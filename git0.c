@@ -37,8 +37,11 @@ SQLITE_EXTENSION_INIT1
 #include <stdlib.h>
 
 /* Repo cache: keep last-used repo open to avoid repeated open/close */
-static git_repository *g_repo = NULL;
-static char g_repo_path[4096] = {0};
+git_repository *g_repo = NULL;
+char g_repo_path[4096] = {0};
+
+/* Forward declaration for TVF registration */
+extern int git0_register_vtabs(sqlite3 *db);
 
 static git_repository *get_repo(const char *path, char **err) {
   if (g_repo && strcmp(g_repo_path, path) == 0) return g_repo;
@@ -494,6 +497,9 @@ int sqlite3_git_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *p
   sqlite3_create_function(db, "git_merge_base", 3, SQLITE_UTF8, 0, fn_git_merge_base, 0, 0);
   sqlite3_create_function(db, "git_config", 2, SQLITE_UTF8, 0, fn_git_config, 0, 0);
   sqlite3_create_function(db, "git_config_set", 3, SQLITE_UTF8, 0, fn_git_config_set, 0, 0);
+
+  /* Table-valued functions */
+  git0_register_vtabs(db);
 
   return SQLITE_OK;
 }
