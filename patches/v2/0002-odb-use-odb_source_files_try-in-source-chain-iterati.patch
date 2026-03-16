@@ -1,4 +1,4 @@
-From f0addd9b98693b4968bae2ad8b997775f914cb13 Mon Sep 17 00:00:00 2001
+From 8ac81703d4eba825c2e49934bc13cec9dee6044d Mon Sep 17 00:00:00 2001
 From: Aaron Paterson <apaterson@pm.me>
 Date: Mon, 16 Mar 2026 12:35:00 +0000
 Subject: [PATCH 2/2] odb: use odb_source_files_try() in source-chain
@@ -34,6 +34,9 @@ Sites converted (22 across 11 files):
   - builtin/grep.c: pack preparation
   - builtin/pack-objects.c: cruft/kept pack enumeration
 
+Add a unit test verifying odb_source_files_try() returns the
+correct backend for ODB_SOURCE_FILES and NULL for other types.
+
 Note: repo_approximate_object_count() and has_object_pack() will
 not account for objects in non-files sources. These are
 display and optimization functions respectively, and a follow-up
@@ -41,19 +44,34 @@ series can add vtable callbacks to address this.
 
 Signed-off-by: Aaron Paterson <apaterson@pm.me>
 ---
- builtin/cat-file.c     |  9 ++++++---
- builtin/fast-import.c  |  8 ++++++--
- builtin/grep.c         |  4 +++-
- builtin/pack-objects.c | 15 +++++++++++----
- commit-graph.c         |  4 +++-
- loose.c                | 11 ++++++++---
- midx.c                 |  8 ++++++--
- object-file.c          |  8 ++++++--
- object-name.c          |  8 +++++---
- packfile.c             | 23 +++++++++++++++++------
- packfile.h             | 14 ++++++++++----
- 11 files changed, 81 insertions(+), 31 deletions(-)
+ Makefile                    |  1 +
+ builtin/cat-file.c          |  9 ++++++---
+ builtin/fast-import.c       |  8 ++++++--
+ builtin/grep.c              |  4 +++-
+ builtin/pack-objects.c      | 15 +++++++++++----
+ commit-graph.c              |  4 +++-
+ loose.c                     | 11 ++++++++---
+ midx.c                      |  8 ++++++--
+ object-file.c               |  8 ++++++--
+ object-name.c               |  8 +++++---
+ packfile.c                  | 23 +++++++++++++++++------
+ packfile.h                  | 14 ++++++++++----
+ t/unit-tests/u-odb-source.c | 25 +++++++++++++++++++++++++
+ 13 files changed, 107 insertions(+), 31 deletions(-)
+ create mode 100644 t/unit-tests/u-odb-source.c
 
+diff --git a/Makefile b/Makefile
+index 58fb895..3d65093 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1544,6 +1544,7 @@ CLAR_TEST_SUITES += u-strvec
+ CLAR_TEST_SUITES += u-trailer
+ CLAR_TEST_SUITES += u-urlmatch-normalization
+ CLAR_TEST_SUITES += u-utf8-width
++CLAR_TEST_SUITES += u-odb-source
+ CLAR_TEST_PROG = $(UNIT_TEST_BIN)/unit-tests$(X)
+ CLAR_TEST_OBJS = $(patsubst %,$(UNIT_TEST_DIR)/%.o,$(CLAR_TEST_SUITES))
+ CLAR_TEST_OBJS += $(UNIT_TEST_DIR)/clar/clar.o
 diff --git a/builtin/cat-file.c b/builtin/cat-file.c
 index b6f12f4..0c63705 100644
 --- a/builtin/cat-file.c
@@ -366,6 +384,37 @@ index 8b04a25..3859415 100644
  		if (!entry)
  			continue;
  		data->source = source;
+diff --git a/t/unit-tests/u-odb-source.c b/t/unit-tests/u-odb-source.c
+new file mode 100644
+index 0000000..6f11c53
+--- /dev/null
++++ b/t/unit-tests/u-odb-source.c
+@@ -0,0 +1,25 @@
++#include "unit-test.h"
++#include "odb/source.h"
++#include "odb/source-files.h"
++
++/*
++ * Verify that odb_source_files_try() returns the files backend
++ * for ODB_SOURCE_FILES and NULL for other source types.
++ */
++void test_odb_source__try_returns_files_for_files_type(void)
++{
++	struct odb_source_files files_src;
++	memset(&files_src, 0, sizeof(files_src));
++	files_src.base.type = ODB_SOURCE_FILES;
++
++	cl_assert(odb_source_files_try(&files_src.base) == &files_src);
++}
++
++void test_odb_source__try_returns_null_for_unknown_type(void)
++{
++	struct odb_source other_src;
++	memset(&other_src, 0, sizeof(other_src));
++	other_src.type = ODB_SOURCE_UNKNOWN;
++
++	cl_assert(odb_source_files_try(&other_src) == NULL);
++}
 -- 
 2.47.3
 
