@@ -63,4 +63,10 @@ SELECT 'mktree: ' || git0_mktree('100644' || char(9) || git0_add('f', 'data') ||
 DROP TABLE objects;
 DROP TABLE refs;
 
+-- Phase 5: LFS
+SELECT 'lfs_pointer: ' || length(git0_lfs_pointer('large content here')) || ' bytes';
+SELECT 'lfs_store: ' || length(git0_lfs_store('large content here')) || ' bytes';
+SELECT 'lfs_fetch: ' || length(git0_lfs_fetch(git0_lfs_store('round trip test')));
+SELECT 'lfs_match: ' || (CAST(git0_lfs_fetch(git0_lfs_store('exact match')) AS TEXT) = 'exact match');
+
 SELECT 'All tests passed.';

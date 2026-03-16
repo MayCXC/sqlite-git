@@ -523,6 +523,7 @@ extern int git0_register_vtabs(sqlite3 *db);
 extern int git0_register_objects(sqlite3 *db);
 extern int git0_register_refs_vt(sqlite3 *db);
 extern int git0_register_repo(sqlite3 *db);
+extern int git0_register_lfs(sqlite3 *db);
 
 GIT0_API int sqlite3_git_init(sqlite3 *db, char **pzErrMsg,
                                const sqlite3_api_routines *pApi) {
@@ -566,6 +567,7 @@ GIT0_API int sqlite3_git_init(sqlite3 *db, char **pzErrMsg,
   git0_register_objects(db);
   git0_register_refs_vt(db);
   git0_register_repo(db);
+  git0_register_lfs(db);
 
   return SQLITE_OK;
 }
