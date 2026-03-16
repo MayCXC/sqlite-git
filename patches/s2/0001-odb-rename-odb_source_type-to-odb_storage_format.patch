@@ -1,0 +1,173 @@
+From 453ffe1817bda794443dbbe5428f0d2bd840e8ee Mon Sep 17 00:00:00 2001
+From: Aaron Paterson <apaterson@pm.me>
+Date: Mon, 16 Mar 2026 16:07:16 +0000
+Subject: [PATCH 1/2] odb: rename odb_source_type to odb_storage_format
+
+Rename the object database backend type enum from odb_source_type
+to odb_storage_format, matching the naming convention used by the
+refs subsystem (ref_storage_format). Move the enum definition
+from odb/source.h to repository.h, alongside ref_storage_format,
+so it can be used in struct repository without circular includes.
+
+This consolidates the backend identification into a single enum
+that serves both as the runtime type tag on odb_source instances
+and as the config-level storage format identifier, following the
+refs pattern where ref_storage_format serves both roles.
+
+No functional change.
+
+Signed-off-by: Aaron Paterson <apaterson@pm.me>
+---
+ odb/source-files.c          |  2 +-
+ odb/source-files.h          |  8 ++++----
+ odb/source.c                |  2 +-
+ odb/source.h                | 16 +++-------------
+ repository.h                |  5 +++++
+ t/unit-tests/u-odb-source.c |  6 +++---
+ 6 files changed, 17 insertions(+), 22 deletions(-)
+
+diff --git a/odb/source-files.c b/odb/source-files.c
+index 14cb9ad..a88f37c 100644
+--- a/odb/source-files.c
++++ b/odb/source-files.c
+@@ -210,7 +210,7 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
+ 	struct odb_source_files *files;
+ 
+ 	CALLOC_ARRAY(files, 1);
+-	odb_source_init(&files->base, odb, ODB_SOURCE_FILES, path, local);
++	odb_source_init(&files->base, odb, ODB_STORAGE_FORMAT_FILES, path, local);
+ 	files->loose = odb_source_loose_new(&files->base);
+ 	files->packed = packfile_store_new(&files->base);
+ 
+diff --git a/odb/source-files.h b/odb/source-files.h
+index abd093b..9e03c8e 100644
+--- a/odb/source-files.h
++++ b/odb/source-files.h
+@@ -1,5 +1,5 @@
+-#ifndef ODB_SOURCE_FILES_H
+-#define ODB_SOURCE_FILES_H
++#ifndef ODB_STORAGE_FORMAT_FILES_H
++#define ODB_STORAGE_FORMAT_FILES_H
+ 
+ #include "odb/source.h"
+ 
+@@ -27,7 +27,7 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
+  */
+ static inline struct odb_source_files *odb_source_files_downcast(struct odb_source *source)
+ {
+-	if (source->type != ODB_SOURCE_FILES)
++	if (source->type != ODB_STORAGE_FORMAT_FILES)
+ 		BUG("trying to downcast source of type '%d' to files", source->type);
+ 	return container_of(source, struct odb_source_files, base);
+ }
+@@ -41,7 +41,7 @@ static inline struct odb_source_files *odb_source_files_downcast(struct odb_sour
+  */
+ static inline struct odb_source_files *odb_source_files_try(struct odb_source *source)
+ {
+-	if (source->type != ODB_SOURCE_FILES)
++	if (source->type != ODB_STORAGE_FORMAT_FILES)
+ 		return NULL;
+ 	return container_of(source, struct odb_source_files, base);
+ }
+diff --git a/odb/source.c b/odb/source.c
+index 7993dcb..cb3818a 100644
+--- a/odb/source.c
++++ b/odb/source.c
+@@ -13,7 +13,7 @@ struct odb_source *odb_source_new(struct object_database *odb,
+ 
+ void odb_source_init(struct odb_source *source,
+ 		     struct object_database *odb,
+-		     enum odb_source_type type,
++		     enum odb_storage_format type,
+ 		     const char *path,
+ 		     bool local)
+ {
+diff --git a/odb/source.h b/odb/source.h
+index caac558..2bcaefb 100644
+--- a/odb/source.h
++++ b/odb/source.h
+@@ -2,17 +2,7 @@
+ #define ODB_SOURCE_H
+ 
+ #include "object.h"
+-
+-enum odb_source_type {
+-	/*
+-	 * The "unknown" type, which should never be in use. This type mostly
+-	 * exists to catch cases where the type field remains zeroed out.
+-	 */
+-	ODB_SOURCE_UNKNOWN,
+-
+-	/* The "files" backend that uses loose objects and packfiles. */
+-	ODB_SOURCE_FILES,
+-};
++#include "repository.h"
+ 
+ /* Flags that can be passed to `odb_read_object_info_extended()`. */
+ enum object_info_flags {
+@@ -88,7 +78,7 @@ struct odb_source {
+ 	struct object_database *odb;
+ 
+ 	/* The type used by this source. */
+-	enum odb_source_type type;
++	enum odb_storage_format type;
+ 
+ 	/*
+ 	 * Figure out whether this is the local source of the owning
+@@ -293,7 +283,7 @@ struct odb_source *odb_source_new(struct object_database *odb,
+  */
+ void odb_source_init(struct odb_source *source,
+ 		     struct object_database *odb,
+-		     enum odb_source_type type,
++		     enum odb_storage_format type,
+ 		     const char *path,
+ 		     bool local);
+ 
+diff --git a/repository.h b/repository.h
+index 078059a..297b0a7 100644
+--- a/repository.h
++++ b/repository.h
+@@ -15,6 +15,11 @@ struct submodule_cache;
+ struct promisor_remote_config;
+ struct remote_state;
+ 
++enum odb_storage_format {
++	ODB_STORAGE_FORMAT_UNKNOWN,
++	ODB_STORAGE_FORMAT_FILES,
++};
++
+ enum ref_storage_format {
+ 	REF_STORAGE_FORMAT_UNKNOWN,
+ 	REF_STORAGE_FORMAT_FILES,
+diff --git a/t/unit-tests/u-odb-source.c b/t/unit-tests/u-odb-source.c
+index 6f11c53..089a504 100644
+--- a/t/unit-tests/u-odb-source.c
++++ b/t/unit-tests/u-odb-source.c
+@@ -4,13 +4,13 @@
+ 
+ /*
+  * Verify that odb_source_files_try() returns the files backend
+- * for ODB_SOURCE_FILES and NULL for other source types.
++ * for ODB_STORAGE_FORMAT_FILES and NULL for other source types.
+  */
+ void test_odb_source__try_returns_files_for_files_type(void)
+ {
+ 	struct odb_source_files files_src;
+ 	memset(&files_src, 0, sizeof(files_src));
+-	files_src.base.type = ODB_SOURCE_FILES;
++	files_src.base.type = ODB_STORAGE_FORMAT_FILES;
+ 
+ 	cl_assert(odb_source_files_try(&files_src.base) == &files_src);
+ }
+@@ -19,7 +19,7 @@ void test_odb_source__try_returns_null_for_unknown_type(void)
+ {
+ 	struct odb_source other_src;
+ 	memset(&other_src, 0, sizeof(other_src));
+-	other_src.type = ODB_SOURCE_UNKNOWN;
++	other_src.type = ODB_STORAGE_FORMAT_UNKNOWN;
+ 
+ 	cl_assert(odb_source_files_try(&other_src) == NULL);
+ }
+-- 
+2.47.3
+

@@ -1,46 +1,42 @@
-From 31558469a6a99af2c9ebaf12969ff6b864d81762 Mon Sep 17 00:00:00 2001
+From a172fbac63a7c6e024cddc15ada76349d7c67464 Mon Sep 17 00:00:00 2001
 From: Aaron Paterson <apaterson@pm.me>
-Date: Mon, 16 Mar 2026 15:48:39 +0000
-Subject: [PATCH] odb: add storage format dispatch for pluggable backends
+Date: Mon, 16 Mar 2026 16:14:24 +0000
+Subject: [PATCH 2/2] odb: add storage format dispatch for pluggable backends
 
-Add an odb_storage_format enum and dispatch mechanism to
-odb_source_new(), mirroring the ref_storage_format pattern used
-for pluggable ref backends (reftable).
+Add a dispatch mechanism to odb_source_new() that selects the
+backend constructor based on the repository's odb_storage_format,
+following the same pattern as refs_backends[] in refs.c.
 
 The new infrastructure includes:
 
-  - enum odb_storage_format in repository.h (UNKNOWN, FILES)
   - odb_backends[] dispatch table in odb/source.c, indexed by
-    format enum, mapping format names to source constructors
+    odb_storage_format, mapping format names to source constructors
   - odb_storage_format_by_name() and odb_storage_format_to_name()
     for name/enum conversion
+  - odb_source_files_new_base() wrapper in odb/source-files.h for
+    use in dispatch tables
   - extensions.objectStorage config key in setup.c, parsed
     alongside extensions.refStorage
   - odb_storage_format field in struct repository and
-    struct repository_format
+    struct repository_format, defaulting to ODB_STORAGE_FORMAT_FILES
 
 odb_source_new() now dispatches through the backend table when the
 repository has a configured format, falling back to the files
-backend when unset. This allows new backends to register by adding
-an entry to odb_backends[] and a new enum value, following exactly
-the same pattern as refs_backends[] in refs.c.
-
-The files backend is currently the only registered backend.
-A subsequent series will add a SQLite backend as the first
-alternative implementation.
+backend when unset. New backends register by adding an entry to
+odb_backends[] and a new enum value.
 
 Signed-off-by: Aaron Paterson <apaterson@pm.me>
 ---
  odb/source-files.h |  7 +++++++
  odb/source.c       | 46 +++++++++++++++++++++++++++++++++++++++++++++-
  odb/source.h       |  7 +++++++
- repository.h       |  8 ++++++++
+ repository.h       |  3 +++
  setup.c            | 14 ++++++++++++++
  setup.h            |  2 ++
- 6 files changed, 83 insertions(+), 1 deletion(-)
+ 6 files changed, 78 insertions(+), 1 deletion(-)
 
 diff --git a/odb/source-files.h b/odb/source-files.h
-index abd093b..bb9dd37 100644
+index 9e03c8e..b7d7ea0 100644
 --- a/odb/source-files.h
 +++ b/odb/source-files.h
 @@ -21,6 +21,13 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
@@ -58,7 +54,7 @@ index abd093b..bb9dd37 100644
   * Cast the given object database source to the files backend. This will cause
   * a BUG in case the source doesn't use this backend.
 diff --git a/odb/source.c b/odb/source.c
-index 7993dcb..36fe200 100644
+index cb3818a..2fa55e0 100644
 --- a/odb/source.c
 +++ b/odb/source.c
 @@ -3,12 +3,56 @@
@@ -120,10 +116,10 @@ index 7993dcb..36fe200 100644
  
  void odb_source_init(struct odb_source *source,
 diff --git a/odb/source.h b/odb/source.h
-index caac558..c37735f 100644
+index 2bcaefb..f464dc3 100644
 --- a/odb/source.h
 +++ b/odb/source.h
-@@ -283,6 +283,13 @@ struct odb_source *odb_source_new(struct object_database *odb,
+@@ -273,6 +273,13 @@ struct odb_source *odb_source_new(struct object_database *odb,
  				  const char *path,
  				  bool local);
  
@@ -138,22 +134,10 @@ index caac558..c37735f 100644
   * Initialize the source for the given object database located at `path`.
   * `local` indicates whether or not the source is the local and thus primary
 diff --git a/repository.h b/repository.h
-index 078059a..478f533 100644
+index 297b0a7..a60a3be 100644
 --- a/repository.h
 +++ b/repository.h
-@@ -21,6 +21,11 @@ enum ref_storage_format {
- 	REF_STORAGE_FORMAT_REFTABLE,
- };
- 
-+enum odb_storage_format {
-+	ODB_STORAGE_FORMAT_UNKNOWN,
-+	ODB_STORAGE_FORMAT_FILES,
-+};
-+
- #ifdef WITH_BREAKING_CHANGES /* Git 3.0 */
- # define REF_STORAGE_FORMAT_DEFAULT REF_STORAGE_FORMAT_REFTABLE
- #else
-@@ -154,6 +159,9 @@ struct repository {
+@@ -159,6 +159,9 @@ struct repository {
  
  	/* Repository's reference storage format, as serialized on disk. */
  	enum ref_storage_format ref_storage_format;
