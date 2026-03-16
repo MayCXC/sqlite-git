@@ -1,6 +1,6 @@
 # sqlite-git
 
-SQLite extension exposing git plumbing via libgit2. Like `readfile()` exposes the filesystem to SQL, git0 exposes the git object database.
+SQLite extension exposing git plumbing via libgit2. The fileio extension gives SQLite access to the filesystem with `readfile()`, `writefile()`, and `fsdir()`. git0 does the same for the git object database: `git_blob()` reads objects, `git_write()` writes them, and `git_tree()` lists entries.
 
 ## Build
 
