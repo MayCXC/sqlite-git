@@ -1,4 +1,4 @@
-From 6f7ceb301677eb9fe1382a82895cd200537f3024 Mon Sep 17 00:00:00 2001
+From 6bac8e8a24325329b14cc0ae27f0e2938104ca8f Mon Sep 17 00:00:00 2001
 From: Aaron Paterson <apaterson@pm.me>
 Date: Mon, 16 Mar 2026 16:14:24 +0000
 Subject: [PATCH 2/2] odb: add storage format dispatch for pluggable backends
@@ -27,13 +27,13 @@ odb_backends[] and a new enum value.
 
 Signed-off-by: Aaron Paterson <apaterson@pm.me>
 ---
- odb/source-files.h |  7 +++++++
- odb/source.c       | 46 +++++++++++++++++++++++++++++++++++++++++++++-
- odb/source.h       |  7 +++++++
- repository.h       |  6 ++++++
- setup.c            | 14 ++++++++++++++
+ odb/source-files.h |  7 ++++++
+ odb/source.c       | 55 +++++++++++++++++++++++++++++++++++++++++++++-
+ odb/source.h       |  7 ++++++
+ repository.h       |  3 +++
+ setup.c            | 14 ++++++++++++
  setup.h            |  2 ++
- 6 files changed, 81 insertions(+), 1 deletion(-)
+ 6 files changed, 87 insertions(+), 1 deletion(-)
 
 diff --git a/odb/source-files.h b/odb/source-files.h
 index 9e03c8e..b7d7ea0 100644
@@ -54,10 +54,10 @@ index 9e03c8e..b7d7ea0 100644
   * Cast the given object database source to the files backend. This will cause
   * a BUG in case the source doesn't use this backend.
 diff --git a/odb/source.c b/odb/source.c
-index cb3818a..2fa55e0 100644
+index cb3818a..cf54169 100644
 --- a/odb/source.c
 +++ b/odb/source.c
-@@ -3,12 +3,56 @@
+@@ -3,12 +3,65 @@
  #include "odb/source-files.h"
  #include "odb/source.h"
  #include "packfile.h"
@@ -81,6 +81,14 @@ index cb3818a..2fa55e0 100644
 +	},
 +};
 +
++static const char *find_odb_storage_backend_name(
++	enum odb_storage_format format)
++{
++	if (format < ARRAY_SIZE(odb_backends))
++		return odb_backends[format].name;
++	return NULL;
++}
++
 +enum odb_storage_format odb_storage_format_by_name(const char *name)
 +{
 +	unsigned int i;
@@ -93,9 +101,10 @@ index cb3818a..2fa55e0 100644
 +
 +const char *odb_storage_format_to_name(enum odb_storage_format format)
 +{
-+	if (format < ARRAY_SIZE(odb_backends) && odb_backends[format].name)
-+		return odb_backends[format].name;
-+	return "unknown";
++	const char *name = find_odb_storage_backend_name(format);
++	if (!name)
++		return "unknown";
++	return name;
 +}
  
  struct odb_source *odb_source_new(struct object_database *odb,
@@ -134,20 +143,10 @@ index 2bcaefb..f464dc3 100644
   * Initialize the source for the given object database located at `path`.
   * `local` indicates whether or not the source is the local and thus primary
 diff --git a/repository.h b/repository.h
-index 297b0a7..d1ed959 100644
+index 297b0a7..a60a3be 100644
 --- a/repository.h
 +++ b/repository.h
-@@ -18,6 +18,9 @@ struct remote_state;
- enum odb_storage_format {
- 	ODB_STORAGE_FORMAT_UNKNOWN,
- 	ODB_STORAGE_FORMAT_FILES,
-+
-+	/* add new backends above this line */
-+	ODB_STORAGE_FORMAT__COUNT,
- };
- 
- enum ref_storage_format {
-@@ -159,6 +162,9 @@ struct repository {
+@@ -159,6 +159,9 @@ struct repository {
  
  	/* Repository's reference storage format, as serialized on disk. */
  	enum ref_storage_format ref_storage_format;
