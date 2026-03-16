@@ -1,2 +1,3 @@
-git0.so
-SELECT *
+*.so
+SELECT*
+EXPLAIN*
