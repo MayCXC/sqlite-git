@@ -15,19 +15,31 @@ struct odb_source *odb_source_new(struct object_database *odb,
 				  const char *path,
 				  bool local)
 {
-	/*
-	 * ODB helper takes priority when configured.
-	 * The helper receives the object directory path and handles
-	 * storage internally (e.g., creates objects.db in the directory).
-	 */
-	const char *helper = getenv("GIT_ODB_HELPER");
-	if (helper && *helper)
-		return &odb_source_helper_new(odb, helper, path, local)->base;
+	struct odb_source *source;
 
 	if (path_is_sqlite(path))
-		return &odb_source_sqlite_new(odb, path, local)->base;
+		source = &odb_source_sqlite_new(odb, path, local)->base;
+	else
+		source = &odb_source_files_new(odb, path, local)->base;
 
-	return &odb_source_files_new(odb, path, local)->base;
+	/*
+	 * When GIT_ODB_HELPER is set, add a helper source as the first
+	 * alternate. The files backend stays as the primary (handles
+	 * writes, temp files, packs). The helper gets first chance at
+	 * reads since alternates are checked before repreparing.
+	 *
+	 * To sync objects TO the helper, use git-remote-sqlite push.
+	 */
+	if (local) {
+		const char *helper = getenv("GIT_ODB_HELPER");
+		if (helper && *helper) {
+			struct odb_source *hsrc =
+				&odb_source_helper_new(odb, helper, path, false)->base;
+			source->next = hsrc;
+		}
+	}
+
+	return source;
 }
 
 void odb_source_init(struct odb_source *source,
