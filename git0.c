@@ -520,6 +520,8 @@ static void fn_git_config_set(sqlite3_context *ctx, int argc, sqlite3_value **ar
 /* ---- Extension entry point ---- */
 
 extern int git0_register_vtabs(sqlite3 *db);
+extern int git0_register_objects(sqlite3 *db);
+extern int git0_register_refs_vt(sqlite3 *db);
 
 GIT0_API int sqlite3_git_init(sqlite3 *db, char **pzErrMsg,
                                const sqlite3_api_routines *pApi) {
@@ -560,6 +562,8 @@ GIT0_API int sqlite3_git_init(sqlite3 *db, char **pzErrMsg,
 #undef F
 
   git0_register_vtabs(db);
+  git0_register_objects(db);
+  git0_register_refs_vt(db);
 
   return SQLITE_OK;
 }

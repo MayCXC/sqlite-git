@@ -15,7 +15,7 @@ ifneq ($(wildcard $(PREFIX)/include/git2.h),)
   LDFLAGS += -L$(PREFIX)/lib -Wl,-rpath,$(PREFIX)/lib
 endif
 
-SRCS = git0.c git0_vtab.c
+SRCS = git0.c git0_vtab.c git0_objects.c git0_refs_vt.c
 HDRS = git0.h
 
 # Targets

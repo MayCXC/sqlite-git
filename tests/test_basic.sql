@@ -32,4 +32,24 @@ SELECT 'blame: ' || count(*) || ' hunks' FROM git_blame('.', 'Makefile');
 -- git_status
 SELECT 'status: ' || count(*) || ' entries' FROM git_status('.');
 
+-- Phase 1/2: git0_objects and git0_refs virtual tables
+CREATE VIRTUAL TABLE IF NOT EXISTS test_obj USING git0_objects;
+CREATE VIRTUAL TABLE IF NOT EXISTS test_refs USING git0_refs;
+
+INSERT INTO test_obj(type, data) VALUES('blob', 'hello world');
+INSERT INTO test_obj(type, data) VALUES('blob', 'second blob');
+INSERT INTO test_obj(type, data) VALUES('blob', 'hello world');  -- duplicate
+
+SELECT 'obj_count: ' || count(*) FROM test_obj;
+SELECT 'obj_lookup: ' || oid FROM test_obj WHERE oid = '95d09f2b10159347eece71399a7e2e907ea3df4f';
+
+INSERT INTO test_refs(name, target) VALUES('refs/heads/main', '95d09f2b10159347eece71399a7e2e907ea3df4f');
+INSERT INTO test_refs(name, target) VALUES('HEAD', '95d09f2b10159347eece71399a7e2e907ea3df4f');
+SELECT 'ref_count: ' || count(*) FROM test_refs;
+SELECT 'ref_type: ' || type FROM test_refs WHERE name = 'refs/heads/main';
+SELECT 'head_type: ' || type FROM test_refs WHERE name = 'HEAD';
+
+DROP TABLE test_obj;
+DROP TABLE test_refs;
+
 SELECT 'All tests passed.';
