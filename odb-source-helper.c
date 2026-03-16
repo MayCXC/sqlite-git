@@ -144,7 +144,13 @@ static int helper_source_read_object_info(struct odb_source *source,
 	char hex[GIT_MAX_HEXSZ + 1];
 	oid_to_hex_r(hex, oid);
 
-	helper_send(src, "get %s\n", hex);
+	int want_content = oi->contentp != NULL;
+
+	/* Use "info" for metadata only, "get" when content is needed */
+	if (want_content)
+		helper_send(src, "get %s\n", hex);
+	else
+		helper_send(src, "info %s\n", hex);
 
 	struct strbuf line = STRBUF_INIT;
 	if (helper_readline(src, &line) == EOF) {
@@ -169,22 +175,17 @@ static int helper_source_read_object_info(struct odb_source *source,
 	if (oi->typep) *(oi->typep) = type;
 	if (oi->sizep) *(oi->sizep) = size;
 
-	if (oi->contentp) {
+	/* "get" returns data after the header line, "info" does not */
+	if (want_content) {
 		*oi->contentp = xmalloc(size);
-		if (read_in_full(fileno(src->out), *oi->contentp, size) != size) {
+		/* Must use fread (not read_in_full on fileno) because
+		 * strbuf_getline may have buffered data in the FILE* */
+		size_t got = fread(*oi->contentp, 1, size, src->out);
+		if (got != size) {
 			free(*oi->contentp);
 			*oi->contentp = NULL;
 			strbuf_release(&line);
 			return -1;
-		}
-	} else {
-		/* Discard the data */
-		char discard[4096];
-		unsigned long remaining = size;
-		while (remaining > 0) {
-			size_t chunk = remaining < sizeof(discard) ? remaining : sizeof(discard);
-			read_in_full(fileno(src->out), discard, chunk);
-			remaining -= chunk;
 		}
 	}
 
