@@ -1,3 +1,10 @@
 *.so
-SELECT*
-EXPLAIN*
+*.dylib
+*.dll
+*.o
+*.a
+*.db
+*.db-journal
+dist/
+build/
+.DS_Store

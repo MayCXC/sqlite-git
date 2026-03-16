@@ -24,8 +24,8 @@ SQLITE_EXTENSION_INIT3
 #include <stdlib.h>
 
 /* Shared functions (defined in git0.c) */
-extern git_repository *get_repo(const char *path, char **err);
-extern void oid_to_hex(const git_oid *oid, char *out);
+extern git_repository *git0_repo_open(const char *path, char **err);
+extern void git0_oid_to_hex(const git_oid *oid, char *out);
 
 /*
 ** ========================================================
@@ -144,7 +144,7 @@ static int git_log_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *
     ? (const char *)sqlite3_value_text(argv[2]) : NULL;
 
   char *err = NULL;
-  cur->repo = get_repo(repo_path, &err);
+  cur->repo = git0_repo_open(repo_path, &err);
   if (!cur->repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_revwalk_new(&cur->walk, cur->repo);
@@ -185,7 +185,7 @@ static int git_log_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, in
 
   switch (col) {
     case 0: /* oid */
-      oid_to_hex(git_commit_id(c), hex);
+      git0_oid_to_hex(git_commit_id(c), hex);
       sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
       break;
     case 1: /* message */
@@ -316,7 +316,7 @@ static int git_tree_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char 
     ? (const char *)sqlite3_value_text(argv[2]) : NULL;
 
   char *err = NULL;
-  cur->repo = get_repo(repo_path, &err);
+  cur->repo = git0_repo_open(repo_path, &err);
   if (!cur->repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_object *obj = NULL;
@@ -374,7 +374,7 @@ static int git_tree_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, i
       sqlite3_result_text(ctx, git_object_type2string(git_tree_entry_type(entry)), -1, SQLITE_STATIC);
       break;
     case 3: /* oid */
-      oid_to_hex(git_tree_entry_id(entry), hex);
+      git0_oid_to_hex(git_tree_entry_id(entry), hex);
       sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
       break;
     case 4: /* size */
@@ -487,7 +487,7 @@ static int git_refs_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char 
     ? (const char *)sqlite3_value_text(argv[1]) : NULL;
 
   char *err = NULL;
-  cur->repo = get_repo(repo_path, &err);
+  cur->repo = git0_repo_open(repo_path, &err);
   if (!cur->repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   if (pattern) {
@@ -525,10 +525,10 @@ static int git_refs_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, i
     case 2: { /* oid */
       git_reference *resolved = NULL;
       if (git_reference_resolve(&resolved, ref) == 0) {
-        oid_to_hex(git_reference_target(resolved), hex);
+        git0_oid_to_hex(git_reference_target(resolved), hex);
         git_reference_free(resolved);
       } else if (git_reference_target(ref)) {
-        oid_to_hex(git_reference_target(ref), hex);
+        git0_oid_to_hex(git_reference_target(ref), hex);
       } else {
         sqlite3_result_null(ctx);
         break;
@@ -629,7 +629,7 @@ static int git_diff_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char 
   const char *new_rev = argc > 2 ? (const char *)sqlite3_value_text(argv[2]) : "HEAD";
 
   char *err = NULL;
-  git_repository *repo = get_repo(repo_path, &err);
+  git_repository *repo = git0_repo_open(repo_path, &err);
   if (!repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_object *old_obj = NULL, *new_obj = NULL;
@@ -695,8 +695,8 @@ static int git_diff_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, i
   switch (col) {
     case 0: sqlite3_result_text(ctx, delta_status_str(delta->status), -1, SQLITE_STATIC); break;
     case 1: sqlite3_result_text(ctx, delta->new_file.path, -1, SQLITE_TRANSIENT); break;
-    case 2: oid_to_hex(&delta->old_file.id, hex); sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT); break;
-    case 3: oid_to_hex(&delta->new_file.id, hex); sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT); break;
+    case 2: git0_oid_to_hex(&delta->old_file.id, hex); sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT); break;
+    case 3: git0_oid_to_hex(&delta->new_file.id, hex); sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT); break;
     case 4: sqlite3_result_int(ctx, (int)delta->old_file.mode); break;
     case 5: sqlite3_result_int(ctx, (int)delta->new_file.mode); break;
     default: sqlite3_result_null(ctx);
@@ -797,7 +797,7 @@ static int git_anc_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *
     ? (const char *)sqlite3_value_text(argv[1]) : "HEAD";
 
   char *err = NULL;
-  git_repository *repo = get_repo(repo_path, &err);
+  git_repository *repo = git0_repo_open(repo_path, &err);
   if (!repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_revwalk_new(&cur->walk, repo);
@@ -824,7 +824,7 @@ static int git_anc_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, in
   git_anc_cursor *cur = (git_anc_cursor *)pCursor;
   if (col == 0) {
     char hex[GIT_OID_MAX_HEXSIZE + 1];
-    oid_to_hex(&cur->current, hex);
+    git0_oid_to_hex(&cur->current, hex);
     sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
   } else {
     sqlite3_result_null(ctx);
@@ -922,7 +922,7 @@ static int git_cfgl_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char 
 
   const char *repo_path = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : ".";
   char *err = NULL;
-  git_repository *repo = get_repo(repo_path, &err);
+  git_repository *repo = git0_repo_open(repo_path, &err);
   if (!repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_config *cfg = NULL;
@@ -1031,7 +1031,7 @@ static int git_stat_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char 
 
   const char *repo_path = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : ".";
   char *err = NULL;
-  git_repository *repo = get_repo(repo_path, &err);
+  git_repository *repo = git0_repo_open(repo_path, &err);
   if (!repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_status_options opts = GIT_STATUS_OPTIONS_INIT;
@@ -1170,7 +1170,7 @@ static int git_bl_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *i
   if (!path) return SQLITE_OK;
 
   char *err = NULL;
-  git_repository *repo = get_repo(repo_path, &err);
+  git_repository *repo = git0_repo_open(repo_path, &err);
   if (!repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
@@ -1210,7 +1210,7 @@ static int git_bl_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int
   switch (col) {
     case 0: sqlite3_result_int(ctx, (int)hunk->final_start_line_number); break;
     case 1: sqlite3_result_int(ctx, (int)hunk->lines_in_hunk); break;
-    case 2: oid_to_hex(&hunk->final_commit_id, hex); sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT); break;
+    case 2: git0_oid_to_hex(&hunk->final_commit_id, hex); sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT); break;
     case 3: sqlite3_result_text(ctx, hunk->orig_path, -1, SQLITE_TRANSIENT); break;
     case 4: sqlite3_result_text(ctx, hunk->final_signature ? hunk->final_signature->name : "", -1, SQLITE_TRANSIENT); break;
     case 5: sqlite3_result_text(ctx, hunk->final_signature ? hunk->final_signature->email : "", -1, SQLITE_TRANSIENT); break;

@@ -2,30 +2,45 @@ PREFIX ?= $(HOME)/.local
 CFLAGS ?= -O2 -Wall -fPIC
 LDFLAGS ?= -lgit2
 
+# Platform detection
+ifeq ($(shell uname -s),Darwin)
+  EXT = dylib
+else
+  EXT = so
+endif
+
+# Find libgit2 in PREFIX
 ifneq ($(wildcard $(PREFIX)/include/git2.h),)
   CFLAGS += -I$(PREFIX)/include
   LDFLAGS += -L$(PREFIX)/lib -Wl,-rpath,$(PREFIX)/lib
 endif
 
 SRCS = git0.c git0_vtab.c
+HDRS = git0.h
 
-git0.so: $(SRCS)
+# Targets
+all: git0.$(EXT)
+
+git0.$(EXT): $(SRCS) $(HDRS)
 	$(CC) -shared $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
 
-install: git0.so
-	install -d $(PREFIX)/lib
-	install -m 755 git0.so $(PREFIX)/lib/git0.so
+static: git0.a
 
-test: git0.so
-	@sqlite3 -cmd ".load ./git0" "SELECT git_rev_parse('.', 'HEAD');"
-	@sqlite3 -cmd ".load ./git0" "SELECT length(git_blob('.', 'HEAD', 'Makefile'));"
-	@sqlite3 -cmd ".load ./git0" "SELECT git_commit_summary('.', 'HEAD');"
-	@sqlite3 -cmd ".load ./git0" "SELECT * FROM git_log('.') LIMIT 3;"
-	@sqlite3 -cmd ".load ./git0" "SELECT * FROM git_tree('.', 'HEAD');"
-	@sqlite3 -cmd ".load ./git0" "SELECT * FROM git_refs('.');"
-	@echo "All tests passed."
+git0.a: $(SRCS) $(HDRS)
+	$(CC) -c $(CFLAGS) -DSQLITE_CORE -DGIT0_STATIC git0.c -o git0.o
+	$(CC) -c $(CFLAGS) -DSQLITE_CORE -DGIT0_STATIC git0_vtab.c -o git0_vtab.o
+	$(AR) rcs $@ git0.o git0_vtab.o
+	@rm -f git0.o git0_vtab.o
+
+install: git0.$(EXT) $(HDRS)
+	install -d $(PREFIX)/lib $(PREFIX)/include
+	install -m 755 git0.$(EXT) $(PREFIX)/lib/
+	install -m 644 git0.h $(PREFIX)/include/
+
+test: git0.$(EXT)
+	@LD_LIBRARY_PATH=$(PREFIX)/lib sqlite3 -cmd ".load ./git0" < tests/test_basic.sql
 
 clean:
-	rm -f git0.so
+	rm -f git0.$(EXT) git0.a git0.o git0_vtab.o
 
-.PHONY: install test clean
+.PHONY: all static install test clean
