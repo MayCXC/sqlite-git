@@ -52,4 +52,15 @@ SELECT 'head_type: ' || type FROM test_refs WHERE name = 'HEAD';
 DROP TABLE test_obj;
 DROP TABLE test_refs;
 
+-- Phase 3: self-contained repo
+SELECT 'init: ' || git0_init();
+SELECT 'obj_after_init: ' || count(*) FROM objects;
+SELECT 'refs_after_init: ' || count(*) FROM refs;
+
+SELECT 'add_blob: ' || git0_add('test', 'hello world');
+SELECT 'mktree: ' || git0_mktree('100644' || char(9) || git0_add('f', 'data') || char(9) || 'file.txt');
+
+DROP TABLE objects;
+DROP TABLE refs;
+
 SELECT 'All tests passed.';
