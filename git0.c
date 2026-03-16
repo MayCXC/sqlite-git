@@ -43,7 +43,7 @@ char g_repo_path[4096] = {0};
 /* Forward declaration for TVF registration */
 extern int git0_register_vtabs(sqlite3 *db);
 
-static git_repository *get_repo(const char *path, char **err) {
+git_repository *get_repo(const char *path, char **err) {
   if (g_repo && strcmp(g_repo_path, path) == 0) return g_repo;
   if (g_repo) { git_repository_free(g_repo); g_repo = NULL; }
   int rc = git_repository_open(&g_repo, path);
@@ -55,7 +55,7 @@ static git_repository *get_repo(const char *path, char **err) {
   return g_repo;
 }
 
-static void oid_to_hex(const git_oid *oid, char *out) {
+void oid_to_hex(const git_oid *oid, char *out) {
   git_oid_tostr(out, GIT_OID_MAX_HEXSIZE + 1, oid);
 }
 

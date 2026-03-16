@@ -23,22 +23,9 @@ SQLITE_EXTENSION_INIT3
 #include <string.h>
 #include <stdlib.h>
 
-/* Shared repo cache (defined in git0.c, declared here) */
-extern git_repository *g_repo;
-extern char g_repo_path[4096];
-
-static git_repository *get_repo(const char *path, char **err) {
-  if (g_repo && strcmp(g_repo_path, path) == 0) return g_repo;
-  if (g_repo) { git_repository_free(g_repo); g_repo = NULL; }
-  int rc = git_repository_open(&g_repo, path);
-  if (rc != 0) { *err = (char *)git_error_last()->message; return NULL; }
-  strncpy(g_repo_path, path, sizeof(g_repo_path) - 1);
-  return g_repo;
-}
-
-static void oid_to_hex(const git_oid *oid, char *out) {
-  git_oid_tostr(out, GIT_OID_MAX_HEXSIZE + 1, oid);
-}
+/* Shared functions (defined in git0.c) */
+extern git_repository *get_repo(const char *path, char **err);
+extern void oid_to_hex(const git_oid *oid, char *out);
 
 /*
 ** ========================================================
@@ -252,6 +239,7 @@ static int git_log_bestindex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     int col = pInfo->aConstraint[i].iColumn;
     if (col == 9 || col == 10 || col == 11) { /* repo, rev, path */
       pInfo->aConstraintUsage[i].argvIndex = ++argIdx;
+      pInfo->aConstraintUsage[i].omit = 1;
     }
   }
   pInfo->estimatedCost = 1000;
@@ -421,6 +409,7 @@ static int git_tree_bestindex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     int col = pInfo->aConstraint[i].iColumn;
     if (col == 5 || col == 6 || col == 7) {
       pInfo->aConstraintUsage[i].argvIndex = ++argIdx;
+      pInfo->aConstraintUsage[i].omit = 1;
     }
   }
   pInfo->estimatedCost = 100;
@@ -566,6 +555,7 @@ static int git_refs_bestindex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     int col = pInfo->aConstraint[i].iColumn;
     if (col == 3 || col == 4) {
       pInfo->aConstraintUsage[i].argvIndex = ++argIdx;
+      pInfo->aConstraintUsage[i].omit = 1;
     }
   }
   pInfo->estimatedCost = 100;
@@ -573,9 +563,17 @@ static int git_refs_bestindex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
 }
 
 static sqlite3_module git_refs_module = {
-  0, 0, git_refs_connect, git_refs_bestindex, git_log_disconnect, 0,
-  git_refs_open, git_refs_close, git_refs_filter, git_refs_next, git_refs_eof,
-  git_refs_column, git_refs_rowid,
+  .iVersion = 0,
+  .xConnect = git_refs_connect,
+  .xBestIndex = git_refs_bestindex,
+  .xDisconnect = git_log_disconnect,
+  .xOpen = git_refs_open,
+  .xClose = git_refs_close,
+  .xFilter = git_refs_filter,
+  .xNext = git_refs_next,
+  .xEof = git_refs_eof,
+  .xColumn = git_refs_column,
+  .xRowid = git_refs_rowid,
 };
 
 /*
