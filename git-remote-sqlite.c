@@ -345,7 +345,7 @@ static void cmd_push(sqlite3 *db, const char *refspec) {
 
 /* ---- Main: remote helper protocol loop ---- */
 
-int main(int argc, char **argv) {
+int remote_main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr, "Usage: git-remote-sqlite <remote> <url>\n");
     return 1;

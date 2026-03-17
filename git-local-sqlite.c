@@ -460,24 +460,9 @@ static void cmd_reflog_delete(const char *refname) {
 	fflush(stdout);
 }
 
-/* ---- Remote helper protocol (git-remote-sqlite) ---- */
+/* ---- Entry point ---- */
 
-static int remote_main(int argc, char **argv);
-
-/* ---- Main dispatch ---- */
-
-int main(int argc, char **argv) {
-	const char *basename = strrchr(argv[0], '/');
-	basename = basename ? basename + 1 : argv[0];
-
-	/*
-	 * When invoked as git-remote-sqlite, speak the remote helper
-	 * protocol (list/fetch/push). Otherwise, speak the local
-	 * helper protocol (capabilities/get/put/read/list/transaction).
-	 */
-	if (!strcmp(basename, "git-remote-sqlite"))
-		return remote_main(argc, argv);
-
+int local_main(int argc, char **argv) {
 	if (argc < 2) {
 		fprintf(stderr, "usage: git-local-sqlite <gitdir>\n");
 		return 1;
@@ -571,17 +556,3 @@ int main(int argc, char **argv) {
 	return 0;
 }
 
-/*
- * Remote helper mode (git-remote-sqlite).
- * TODO: merge git-remote-sqlite.c into this binary.
- * For now, this is a placeholder; the remote helper is still a
- * separate binary. Create a symlink to test:
- *   ln -s git-local-sqlite git-remote-sqlite
- */
-static int remote_main(int argc, char **argv) {
-	(void)argc;
-	(void)argv;
-	fprintf(stderr, "error: remote helper mode not yet merged into this binary\n");
-	fprintf(stderr, "hint: use the standalone git-remote-sqlite for now\n");
-	return 1;
-}
