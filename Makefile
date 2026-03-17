@@ -26,7 +26,7 @@ git0.$(EXT): $(SRCS) $(HDRS)
 
 static: git0.a
 
-git-sqlite: git-sqlite.c git-local-sqlite.c git-remote-sqlite.c vendor/fossil-delta.c
+git-sqlite: git-sqlite.c git-local-sqlite.c git-remote-sqlite.c storage.c vendor/fossil-delta.c
 	$(CC) $(CFLAGS) -I. -o $@ $^ $(LDFLAGS) -lsqlite3 -lz
 
 git-local-sqlite: git-sqlite
