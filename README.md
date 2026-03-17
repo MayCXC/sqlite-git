@@ -167,6 +167,10 @@ FROM git_blame('.', 'main.c');
 | `git_blame` | `(repo, path, rev?)` | line_start, line_count, oid, orig_path, author_name, author_email, author_when |
 | `git_config_list` | `(repo)` | key, value |
 
+## Git upstream patches
+
+The local helper backend requires patches to git that add `git-local-*` support (pluggable ODB and ref storage via external processes). These patches are on the [`ps/local-helper-backends`](https://github.com/MayCXC/git/tree/ps/local-helper-backends) branch of our git fork. Series 1 has been [submitted upstream](https://lore.kernel.org/git/pull.2068.git.1773674983.gitgitgadget@gmail.com).
+
 ## Dependencies
 
 - [libgit2](https://libgit2.org/) (1.7+)
