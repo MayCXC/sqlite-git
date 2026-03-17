@@ -364,7 +364,7 @@ static void write_object(const unsigned char *oid_bin, int type,
 static void cmd_capabilities(void) {
 	printf("get\ninfo\nput\nhave\nlist-objects\nodb-transaction\n"
 	       "read\nlist\ntransaction\ncreate\nremove\n"
-	       "reflog-read\nreflog-exists\nreflog-delete\n\n");
+	       "reflog-read\nreflog-append\nreflog-exists\nreflog-delete\n\n");
 	fflush(stdout);
 }
 
@@ -640,6 +640,70 @@ static void cmd_reflog_exists(const char *refname) {
 	fflush(stdout);
 }
 
+static void cmd_reflog_append(const char *args) {
+	/*
+	 * reflog-append <refname> <old-oid> <new-oid> <committer> <ts> <tz> <msg>
+	 * The committer field may contain spaces (e.g. "Name <email>").
+	 * Parse fixed fields first, then treat rest as committer+ts+tz+msg.
+	 */
+	char refname[4096], old_hex[OID_HEXSZ + 1], new_hex[OID_HEXSZ + 1];
+	unsigned char old_oid[OID_RAWSZ], new_oid[OID_RAWSZ];
+
+	/* Parse refname old new */
+	const char *p = args;
+	const char *sp = strchr(p, ' ');
+	if (!sp) { printf("error bad args\n"); fflush(stdout); return; }
+	snprintf(refname, sizeof(refname), "%.*s", (int)(sp - p), p);
+	p = sp + 1;
+
+	sp = strchr(p, ' ');
+	if (!sp) { printf("error bad args\n"); fflush(stdout); return; }
+	snprintf(old_hex, sizeof(old_hex), "%.*s", (int)(sp - p), p);
+	p = sp + 1;
+
+	sp = strchr(p, ' ');
+	if (!sp) { printf("error bad args\n"); fflush(stdout); return; }
+	snprintf(new_hex, sizeof(new_hex), "%.*s", (int)(sp - p), p);
+	p = sp + 1;
+
+	if (hex2bin(old_hex, old_oid, OID_RAWSZ) < 0 ||
+	    hex2bin(new_hex, new_oid, OID_RAWSZ) < 0) {
+		printf("error bad oid\n"); fflush(stdout); return;
+	}
+
+	/* Rest is: committer timestamp tz msg
+	 * Find '>' to end committer, then parse ts and tz */
+	const char *email_end = strchr(p, '>');
+	if (!email_end) { printf("error bad committer\n"); fflush(stdout); return; }
+	email_end++;
+
+	char committer[512];
+	snprintf(committer, sizeof(committer), "%.*s", (int)(email_end - p), p);
+
+	long long timestamp = 0;
+	int tz = 0;
+	char msg[4096] = "";
+	if (*email_end == ' ') {
+		char *end;
+		timestamp = strtoll(email_end + 1, &end, 10);
+		if (*end == ' ') tz = strtol(end + 1, &end, 10);
+		if (*end == '\t') snprintf(msg, sizeof(msg), "%s", end + 1);
+	}
+
+	sqlite3_reset(st_reflog_append);
+	sqlite3_bind_text(st_reflog_append, 1, refname, -1, SQLITE_STATIC);
+	sqlite3_bind_text(st_reflog_append, 2, refname, -1, SQLITE_STATIC);
+	sqlite3_bind_blob(st_reflog_append, 3, old_oid, OID_RAWSZ, SQLITE_STATIC);
+	sqlite3_bind_blob(st_reflog_append, 4, new_oid, OID_RAWSZ, SQLITE_STATIC);
+	sqlite3_bind_text(st_reflog_append, 5, committer, -1, SQLITE_STATIC);
+	sqlite3_bind_int64(st_reflog_append, 6, timestamp);
+	sqlite3_bind_int(st_reflog_append, 7, tz);
+	sqlite3_bind_text(st_reflog_append, 8, msg, -1, SQLITE_STATIC);
+	sqlite3_step(st_reflog_append);
+
+	printf("ok\n"); fflush(stdout);
+}
+
 static void cmd_reflog_delete(const char *refname) {
 	sqlite3_reset(st_reflog_delete);
 	sqlite3_bind_text(st_reflog_delete, 1, refname, -1, SQLITE_STATIC);
@@ -687,6 +751,7 @@ int local_main(int argc, char **argv) {
 		else if (!strcmp(line, "transaction-finish")) cmd_transaction_finish();
 		else if (!strcmp(line, "transaction-abort")) cmd_transaction_abort();
 		else if (!strncmp(line, "reflog-read ", 12)) cmd_reflog_read(line + 12);
+		else if (!strncmp(line, "reflog-append ", 14)) cmd_reflog_append(line + 14);
 		else if (!strncmp(line, "reflog-exists ", 14)) cmd_reflog_exists(line + 14);
 		else if (!strncmp(line, "reflog-delete ", 14)) cmd_reflog_delete(line + 14);
 	}
