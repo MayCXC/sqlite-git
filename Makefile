@@ -19,17 +19,20 @@ SRCS = git0.c git0_vtab.c git0_objects.c git0_refs_vt.c git0_repo.c git0_lfs.c
 HDRS = git0.h
 
 # Targets
-all: git0.$(EXT) git-local-sqlite
+all: git0.$(EXT) git-sqlite
 
 git0.$(EXT): $(SRCS) $(HDRS)
 	$(CC) -shared $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
 
 static: git0.a
 
-git-local-sqlite: git-sqlite.c git-local-sqlite.c git-remote-sqlite.c
+git-sqlite: git-sqlite.c git-local-sqlite.c git-remote-sqlite.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -lsqlite3
 
-git-remote-sqlite: git-local-sqlite
+git-local-sqlite: git-sqlite
+	ln -sf $< $@
+
+git-remote-sqlite: git-sqlite
 	ln -sf $< $@
 
 git0.a: $(SRCS) $(HDRS)
@@ -38,17 +41,18 @@ git0.a: $(SRCS) $(HDRS)
 	$(AR) rcs $@ git0.o git0_vtab.o
 	@rm -f git0.o git0_vtab.o
 
-install: git0.$(EXT) git-local-sqlite git-remote-sqlite $(HDRS)
+install: git0.$(EXT) git-sqlite $(HDRS)
 	install -d $(PREFIX)/lib $(PREFIX)/include $(PREFIX)/bin
 	install -m 755 git0.$(EXT) $(PREFIX)/lib/
 	install -m 644 git0.h $(PREFIX)/include/
-	install -m 755 git-local-sqlite $(PREFIX)/bin/
-	ln -sf git-local-sqlite $(PREFIX)/bin/git-remote-sqlite
+	install -m 755 git-sqlite $(PREFIX)/bin/
+	ln -sf git-sqlite $(PREFIX)/bin/git-local-sqlite
+	ln -sf git-sqlite $(PREFIX)/bin/git-remote-sqlite
 
 test: git0.$(EXT)
 	@LD_LIBRARY_PATH=$(PREFIX)/lib sqlite3 -cmd ".load ./git0" < tests/test_basic.sql
 
 clean:
-	rm -f git0.$(EXT) git0.a git0.o git0_vtab.o git-local-sqlite git-remote-sqlite
+	rm -f git0.$(EXT) git0.a git0.o git0_vtab.o git-sqlite git-local-sqlite git-remote-sqlite
 
 .PHONY: all static install test clean
