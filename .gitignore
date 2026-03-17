@@ -11,3 +11,6 @@ build/
 git-sqlite
 git-local-sqlite
 git-remote-sqlite
+UPSTREAM.md
+git-odb-sqlite
+patches/
