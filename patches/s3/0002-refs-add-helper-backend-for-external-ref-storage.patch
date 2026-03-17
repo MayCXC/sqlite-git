@@ -1,0 +1,1016 @@
+From 86f9224826d50c5e21a8e84e4881b9c23435c6b9 Mon Sep 17 00:00:00 2001
+From: Aaron Paterson <apaterson@pm.me>
+Date: Mon, 16 Mar 2026 22:28:29 +0000
+Subject: [PATCH 2/2] refs: add helper backend for external ref storage
+
+Introduce REF_STORAGE_FORMAT_HELPER, a new ref storage backend that
+delegates ref operations to an external process. This follows the
+same pattern as the ODB helper backend (odb/source-helper.c) and
+transport helpers (git-remote-*).
+
+The helper binary is discovered as "git-ref-<name>" in PATH. It is
+invoked with the gitdir path as its sole argument and communicates
+via a line-based protocol on stdin/stdout:
+
+  capabilities -> list supported commands
+  read <refname> -> oid, symref target, or "missing"
+  list [prefix] -> refname + oid/symref per line, blank terminates
+  transaction-begin -> ok
+  transaction-update/create/delete/create-symref -> ok
+  transaction-prepare -> ok/error
+  transaction-finish -> ok/error
+  transaction-abort -> ok
+  create -> ok/error (initialize storage)
+
+Configuration uses the same URI format as existing ref storage:
+
+  [extensions]
+    refStorage = helper://sqlite
+
+This sets ref_storage_format to REF_STORAGE_FORMAT_HELPER with
+"sqlite" as the payload, causing git to spawn "git-ref-sqlite" and
+pass all ref operations through it.
+
+Together with the ODB helper backend, this enables testing complete
+alternative storage backends (like sqlite-git) without compiling
+them into git.
+
+Reflog operations return success without storing, as the helper
+protocol does not yet include reflog commands. This matches the
+behavior of a backend that does not maintain reflogs.
+
+Include an integration test (t0621) that exercises ref creation,
+reading, and listing through a shell-based test helper.
+
+Signed-off-by: Aaron Willoughby <aaron@omniband.org>
+---
+ Makefile              |   1 +
+ meson.build           |   1 +
+ refs.c                |   2 +
+ refs/helper-backend.c | 652 ++++++++++++++++++++++++++++++++++++++++++
+ refs/helper-backend.h |  58 ++++
+ repository.h          |   1 +
+ t/t0621-ref-helper.sh | 171 +++++++++++
+ 7 files changed, 886 insertions(+)
+ create mode 100644 refs/helper-backend.c
+ create mode 100644 refs/helper-backend.h
+ create mode 100755 t/t0621-ref-helper.sh
+
+diff --git a/Makefile b/Makefile
+index b4403aa..e4ee760 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1264,6 +1264,7 @@ LIB_OBJS += reflog.o
+ LIB_OBJS += refs.o
+ LIB_OBJS += refs/debug.o
+ LIB_OBJS += refs/files-backend.o
++LIB_OBJS += refs/helper-backend.o
+ LIB_OBJS += refs/reftable-backend.o
+ LIB_OBJS += refs/iterator.o
+ LIB_OBJS += refs/packed-backend.o
+diff --git a/meson.build b/meson.build
+index ce9cf9a..6a544c0 100644
+--- a/meson.build
++++ b/meson.build
+@@ -449,6 +449,7 @@ libgit_sources = [
+   'refs.c',
+   'refs/debug.c',
+   'refs/files-backend.c',
++  'refs/helper-backend.c',
+   'refs/reftable-backend.c',
+   'refs/iterator.c',
+   'refs/packed-backend.c',
+diff --git a/refs.c b/refs.c
+index 6fb8f9d..92a7d3e 100644
+--- a/refs.c
++++ b/refs.c
+@@ -31,6 +31,7 @@
+ #include "wildmatch.h"
+ #include "ident.h"
+ #include "fsck.h"
++#include "refs/helper-backend.h"
+ 
+ /*
+  * List of all available backends
+@@ -38,6 +39,7 @@
+ static const struct ref_storage_be *refs_backends[] = {
+ 	[REF_STORAGE_FORMAT_FILES] = &refs_be_files,
+ 	[REF_STORAGE_FORMAT_REFTABLE] = &refs_be_reftable,
++	[REF_STORAGE_FORMAT_HELPER] = &refs_be_helper,
+ };
+ 
+ static const struct ref_storage_be *find_ref_storage_backend(
+diff --git a/refs/helper-backend.c b/refs/helper-backend.c
+new file mode 100644
+index 0000000..9eec98e
+--- /dev/null
++++ b/refs/helper-backend.c
+@@ -0,0 +1,652 @@
++/*
++ * Ref helper backend: delegate ref storage to an external process.
++ *
++ * Follows the same pattern as odb/source-helper.c for object storage
++ * and transport-helper.c for remote helpers. The helper binary is
++ * discovered as "git-ref-<name>" in PATH and communicates via a
++ * line-based protocol on stdin/stdout.
++ */
++#include "../git-compat-util.h"
++#include "../gettext.h"
++#include "../hash.h"
++#include "../hex.h"
++#include "../object.h"
++#include "../repository.h"
++#include "../run-command.h"
++#include "../sigchain.h"
++#include "../strbuf.h"
++#include "../strvec.h"
++#include "../wrapper.h"
++#include "refs-internal.h"
++#include "helper-backend.h"
++
++struct helper_ref_store {
++	struct ref_store base;
++	struct child_process *helper;
++	FILE *helper_out;
++	char *helper_name;
++	unsigned int store_flags;
++
++	unsigned cap_read:1,
++		 cap_list:1,
++		 cap_transaction:1,
++		 cap_create:1;
++};
++
++static struct child_process *get_ref_helper(struct helper_ref_store *refs)
++{
++	struct child_process *helper;
++	struct strbuf line = STRBUF_INIT;
++	int duped;
++
++	if (refs->helper)
++		return refs->helper;
++
++	helper = xmalloc(sizeof(*helper));
++	child_process_init(helper);
++	helper->in = -1;
++	helper->out = -1;
++	helper->err = 0;
++	helper->silent_exec_failure = 1;
++	strvec_pushf(&helper->args, "git-ref-%s", refs->helper_name);
++	strvec_push(&helper->args, refs->base.gitdir);
++
++	if (start_command(helper) < 0)
++		die(_("unable to start ref helper '%s'"), refs->helper_name);
++
++	refs->helper = helper;
++
++	duped = dup(helper->out);
++	if (duped < 0)
++		die_errno(_("cannot dup ref helper output fd"));
++	refs->helper_out = fdopen(duped, "r");
++	if (!refs->helper_out)
++		die_errno(_("cannot fdopen ref helper output"));
++
++	/* Negotiate capabilities */
++	sigchain_push(SIGPIPE, SIG_IGN);
++	write_in_full(helper->in, "capabilities\n", 13);
++	sigchain_pop(SIGPIPE);
++
++	while (strbuf_getline_lf(&line, refs->helper_out) != EOF) {
++		if (!line.len)
++			break;
++		if (!strcmp(line.buf, "read"))
++			refs->cap_read = 1;
++		else if (!strcmp(line.buf, "list"))
++			refs->cap_list = 1;
++		else if (!strcmp(line.buf, "transaction"))
++			refs->cap_transaction = 1;
++		else if (!strcmp(line.buf, "create"))
++			refs->cap_create = 1;
++	}
++	strbuf_release(&line);
++
++	return helper;
++}
++
++static void ref_helper_send(struct helper_ref_store *refs,
++			    const char *fmt, ...)
++{
++	struct child_process *h = get_ref_helper(refs);
++	struct strbuf buf = STRBUF_INIT;
++	va_list ap;
++
++	va_start(ap, fmt);
++	strbuf_vaddf(&buf, fmt, ap);
++	va_end(ap);
++
++	sigchain_push(SIGPIPE, SIG_IGN);
++	write_in_full(h->in, buf.buf, buf.len);
++	sigchain_pop(SIGPIPE);
++
++	strbuf_release(&buf);
++}
++
++static int ref_helper_readline(struct helper_ref_store *refs,
++			       struct strbuf *line)
++{
++	get_ref_helper(refs);
++	strbuf_reset(line);
++	return strbuf_getline_lf(line, refs->helper_out);
++}
++
++/* ---- ref_storage_be callbacks ---- */
++
++static struct helper_ref_store *helper_downcast(struct ref_store *ref_store)
++{
++	if (ref_store->be != &refs_be_helper)
++		BUG("ref_store is type \"%s\" not \"helper\"",
++		    ref_store->be->name);
++	return (struct helper_ref_store *)ref_store;
++}
++
++static struct ref_store *helper_ref_store_init(struct repository *repo,
++					       const char *payload,
++					       const char *gitdir,
++					       unsigned int flags)
++{
++	struct helper_ref_store *refs = xcalloc(1, sizeof(*refs));
++
++	if (!payload || !*payload)
++		die(_("ref helper backend requires a helper name in "
++		      "extensions.refStorage (e.g. helper://sqlite)"));
++
++	base_ref_store_init(&refs->base, repo, gitdir, &refs_be_helper);
++	refs->store_flags = flags;
++	refs->helper_name = xstrdup(payload);
++	return &refs->base;
++}
++
++static void helper_ref_store_release(struct ref_store *ref_store)
++{
++	struct helper_ref_store *refs = helper_downcast(ref_store);
++
++	if (refs->helper) {
++		close(refs->helper->in);
++		fclose(refs->helper_out);
++		finish_command(refs->helper);
++		free(refs->helper);
++	}
++	free(refs->helper_name);
++}
++
++static int helper_create_on_disk(struct ref_store *ref_store,
++				 int flags UNUSED,
++				 struct strbuf *err)
++{
++	struct helper_ref_store *refs = helper_downcast(ref_store);
++	struct strbuf line = STRBUF_INIT;
++
++	get_ref_helper(refs);
++
++	if (!refs->cap_create) {
++		strbuf_addstr(err, "ref helper does not support create");
++		return -1;
++	}
++
++	ref_helper_send(refs, "create\n");
++	if (ref_helper_readline(refs, &line) == EOF) {
++		strbuf_addstr(err, "ref helper EOF during create");
++		strbuf_release(&line);
++		return -1;
++	}
++
++	if (starts_with(line.buf, "error ")) {
++		strbuf_addstr(err, line.buf + 6);
++		strbuf_release(&line);
++		return -1;
++	}
++
++	strbuf_release(&line);
++	return 0;
++}
++
++static int helper_remove_on_disk(struct ref_store *ref_store UNUSED,
++				 struct strbuf *err)
++{
++	strbuf_addstr(err, "ref helper does not support remove_on_disk");
++	return -1;
++}
++
++/* ---- Read operations ---- */
++
++static int helper_read_raw_ref(struct ref_store *ref_store,
++			       const char *refname,
++			       struct object_id *oid,
++			       struct strbuf *referent,
++			       unsigned int *type,
++			       int *failure_errno)
++{
++	struct helper_ref_store *refs = helper_downcast(ref_store);
++	struct strbuf line = STRBUF_INIT;
++
++	get_ref_helper(refs);
++
++	if (!refs->cap_read) {
++		*failure_errno = ENOENT;
++		return -1;
++	}
++
++	ref_helper_send(refs, "read %s\n", refname);
++	if (ref_helper_readline(refs, &line) == EOF) {
++		*failure_errno = ENOENT;
++		strbuf_release(&line);
++		return -1;
++	}
++
++	if (!strcmp(line.buf, "missing")) {
++		*failure_errno = ENOENT;
++		strbuf_release(&line);
++		return -1;
++	}
++
++	if (starts_with(line.buf, "symref ")) {
++		strbuf_reset(referent);
++		strbuf_addstr(referent, line.buf + 7);
++		*type = REF_ISSYMREF;
++		strbuf_release(&line);
++		return 0;
++	}
++
++	/* Regular ref: line is hex oid */
++	if (get_oid_hex_any(line.buf, oid) == GIT_HASH_UNKNOWN) {
++		*failure_errno = EINVAL;
++		strbuf_release(&line);
++		return -1;
++	}
++	*type = 0;
++	strbuf_release(&line);
++	return 0;
++}
++
++static int helper_read_symbolic_ref(struct ref_store *ref_store,
++				    const char *refname,
++				    struct strbuf *referent)
++{
++	struct object_id oid;
++	unsigned int type = 0;
++	int failure_errno = 0;
++
++	if (helper_read_raw_ref(ref_store, refname, &oid, referent,
++				&type, &failure_errno))
++		return -1;
++	if (!(type & REF_ISSYMREF))
++		return -1;
++	return 0;
++}
++
++/* ---- Iterator ---- */
++
++struct helper_ref_iterator {
++	struct ref_iterator base;
++	struct helper_ref_store *refs;
++	struct strbuf line;
++	struct object_id oid;
++	char *current_refname;
++	char *current_target;
++	int done;
++};
++
++static int helper_ref_iterator_advance(struct ref_iterator *ref_iterator)
++{
++	struct helper_ref_iterator *iter =
++		(struct helper_ref_iterator *)ref_iterator;
++
++	if (iter->done)
++		return ITER_DONE;
++
++	free(iter->current_refname);
++	iter->current_refname = NULL;
++	free(iter->current_target);
++	iter->current_target = NULL;
++
++	if (ref_helper_readline(iter->refs, &iter->line) == EOF) {
++		iter->done = 1;
++		return ITER_DONE;
++	}
++
++	if (!iter->line.len) {
++		iter->done = 1;
++		return ITER_DONE;
++	}
++
++	/* Parse "<refname> <oid>" or "<refname> symref <target>" */
++	{
++		const char *p = iter->line.buf;
++		const char *sp = strchr(p, ' ');
++
++		if (!sp) {
++			iter->done = 1;
++			return ITER_ERROR;
++		}
++
++		iter->current_refname = xstrndup(p, sp - p);
++		sp++;
++
++		if (starts_with(sp, "symref ")) {
++			iter->current_target = xstrdup(sp + 7);
++			oidclr(&iter->oid, iter->refs->base.repo->hash_algo);
++			iter->base.ref.target = iter->current_target;
++		} else {
++			if (get_oid_hex_any(sp, &iter->oid) == GIT_HASH_UNKNOWN) {
++				iter->done = 1;
++				return ITER_ERROR;
++			}
++			iter->base.ref.target = NULL;
++		}
++
++		iter->base.ref.name = iter->current_refname;
++		iter->base.ref.oid = &iter->oid;
++	}
++
++	return ITER_OK;
++}
++
++static int helper_ref_iterator_seek(struct ref_iterator *ref_iterator UNUSED,
++				    const char *prefix UNUSED,
++				    unsigned int flags UNUSED)
++{
++	/* Seeking is not supported; callers should create a new iterator. */
++	return -1;
++}
++
++static void helper_ref_iterator_release(struct ref_iterator *ref_iterator)
++{
++	struct helper_ref_iterator *iter =
++		(struct helper_ref_iterator *)ref_iterator;
++	strbuf_release(&iter->line);
++	free(iter->current_refname);
++	free(iter->current_target);
++}
++
++static struct ref_iterator_vtable helper_ref_iterator_vtable = {
++	.advance = helper_ref_iterator_advance,
++	.seek = helper_ref_iterator_seek,
++	.release = helper_ref_iterator_release,
++};
++
++static struct ref_iterator *helper_ref_iterator_begin(
++		struct ref_store *ref_store,
++		const char *prefix, const char **exclude_patterns UNUSED,
++		unsigned int flags UNUSED)
++{
++	struct helper_ref_store *refs = helper_downcast(ref_store);
++	struct helper_ref_iterator *iter;
++
++	get_ref_helper(refs);
++
++	if (!refs->cap_list)
++		return empty_ref_iterator_begin();
++
++	CALLOC_ARRAY(iter, 1);
++	base_ref_iterator_init(&iter->base, &helper_ref_iterator_vtable);
++	iter->refs = refs;
++	strbuf_init(&iter->line, 0);
++
++	if (prefix && *prefix)
++		ref_helper_send(refs, "list %s\n", prefix);
++	else
++		ref_helper_send(refs, "list\n");
++
++	return &iter->base;
++}
++
++/* ---- Transactions ---- */
++
++static int helper_transaction_prepare(struct ref_store *ref_store,
++				      struct ref_transaction *transaction,
++				      struct strbuf *err)
++{
++	struct helper_ref_store *refs = helper_downcast(ref_store);
++	struct strbuf line = STRBUF_INIT;
++	int ret = 0;
++
++	get_ref_helper(refs);
++
++	if (!refs->cap_transaction) {
++		strbuf_addstr(err, "ref helper does not support transactions");
++		return -1;
++	}
++
++	ref_helper_send(refs, "transaction-begin\n");
++	if (ref_helper_readline(refs, &line) == EOF || strcmp(line.buf, "ok")) {
++		strbuf_addf(err, "ref helper transaction-begin failed: %s",
++			    line.len ? line.buf : "EOF");
++		strbuf_release(&line);
++		return -1;
++	}
++
++	for (size_t i = 0; i < transaction->nr; i++) {
++		struct ref_update *update = transaction->updates[i];
++		char new_hex[GIT_MAX_HEXSZ + 1];
++		char old_hex[GIT_MAX_HEXSZ + 1];
++
++		if (update->new_target) {
++			/* Symbolic ref creation */
++			if (update->msg && *update->msg)
++				ref_helper_send(refs,
++					"transaction-create-symref %s %s %s\n",
++					update->refname,
++					update->new_target,
++					update->msg);
++			else
++				ref_helper_send(refs,
++					"transaction-create-symref %s %s\n",
++					update->refname,
++					update->new_target);
++		} else if (update->flags & REF_HAVE_NEW &&
++			   is_null_oid(&update->new_oid)) {
++			/* Delete */
++			oid_to_hex_r(old_hex, &update->old_oid);
++			if (update->msg && *update->msg)
++				ref_helper_send(refs,
++					"transaction-delete %s %s %s\n",
++					update->refname, old_hex,
++					update->msg);
++			else
++				ref_helper_send(refs,
++					"transaction-delete %s %s\n",
++					update->refname, old_hex);
++		} else if (update->flags & REF_HAVE_OLD) {
++			/* Update with old value check */
++			oid_to_hex_r(new_hex, &update->new_oid);
++			oid_to_hex_r(old_hex, &update->old_oid);
++			if (update->msg && *update->msg)
++				ref_helper_send(refs,
++					"transaction-update %s %s %s %s\n",
++					update->refname, new_hex, old_hex,
++					update->msg);
++			else
++				ref_helper_send(refs,
++					"transaction-update %s %s %s\n",
++					update->refname, new_hex, old_hex);
++		} else {
++			/* Create (no old value check) */
++			oid_to_hex_r(new_hex, &update->new_oid);
++			if (update->msg && *update->msg)
++				ref_helper_send(refs,
++					"transaction-create %s %s %s\n",
++					update->refname, new_hex,
++					update->msg);
++			else
++				ref_helper_send(refs,
++					"transaction-create %s %s\n",
++					update->refname, new_hex);
++		}
++
++		if (ref_helper_readline(refs, &line) == EOF ||
++		    strcmp(line.buf, "ok")) {
++			strbuf_addf(err,
++				    "ref helper rejected update for '%s': %s",
++				    update->refname,
++				    line.len ? line.buf : "EOF");
++			ret = -1;
++			break;
++		}
++	}
++
++	if (!ret) {
++		ref_helper_send(refs, "transaction-prepare\n");
++		if (ref_helper_readline(refs, &line) == EOF ||
++		    strcmp(line.buf, "ok")) {
++			if (starts_with(line.buf, "error "))
++				strbuf_addstr(err, line.buf + 6);
++			else
++				strbuf_addf(err, "transaction-prepare failed: %s",
++					    line.len ? line.buf : "EOF");
++			ret = -1;
++		}
++	}
++
++	if (ret) {
++		ref_helper_send(refs, "transaction-abort\n");
++		ref_helper_readline(refs, &line);
++	}
++
++	strbuf_release(&line);
++	return ret;
++}
++
++static int helper_transaction_finish(struct ref_store *ref_store,
++				     struct ref_transaction *transaction UNUSED,
++				     struct strbuf *err)
++{
++	struct helper_ref_store *refs = helper_downcast(ref_store);
++	struct strbuf line = STRBUF_INIT;
++
++	ref_helper_send(refs, "transaction-finish\n");
++	if (ref_helper_readline(refs, &line) == EOF ||
++	    strcmp(line.buf, "ok")) {
++		if (starts_with(line.buf, "error "))
++			strbuf_addstr(err, line.buf + 6);
++		else
++			strbuf_addf(err, "transaction-finish failed: %s",
++				    line.len ? line.buf : "EOF");
++		strbuf_release(&line);
++		return -1;
++	}
++
++	strbuf_release(&line);
++	return 0;
++}
++
++static int helper_transaction_abort(struct ref_store *ref_store,
++				    struct ref_transaction *transaction UNUSED,
++				    struct strbuf *err UNUSED)
++{
++	struct helper_ref_store *refs = helper_downcast(ref_store);
++	struct strbuf line = STRBUF_INIT;
++
++	ref_helper_send(refs, "transaction-abort\n");
++	ref_helper_readline(refs, &line);
++	strbuf_release(&line);
++	return 0;
++}
++
++/* ---- Stubs for optional operations ---- */
++
++static int helper_optimize(struct ref_store *ref_store UNUSED,
++			   struct refs_optimize_opts *opts UNUSED)
++{
++	return 0;
++}
++
++static int helper_optimize_required(struct ref_store *ref_store UNUSED,
++				    struct refs_optimize_opts *opts UNUSED,
++				    bool *required)
++{
++	*required = 0;
++	return 0;
++}
++
++static int helper_rename_ref(struct ref_store *ref_store UNUSED,
++			     const char *oldref UNUSED,
++			     const char *newref UNUSED,
++			     const char *logmsg UNUSED)
++{
++	return error(_("ref helper does not support rename"));
++}
++
++static int helper_copy_ref(struct ref_store *ref_store UNUSED,
++			   const char *oldref UNUSED,
++			   const char *newref UNUSED,
++			   const char *logmsg UNUSED)
++{
++	return error(_("ref helper does not support copy"));
++}
++
++/* ---- Reflog stubs ---- */
++
++static struct ref_iterator *helper_reflog_iterator_begin(
++		struct ref_store *ref_store UNUSED)
++{
++	return empty_ref_iterator_begin();
++}
++
++static int helper_for_each_reflog_ent(struct ref_store *ref_store UNUSED,
++				      const char *refname UNUSED,
++				      each_reflog_ent_fn fn UNUSED,
++				      void *cb_data UNUSED)
++{
++	return 0;
++}
++
++static int helper_for_each_reflog_ent_reverse(
++		struct ref_store *ref_store UNUSED,
++		const char *refname UNUSED,
++		each_reflog_ent_fn fn UNUSED,
++		void *cb_data UNUSED)
++{
++	return 0;
++}
++
++static int helper_reflog_exists(struct ref_store *ref_store UNUSED,
++				const char *refname UNUSED)
++{
++	return 0;
++}
++
++static int helper_create_reflog(struct ref_store *ref_store UNUSED,
++				const char *refname UNUSED,
++				struct strbuf *err UNUSED)
++{
++	return 0;
++}
++
++static int helper_delete_reflog(struct ref_store *ref_store UNUSED,
++				const char *refname UNUSED)
++{
++	return 0;
++}
++
++static int helper_reflog_expire(struct ref_store *ref_store UNUSED,
++				const char *refname UNUSED,
++				unsigned int flags UNUSED,
++				reflog_expiry_prepare_fn prepare_fn UNUSED,
++				reflog_expiry_should_prune_fn should_prune_fn UNUSED,
++				reflog_expiry_cleanup_fn cleanup_fn UNUSED,
++				void *policy_cb_data UNUSED)
++{
++	return 0;
++}
++
++static int helper_fsck(struct ref_store *ref_store UNUSED,
++		       struct fsck_options *o UNUSED,
++		       struct worktree *wt UNUSED)
++{
++	return 0;
++}
++
++/* ---- Backend registration ---- */
++
++struct ref_storage_be refs_be_helper = {
++	.name = "helper",
++	.init = helper_ref_store_init,
++	.release = helper_ref_store_release,
++	.create_on_disk = helper_create_on_disk,
++	.remove_on_disk = helper_remove_on_disk,
++
++	.transaction_prepare = helper_transaction_prepare,
++	.transaction_finish = helper_transaction_finish,
++	.transaction_abort = helper_transaction_abort,
++
++	.optimize = helper_optimize,
++	.optimize_required = helper_optimize_required,
++	.rename_ref = helper_rename_ref,
++	.copy_ref = helper_copy_ref,
++
++	.iterator_begin = helper_ref_iterator_begin,
++	.read_raw_ref = helper_read_raw_ref,
++	.read_symbolic_ref = helper_read_symbolic_ref,
++
++	.reflog_iterator_begin = helper_reflog_iterator_begin,
++	.for_each_reflog_ent = helper_for_each_reflog_ent,
++	.for_each_reflog_ent_reverse = helper_for_each_reflog_ent_reverse,
++	.reflog_exists = helper_reflog_exists,
++	.create_reflog = helper_create_reflog,
++	.delete_reflog = helper_delete_reflog,
++	.reflog_expire = helper_reflog_expire,
++
++	.fsck = helper_fsck,
++};
+diff --git a/refs/helper-backend.h b/refs/helper-backend.h
+new file mode 100644
+index 0000000..68b14ef
+--- /dev/null
++++ b/refs/helper-backend.h
+@@ -0,0 +1,58 @@
++#ifndef REFS_HELPER_BACKEND_H
++#define REFS_HELPER_BACKEND_H
++
++/*
++ * Ref helper backend: delegate ref storage to an external process.
++ *
++ * Follows the same pattern as the ODB helper backend in odb/source-helper.c
++ * and transport helpers in transport-helper.c. The helper binary is
++ * discovered as "git-ref-<name>" in PATH and communicates via a
++ * line-based protocol on stdin/stdout.
++ *
++ * Configuration:
++ *   [extensions]
++ *     refStorage = helper://sqlite
++ *
++ * Protocol:
++ *
++ *   -> capabilities\n
++ *   <- read\n
++ *   <- list\n
++ *   <- transaction\n
++ *   <- create\n
++ *   <- \n
++ *
++ *   -> read <refname>\n
++ *   <- <hex-oid>\n                  (regular ref)
++ *   <- symref <target>\n           (symbolic ref)
++ *   <- missing\n                   (ref does not exist)
++ *
++ *   -> list [<prefix>]\n
++ *   <- <refname> <hex-oid>\n       (regular ref, repeated)
++ *   <- <refname> symref <target>\n (symbolic ref)
++ *   <- \n                          (end of list)
++ *
++ *   -> transaction-begin\n
++ *   <- ok\n
++ *   -> transaction-update <refname> <new-oid> <old-oid> [<msg>]\n
++ *   <- ok\n
++ *   -> transaction-create <refname> <new-oid> [<msg>]\n
++ *   <- ok\n
++ *   -> transaction-delete <refname> <old-oid> [<msg>]\n
++ *   <- ok\n
++ *   -> transaction-create-symref <refname> <target> [<msg>]\n
++ *   <- ok\n
++ *   -> transaction-prepare\n
++ *   <- ok\n | error <msg>\n
++ *   -> transaction-finish\n
++ *   <- ok\n | error <msg>\n
++ *   -> transaction-abort\n
++ *   <- ok\n
++ *
++ *   -> create\n
++ *   <- ok\n | error <msg>\n
++ */
++
++extern struct ref_storage_be refs_be_helper;
++
++#endif
+diff --git a/repository.h b/repository.h
+index 2970f35..b856745 100644
+--- a/repository.h
++++ b/repository.h
+@@ -25,6 +25,7 @@ enum ref_storage_format {
+ 	REF_STORAGE_FORMAT_UNKNOWN,
+ 	REF_STORAGE_FORMAT_FILES,
+ 	REF_STORAGE_FORMAT_REFTABLE,
++	REF_STORAGE_FORMAT_HELPER,
+ };
+ 
+ #ifdef WITH_BREAKING_CHANGES /* Git 3.0 */
+diff --git a/t/t0621-ref-helper.sh b/t/t0621-ref-helper.sh
+new file mode 100755
+index 0000000..4be1e4e
+--- /dev/null
++++ b/t/t0621-ref-helper.sh
+@@ -0,0 +1,171 @@
++#!/bin/sh
++
++test_description='ref helper backend basics'
++
++GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=main
++export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
++
++. ./test-lib.sh
++
++# Write a minimal ref helper that stores refs as flat files.
++# The helper name is "test", so git discovers it as "git-ref-test".
++write_ref_helper () {
++	write_script "$1" <<-'HELPER'
++	REFDIR="$1/helper-refs"
++	mkdir -p "$REFDIR"
++
++	while IFS= read -r line; do
++		case "$line" in
++		capabilities)
++			printf '%s\n' read list transaction create ""
++			;;
++		create)
++			echo ok
++			;;
++		read\ *)
++			refname="${line#read }"
++			file="$REFDIR/$(echo "$refname" | tr / _)"
++			if test -f "$file"; then
++				val=$(cat "$file")
++				case "$val" in
++				symref\ *)
++					echo "$val"
++					;;
++				*)
++					echo "$val"
++					;;
++				esac
++			else
++				echo missing
++			fi
++			;;
++		list|list\ *)
++			prefix="${line#list}"
++			prefix="${prefix# }"
++			for f in "$REFDIR"/*; do
++				test -f "$f" || continue
++				refname=$(basename "$f" | tr _ /)
++				case "$refname" in
++				"$prefix"*|"")
++					val=$(cat "$f")
++					case "$val" in
++					symref\ *)
++						target="${val#symref }"
++						echo "$refname symref $target"
++						;;
++					*)
++						echo "$refname $val"
++						;;
++					esac
++					;;
++				esac
++			done
++			echo ""
++			;;
++		transaction-begin)
++			TXUPDATES=""
++			echo ok
++			;;
++		transaction-update\ *|transaction-create\ *|transaction-delete\ *|transaction-create-symref\ *)
++			TXUPDATES="$TXUPDATES
++$line"
++			echo ok
++			;;
++		transaction-prepare)
++			echo ok
++			;;
++		transaction-finish)
++			echo "$TXUPDATES" | while IFS= read -r upd; do
++				test -z "$upd" && continue
++				case "$upd" in
++				transaction-update\ *)
++					set -- $upd
++					shift
++					refname="$1"
++					new_oid="$2"
++					file="$REFDIR/$(echo "$refname" | tr / _)"
++					echo "$new_oid" >"$file"
++					;;
++				transaction-create\ *)
++					set -- $upd
++					shift
++					refname="$1"
++					new_oid="$2"
++					file="$REFDIR/$(echo "$refname" | tr / _)"
++					echo "$new_oid" >"$file"
++					;;
++				transaction-delete\ *)
++					set -- $upd
++					shift
++					refname="$1"
++					file="$REFDIR/$(echo "$refname" | tr / _)"
++					rm -f "$file"
++					;;
++				transaction-create-symref\ *)
++					set -- $upd
++					shift
++					refname="$1"
++					target="$2"
++					file="$REFDIR/$(echo "$refname" | tr / _)"
++					echo "symref $target" >"$file"
++					;;
++				esac
++			done
++			echo ok
++			;;
++		transaction-abort)
++			TXUPDATES=""
++			echo ok
++			;;
++		"")
++			;;
++		esac
++	done
++	HELPER
++}
++
++test_expect_success 'setup ref helper in PATH' '
++	mkdir helper-bin &&
++	write_ref_helper helper-bin/git-ref-test &&
++	PATH="$PWD/helper-bin:$PATH" &&
++	export PATH
++'
++
++# Helper to create a repo with both the ref and odb helper configured.
++setup_helper_repo () {
++	git init "$1" &&
++	git config --file "$1/.git/config" core.repositoryformatversion 1 &&
++	git config --file "$1/.git/config" extensions.refStorage "helper://test"
++}
++
++test_expect_success 'config: extensions.refStorage = helper://test is accepted' '
++	test_when_finished "rm -rf repo" &&
++	setup_helper_repo repo &&
++	git -C repo rev-parse --git-dir
++'
++
++test_expect_success 'update-ref: write and read a ref through helper' '
++	test_when_finished "rm -rf repo" &&
++	setup_helper_repo repo &&
++	oid=$(git -C repo hash-object -w --stdin </dev/null) &&
++	git -C repo update-ref refs/heads/test $oid &&
++	echo $oid >expect &&
++	git -C repo rev-parse refs/heads/test >actual &&
++	test_cmp expect actual
++'
++
++test_expect_success 'for-each-ref: list refs through helper' '
++	test_when_finished "rm -rf repo" &&
++	setup_helper_repo repo &&
++	oid=$(git -C repo hash-object -w --stdin </dev/null) &&
++	git -C repo update-ref refs/heads/branch1 $oid &&
++	git -C repo update-ref refs/heads/branch2 $oid &&
++	git -C repo for-each-ref --format="%(refname)" refs/heads/ >actual &&
++	cat >expect <<-\EOF &&
++	refs/heads/branch1
++	refs/heads/branch2
++	EOF
++	test_cmp expect actual
++'
++
++test_done
+-- 
+2.47.3
+

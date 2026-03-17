@@ -1,0 +1,844 @@
+From 71d24ce65a8b78bc44fc03e5487d2bae96bc679f Mon Sep 17 00:00:00 2001
+From: Aaron Paterson <apaterson@pm.me>
+Date: Mon, 16 Mar 2026 21:49:40 +0000
+Subject: [PATCH 1/2] odb: add helper backend for external object storage
+
+Introduce `ODB_STORAGE_FORMAT_HELPER`, a new object storage backend
+that delegates object operations to an external process. This follows
+the same pattern as transport helpers (git-remote-*) and credential
+helpers (git-credential-*).
+
+The helper binary is discovered as "git-odb-<name>" in PATH. It is
+invoked with the object directory path as its sole argument and
+communicates via a line-based protocol on stdin/stdout:
+
+  capabilities -> list supported commands
+  info <oid>   -> type size (or "missing")
+  get <oid>    -> type size + raw data (or "missing")
+  put <oid> <type> <size> + raw data -> oid
+  have <oid>   -> true/false
+  list         -> oid type size per line, blank line terminates
+
+Configuration uses the URI format already established for ref storage:
+
+  [extensions]
+    objectStorage = helper://sqlite
+
+This sets odb_storage_format to ODB_STORAGE_FORMAT_HELPER with
+"sqlite" as the payload, causing git to spawn "git-odb-sqlite" and
+pass all object operations through it.
+
+The ODB storage format and payload are now set on the repository
+struct before calling setup_git_env(), so that odb_source_new() can
+select the correct backend when creating the object database.
+
+Include unit tests for the helper format lookup and an integration
+test (t0620) that exercises the full write/read round-trip through
+a shell-based test helper.
+
+Signed-off-by: Aaron Willoughby <aaron@omniband.org>
+---
+ Makefile                    |   1 +
+ meson.build                 |   1 +
+ odb/source-helper.c         | 389 ++++++++++++++++++++++++++++++++++++
+ odb/source-helper.h         |  71 +++++++
+ odb/source.c                |   5 +
+ repository.c                |   1 +
+ repository.h                |   9 +
+ setup.c                     |  24 ++-
+ setup.h                     |   1 +
+ t/t0620-odb-helper.sh       | 121 +++++++++++
+ t/unit-tests/u-odb-source.c |  21 ++
+ 11 files changed, 641 insertions(+), 3 deletions(-)
+ create mode 100644 odb/source-helper.c
+ create mode 100644 odb/source-helper.h
+ create mode 100755 t/t0620-odb-helper.sh
+
+diff --git a/Makefile b/Makefile
+index 3d65093..b4403aa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1216,6 +1216,7 @@ LIB_OBJS += object.o
+ LIB_OBJS += odb.o
+ LIB_OBJS += odb/source.o
+ LIB_OBJS += odb/source-files.o
++LIB_OBJS += odb/source-helper.o
+ LIB_OBJS += odb/streaming.o
+ LIB_OBJS += oid-array.o
+ LIB_OBJS += oidmap.o
+diff --git a/meson.build b/meson.build
+index 1036eaf..ce9cf9a 100644
+--- a/meson.build
++++ b/meson.build
+@@ -401,6 +401,7 @@ libgit_sources = [
+   'odb.c',
+   'odb/source.c',
+   'odb/source-files.c',
++  'odb/source-helper.c',
+   'odb/streaming.c',
+   'oid-array.c',
+   'oidmap.c',
+diff --git a/odb/source-helper.c b/odb/source-helper.c
+new file mode 100644
+index 0000000..bdf605f
+--- /dev/null
++++ b/odb/source-helper.c
+@@ -0,0 +1,389 @@
++/*
++ * ODB helper: delegate object storage to an external process.
++ *
++ * Follows the same pattern as transport-helper.c for remote helpers
++ * and credential.c for credential helpers. The helper binary is
++ * discovered as "git-odb-<name>" in PATH and communicates via a
++ * line-based protocol on stdin/stdout.
++ */
++#include "git-compat-util.h"
++#include "gettext.h"
++#include "hex.h"
++#include "object.h"
++#include "object-file.h"
++#include "odb/source-helper.h"
++#include "repository.h"
++#include "run-command.h"
++#include "sigchain.h"
++#include "strbuf.h"
++#include "strvec.h"
++#include "wrapper.h"
++
++static struct child_process *get_helper(struct odb_source_helper *src)
++{
++	struct child_process *helper;
++	struct strbuf line = STRBUF_INIT;
++	int duped;
++
++	if (src->helper)
++		return src->helper;
++
++	helper = xmalloc(sizeof(*helper));
++	child_process_init(helper);
++	helper->in = -1;
++	helper->out = -1;
++	helper->err = 0;
++	helper->silent_exec_failure = 1;
++	strvec_pushf(&helper->args, "git-odb-%s", src->helper_name);
++	strvec_push(&helper->args, src->base.path);
++
++	if (start_command(helper) < 0)
++		die(_("unable to start odb helper '%s'"), src->helper_name);
++
++	src->helper = helper;
++
++	duped = dup(helper->out);
++	if (duped < 0)
++		die_errno(_("cannot dup odb helper output fd"));
++	src->helper_out = fdopen(duped, "r");
++	if (!src->helper_out)
++		die_errno(_("cannot fdopen odb helper output"));
++
++	/* Negotiate capabilities */
++	sigchain_push(SIGPIPE, SIG_IGN);
++	write_in_full(helper->in, "capabilities\n", 13);
++	sigchain_pop(SIGPIPE);
++
++	while (strbuf_getline_lf(&line, src->helper_out) != EOF) {
++		if (!line.len)
++			break;
++		if (!strcmp(line.buf, "get"))
++			src->cap_get = 1;
++		else if (!strcmp(line.buf, "put"))
++			src->cap_put = 1;
++		else if (!strcmp(line.buf, "have"))
++			src->cap_have = 1;
++		else if (!strcmp(line.buf, "info"))
++			src->cap_info = 1;
++		else if (!strcmp(line.buf, "list"))
++			src->cap_list = 1;
++	}
++	strbuf_release(&line);
++
++	return helper;
++}
++
++static void helper_send(struct odb_source_helper *src, const char *fmt, ...)
++{
++	struct child_process *h = get_helper(src);
++	struct strbuf buf = STRBUF_INIT;
++	va_list ap;
++
++	va_start(ap, fmt);
++	strbuf_vaddf(&buf, fmt, ap);
++	va_end(ap);
++
++	sigchain_push(SIGPIPE, SIG_IGN);
++	write_in_full(h->in, buf.buf, buf.len);
++	sigchain_pop(SIGPIPE);
++
++	strbuf_release(&buf);
++}
++
++static int helper_readline(struct odb_source_helper *src, struct strbuf *line)
++{
++	get_helper(src);
++	strbuf_reset(line);
++	return strbuf_getline_lf(line, src->helper_out);
++}
++
++/* ---- odb_source callbacks ---- */
++
++static void helper_free(struct odb_source *source)
++{
++	struct odb_source_helper *src =
++		container_of(source, struct odb_source_helper, base);
++
++	if (src->helper) {
++		close(src->helper->in);
++		fclose(src->helper_out);
++		finish_command(src->helper);
++		free(src->helper);
++	}
++	free(src->helper_name);
++	odb_source_release(&src->base);
++	free(src);
++}
++
++static void helper_close(struct odb_source *source UNUSED)
++{
++	/* Keep helper process alive for reuse within this session. */
++}
++
++static void helper_reprepare(struct odb_source *source UNUSED)
++{
++	/* The helper manages its own caches. Nothing to do here. */
++}
++
++static int helper_read_object_info(struct odb_source *source,
++				   const struct object_id *oid,
++				   struct object_info *oi,
++				   enum object_info_flags flags UNUSED)
++{
++	struct odb_source_helper *src =
++		container_of(source, struct odb_source_helper, base);
++	struct strbuf line = STRBUF_INIT;
++	char hex[GIT_MAX_HEXSZ + 1];
++	char type_str[32];
++	unsigned long size;
++	enum object_type type;
++	int want_content;
++	int ret = -1;
++
++	/* Ensure the helper process is started and capabilities negotiated */
++	get_helper(src);
++
++	oid_to_hex_r(hex, oid);
++	want_content = oi->contentp != NULL;
++
++	/*
++	 * Use "info" for metadata-only requests and "get" when the
++	 * caller also wants the object content. This avoids sending
++	 * data over the pipe when only type and size are needed.
++	 */
++	if (want_content && src->cap_get)
++		helper_send(src, "get %s\n", hex);
++	else if (src->cap_info)
++		helper_send(src, "info %s\n", hex);
++	else if (src->cap_get)
++		helper_send(src, "get %s\n", hex);
++	else
++		goto out;
++
++	if (helper_readline(src, &line) == EOF)
++		goto out;
++
++	if (!strcmp(line.buf, "missing"))
++		goto out;
++
++	/* Parse "<type> <size>" */
++	if (sscanf(line.buf, "%31s %lu", type_str, &size) != 2)
++		goto out;
++
++	type = type_from_string(type_str);
++	if (oi->typep)
++		*(oi->typep) = type;
++	if (oi->sizep)
++		*(oi->sizep) = size;
++
++	if (want_content && src->cap_get) {
++		size_t got;
++
++		*oi->contentp = xmalloc(size);
++		/*
++		 * Must use fread rather than read_in_full on
++		 * fileno(helper_out) because strbuf_getline may have
++		 * buffered data in the FILE*.
++		 */
++		got = fread(*oi->contentp, 1, size, src->helper_out);
++		if (got != size) {
++			free(*oi->contentp);
++			*oi->contentp = NULL;
++			goto out;
++		}
++	}
++
++	ret = 0;
++out:
++	strbuf_release(&line);
++	return ret;
++}
++
++static int helper_read_object_stream(struct odb_read_stream **out UNUSED,
++				     struct odb_source *source UNUSED,
++				     const struct object_id *oid UNUSED)
++{
++	/* Streaming reads are not supported via the helper protocol. */
++	return -1;
++}
++
++static int helper_for_each_object(struct odb_source *source,
++				  const struct object_info *request,
++				  odb_for_each_object_cb cb,
++				  void *cb_data,
++				  unsigned flags UNUSED)
++{
++	struct odb_source_helper *src =
++		container_of(source, struct odb_source_helper, base);
++	struct strbuf line = STRBUF_INIT;
++	int ret = 0;
++
++	get_helper(src);
++
++	if (!src->cap_list)
++		return 0;
++
++	helper_send(src, "list\n");
++
++	while (helper_readline(src, &line) != EOF) {
++		char oid_hex[GIT_MAX_HEXSZ + 1];
++		char type_str[32];
++		unsigned long size;
++		struct object_id oid;
++		struct object_info oi = OBJECT_INFO_INIT;
++		enum object_type type;
++
++		if (!line.len)
++			break;
++
++		if (sscanf(line.buf, "%s %31s %lu",
++			   oid_hex, type_str, &size) != 3)
++			continue;
++
++		if (get_oid_hex_any(oid_hex, &oid) == GIT_HASH_UNKNOWN)
++			continue;
++
++		type = type_from_string(type_str);
++		if (request && request->typep)
++			oi.typep = &type;
++		if (request && request->sizep)
++			oi.sizep = &size;
++
++		ret = cb(&oid, &oi, cb_data);
++		if (ret)
++			break;
++	}
++	strbuf_release(&line);
++	return ret;
++}
++
++static int helper_freshen_object(struct odb_source *source,
++				 const struct object_id *oid)
++{
++	struct odb_source_helper *src =
++		container_of(source, struct odb_source_helper, base);
++	struct strbuf line = STRBUF_INIT;
++	char hex[GIT_MAX_HEXSZ + 1];
++	int exists;
++
++	get_helper(src);
++
++	if (!src->cap_have)
++		return 0;
++
++	oid_to_hex_r(hex, oid);
++	helper_send(src, "have %s\n", hex);
++
++	if (helper_readline(src, &line) == EOF) {
++		strbuf_release(&line);
++		return 0;
++	}
++	exists = !strcmp(line.buf, "true");
++	strbuf_release(&line);
++	return exists;
++}
++
++static int helper_write_object(struct odb_source *source,
++			       const void *buf, unsigned long len,
++			       enum object_type type,
++			       struct object_id *oid,
++			       struct object_id *compat_oid,
++			       unsigned flags UNUSED)
++{
++	struct odb_source_helper *src =
++		container_of(source, struct odb_source_helper, base);
++	struct strbuf line = STRBUF_INIT;
++	char hex[GIT_MAX_HEXSZ + 1];
++
++	/* Ensure the helper process is started and capabilities negotiated */
++	get_helper(src);
++
++	if (!src->cap_put)
++		return -1;
++
++	/* Compute OID locally so the helper can store it directly */
++	hash_object_file(src->base.odb->repo->hash_algo, buf, len, type, oid);
++	oid_to_hex_r(hex, oid);
++
++	helper_send(src, "put %s %s %lu\n", hex, type_name(type), len);
++
++	sigchain_push(SIGPIPE, SIG_IGN);
++	write_in_full(get_helper(src)->in, buf, len);
++	sigchain_pop(SIGPIPE);
++
++	if (helper_readline(src, &line) == EOF) {
++		strbuf_release(&line);
++		return -1;
++	}
++	strbuf_release(&line);
++
++	if (compat_oid)
++		oidcpy(compat_oid, oid);
++	return 0;
++}
++
++static int helper_write_object_stream(struct odb_source *source UNUSED,
++				      struct odb_write_stream *stream UNUSED,
++				      size_t len UNUSED,
++				      struct object_id *oid UNUSED)
++{
++	return -1;
++}
++
++static int helper_begin_transaction(struct odb_source *source UNUSED,
++				    struct odb_transaction **out UNUSED)
++{
++	return -1;
++}
++
++static int helper_read_alternates(struct odb_source *source UNUSED,
++				  struct strvec *out UNUSED)
++{
++	return 0;
++}
++
++static int helper_write_alternate(struct odb_source *source UNUSED,
++				  const char *alternate UNUSED)
++{
++	return -1;
++}
++
++/* ---- Constructor ---- */
++
++struct odb_source_helper *odb_source_helper_new(struct object_database *odb,
++						const char *helper_name,
++						const char *path,
++						bool local)
++{
++	struct odb_source_helper *src;
++
++	CALLOC_ARRAY(src, 1);
++	odb_source_init(&src->base, odb, ODB_STORAGE_FORMAT_HELPER, path, local);
++	src->helper_name = xstrdup(helper_name);
++	src->base.free = helper_free;
++	src->base.close = helper_close;
++	src->base.reprepare = helper_reprepare;
++	src->base.read_object_info = helper_read_object_info;
++	src->base.read_object_stream = helper_read_object_stream;
++	src->base.for_each_object = helper_for_each_object;
++	src->base.freshen_object = helper_freshen_object;
++	src->base.write_object = helper_write_object;
++	src->base.write_object_stream = helper_write_object_stream;
++	src->base.begin_transaction = helper_begin_transaction;
++	src->base.read_alternates = helper_read_alternates;
++	src->base.write_alternate = helper_write_alternate;
++	return src;
++}
++
++struct odb_source *odb_source_helper_new_base(struct object_database *odb,
++					      const char *path,
++					      bool local)
++{
++	const char *payload = odb->repo->odb_storage_payload;
++
++	if (!payload || !*payload)
++		die(_("odb helper backend requires a helper name in "
++		      "extensions.objectStorage (e.g. helper://sqlite)"));
++
++	return &odb_source_helper_new(odb, payload, path, local)->base;
++}
+diff --git a/odb/source-helper.h b/odb/source-helper.h
+new file mode 100644
+index 0000000..baf0859
+--- /dev/null
++++ b/odb/source-helper.h
+@@ -0,0 +1,71 @@
++#ifndef ODB_SOURCE_HELPER_H
++#define ODB_SOURCE_HELPER_H
++
++#include "odb/source.h"
++
++struct child_process;
++
++/*
++ * The helper object database source delegates object operations to an
++ * external process, following the same pattern as transport helpers
++ * (git-remote-*) and credential helpers (git-credential-*).
++ *
++ * The helper binary is discovered as "git-odb-<name>" in PATH. It is
++ * invoked with the object directory path as its sole argument and
++ * communicates via a line-based protocol on stdin/stdout.
++ *
++ * The protocol begins with a capabilities handshake:
++ *
++ *   -> capabilities\n
++ *   <- get\n
++ *   <- put\n
++ *   <- have\n
++ *   <- info\n
++ *   <- list\n
++ *   <- \n
++ *
++ * Supported commands:
++ *
++ *   -> info <oid-hex>\n
++ *   <- <type> <size>\n    (or "missing\n")
++ *
++ *   -> get <oid-hex>\n
++ *   <- <type> <size>\n    (or "missing\n")
++ *   <- <size bytes of raw data>
++ *
++ *   -> put <oid-hex> <type> <size>\n
++ *   -> <size bytes of raw data>
++ *   <- <oid-hex>\n
++ *
++ *   -> have <oid-hex>\n
++ *   <- true\n | false\n
++ *
++ *   -> list\n
++ *   <- <oid-hex> <type> <size>\n  (repeated)
++ *   <- \n
++ */
++struct odb_source_helper {
++	struct odb_source base;
++	struct child_process *helper;
++	FILE *helper_out;
++	char *helper_name;
++
++	unsigned cap_get:1,
++		 cap_put:1,
++		 cap_have:1,
++		 cap_info:1,
++		 cap_list:1;
++};
++
++/* Allocate and initialize a new helper source. */
++struct odb_source_helper *odb_source_helper_new(struct object_database *odb,
++						const char *helper_name,
++						const char *path,
++						bool local);
++
++/* Wrapper returning the base odb_source pointer, for use in dispatch tables. */
++struct odb_source *odb_source_helper_new_base(struct object_database *odb,
++					      const char *path,
++					      bool local);
++
++#endif
+diff --git a/odb/source.c b/odb/source.c
+index cf54169..72b02dc 100644
+--- a/odb/source.c
++++ b/odb/source.c
+@@ -1,6 +1,7 @@
+ #include "git-compat-util.h"
+ #include "object-file.h"
+ #include "odb/source-files.h"
++#include "odb/source-helper.h"
+ #include "odb/source.h"
+ #include "packfile.h"
+ #include "repository.h"
+@@ -21,6 +22,10 @@ static const struct {
+ 		.name = "files",
+ 		.new_source = odb_source_files_new_base,
+ 	},
++	[ODB_STORAGE_FORMAT_HELPER] = {
++		.name = "helper",
++		.new_source = odb_source_helper_new_base,
++	},
+ };
+ 
+ static const char *find_odb_storage_backend_name(
+diff --git a/repository.c b/repository.c
+index 0b8f7ec..11d6813 100644
+--- a/repository.c
++++ b/repository.c
+@@ -396,6 +396,7 @@ void repo_clear(struct repository *repo)
+ 	FREE_AND_NULL(repo->worktree);
+ 	FREE_AND_NULL(repo->submodule_prefix);
+ 	FREE_AND_NULL(repo->ref_storage_payload);
++	FREE_AND_NULL(repo->odb_storage_payload);
+ 
+ 	odb_free(repo->objects);
+ 	repo->objects = NULL;
+diff --git a/repository.h b/repository.h
+index a60a3be..2970f35 100644
+--- a/repository.h
++++ b/repository.h
+@@ -18,6 +18,7 @@ struct remote_state;
+ enum odb_storage_format {
+ 	ODB_STORAGE_FORMAT_UNKNOWN,
+ 	ODB_STORAGE_FORMAT_FILES,
++	ODB_STORAGE_FORMAT_HELPER,
+ };
+ 
+ enum ref_storage_format {
+@@ -162,6 +163,14 @@ struct repository {
+ 
+ 	/* Repository's object storage format, as serialized on disk. */
+ 	enum odb_storage_format odb_storage_format;
++
++	/*
++	 * Object storage information as needed for the backend. For the
++	 * helper backend this contains the helper name (e.g. "sqlite"
++	 * for git-odb-sqlite).
++	 */
++	char *odb_storage_payload;
++
+ 	/*
+ 	 * Reference storage information as needed for the backend. This contains
+ 	 * only the payload from the reference URI without the schema.
+diff --git a/setup.c b/setup.c
+index 9274525..065a613 100644
+--- a/setup.c
++++ b/setup.c
+@@ -707,10 +707,17 @@ static enum extension_result handle_extension(const char *var,
+ 		return EXTENSION_OK;
+ 	} else if (!strcmp(ext, "objectstorage")) {
+ 		enum odb_storage_format format;
++		char *format_str;
+ 
+ 		if (!value)
+ 			return config_error_nonbool(var);
+-		format = odb_storage_format_by_name(value);
++
++		parse_reference_uri(value, &format_str,
++				    &data->odb_storage_payload);
++
++		format = odb_storage_format_by_name(format_str);
++		free(format_str);
++
+ 		if (format == ODB_STORAGE_FORMAT_UNKNOWN)
+ 			return error(_("invalid value for '%s': '%s'"),
+ 				     "extensions.objectStorage", value);
+@@ -887,6 +894,7 @@ void clear_repository_format(struct repository_format *format)
+ 	free(format->work_tree);
+ 	free(format->partial_clone);
+ 	free(format->ref_storage_payload);
++	free(format->odb_storage_payload);
+ 	init_repository_format(format);
+ }
+ 
+@@ -1973,6 +1981,18 @@ const char *setup_git_directory_gently(int *nongit_ok)
+ 			const char *gitdir = getenv(GIT_DIR_ENVIRONMENT);
+ 			if (!gitdir)
+ 				gitdir = DEFAULT_GIT_DIR_ENVIRONMENT;
++			/*
++			 * Set the ODB storage format before creating the
++			 * object database so that odb_source_new() can
++			 * select the correct backend.
++			 */
++			if (startup_info->have_repository) {
++				the_repository->odb_storage_format =
++					repo_fmt.odb_storage_format;
++				free(the_repository->odb_storage_payload);
++				the_repository->odb_storage_payload =
++					xstrdup_or_null(repo_fmt.odb_storage_payload);
++			}
+ 			setup_git_env(gitdir);
+ 		}
+ 		if (startup_info->have_repository) {
+@@ -1982,8 +2002,6 @@ const char *setup_git_directory_gently(int *nongit_ok)
+ 			repo_set_ref_storage_format(the_repository,
+ 						    repo_fmt.ref_storage_format,
+ 						    repo_fmt.ref_storage_payload);
+-			the_repository->odb_storage_format =
+-				repo_fmt.odb_storage_format;
+ 			the_repository->repository_format_worktree_config =
+ 				repo_fmt.worktree_config;
+ 			the_repository->repository_format_relative_worktrees =
+diff --git a/setup.h b/setup.h
+index a94771c..c52eff1 100644
+--- a/setup.h
++++ b/setup.h
+@@ -174,6 +174,7 @@ struct repository_format {
+ 	enum ref_storage_format ref_storage_format;
+ 	char *ref_storage_payload;
+ 	enum odb_storage_format odb_storage_format;
++	char *odb_storage_payload;
+ 	int sparse_index;
+ 	char *work_tree;
+ 	struct string_list unknown_extensions;
+diff --git a/t/t0620-odb-helper.sh b/t/t0620-odb-helper.sh
+new file mode 100755
+index 0000000..1ffc104
+--- /dev/null
++++ b/t/t0620-odb-helper.sh
+@@ -0,0 +1,121 @@
++#!/bin/sh
++
++test_description='ODB helper backend basics'
++
++GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=main
++export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
++
++. ./test-lib.sh
++
++# Write a minimal ODB helper that stores objects as flat files.
++# The helper name is "test", so git discovers it as "git-odb-test".
++write_helper () {
++	write_script "$1" <<-'EOF'
++	OBJDIR="$1/helper-objects"
++	mkdir -p "$OBJDIR"
++	while IFS= read -r line; do
++		case "$line" in
++		capabilities)
++			printf '%s\n' get put have info list ""
++			;;
++		info\ *)
++			oid="${line#info }"
++			if test -f "$OBJDIR/$oid.meta"; then
++				cat "$OBJDIR/$oid.meta"
++			else
++				echo missing
++			fi
++			;;
++		get\ *)
++			oid="${line#get }"
++			if test -f "$OBJDIR/$oid.meta"; then
++				cat "$OBJDIR/$oid.meta"
++				cat "$OBJDIR/$oid"
++			else
++				echo missing
++			fi
++			;;
++		put\ *)
++			# put <oid> <type> <size>
++			oid=$(echo "$line" | cut -d' ' -f2)
++			type=$(echo "$line" | cut -d' ' -f3)
++			size=$(echo "$line" | cut -d' ' -f4)
++			printf '%s %s\n' "$type" "$size" >"$OBJDIR/$oid.meta"
++			head -c "$size" >"$OBJDIR/$oid"
++			echo "$oid"
++			;;
++		have\ *)
++			oid="${line#have }"
++			if test -f "$OBJDIR/$oid.meta"; then
++				echo true
++			else
++				echo false
++			fi
++			;;
++		list)
++			for meta in "$OBJDIR"/*.meta; do
++				test -f "$meta" || continue
++				oid=$(basename "$meta" .meta)
++				read -r type size <"$meta"
++				printf '%s %s %s\n' "$oid" "$type" "$size"
++			done
++			echo ""
++			;;
++		"")
++			;;
++		esac
++	done
++	EOF
++}
++
++test_expect_success 'setup helper in PATH' '
++	mkdir helper-bin &&
++	write_helper helper-bin/git-odb-test &&
++	PATH="$PWD/helper-bin:$PATH" &&
++	export PATH
++'
++
++# Helper to create a repo with the helper backend configured.
++# Uses --file to write config directly, bypassing format checks.
++setup_helper_repo () {
++	git init "$1" &&
++	git config --file "$1/.git/config" core.repositoryformatversion 1 &&
++	git config --file "$1/.git/config" extensions.objectStorage "helper://test"
++}
++
++test_expect_success 'config: extensions.objectStorage = helper://test is accepted' '
++	test_when_finished "rm -rf repo" &&
++	setup_helper_repo repo &&
++	git -C repo rev-parse --git-dir
++'
++
++test_expect_success 'hash-object: write through helper backend' '
++	test_when_finished "rm -rf repo" &&
++	setup_helper_repo repo &&
++	echo "hello world" >repo/file &&
++	oid=$(git -C repo hash-object -w --stdin <repo/file) &&
++	test -n "$oid" &&
++	test -f repo/.git/objects/helper-objects/$oid
++'
++
++test_expect_success 'cat-file: read through helper backend' '
++	test_when_finished "rm -rf repo" &&
++	setup_helper_repo repo &&
++	echo "hello world" >repo/file &&
++	oid=$(git -C repo hash-object -w --stdin <repo/file) &&
++	echo "hello world" >expect &&
++	git -C repo cat-file blob $oid >actual &&
++	test_cmp expect actual
++'
++
++test_expect_success 'cat-file -t: type through helper backend' '
++	test_when_finished "rm -rf repo" &&
++	setup_helper_repo repo &&
++	echo "hello world" >repo/file &&
++	oid=$(git -C repo hash-object -w --stdin <repo/file) &&
++	echo blob >expect &&
++	git -C repo cat-file -t $oid >actual &&
++	test_cmp expect actual
++'
++
++test_done
+diff --git a/t/unit-tests/u-odb-source.c b/t/unit-tests/u-odb-source.c
+index e222086..eb6296d 100644
+--- a/t/unit-tests/u-odb-source.c
++++ b/t/unit-tests/u-odb-source.c
+@@ -90,3 +90,24 @@ void test_odb_source__free_null_is_noop(void)
+ 	/* odb_source_free(NULL) must not crash. */
+ 	odb_source_free(NULL);
+ }
++
++void test_odb_source__format_by_name_helper(void)
++{
++	cl_assert_equal_i(ODB_STORAGE_FORMAT_HELPER,
++			  odb_storage_format_by_name("helper"));
++}
++
++void test_odb_source__format_to_name_helper(void)
++{
++	cl_assert_equal_s("helper",
++			  odb_storage_format_to_name(ODB_STORAGE_FORMAT_HELPER));
++}
++
++void test_odb_source__try_returns_null_for_helper_type(void)
++{
++	struct odb_source src;
++	memset(&src, 0, sizeof(src));
++	src.type = ODB_STORAGE_FORMAT_HELPER;
++
++	cl_assert(odb_source_files_try(&src) == NULL);
++}
+-- 
+2.47.3
+

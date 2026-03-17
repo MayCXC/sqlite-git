@@ -1,30 +1,36 @@
-From cf3215c10e37df369a78345d892d17cc9a685f95 Mon Sep 17 00:00:00 2001
+From e58da8135853dc668d3cc4df39d120efff427fa6 Mon Sep 17 00:00:00 2001
 From: Aaron Paterson <apaterson@pm.me>
-Date: Mon, 16 Mar 2026 16:14:24 +0000
-Subject: [PATCH 2/2] odb: add storage format dispatch for pluggable backends
+Date: Mon, 16 Mar 2026 23:33:55 +0000
+Subject: [PATCH] odb: rename odb_source_type to odb_storage_format and add
+ dispatch
 
-Introduce a dispatch table `odb_backends[]` in `odb/source.c`, indexed by
-`odb_storage_format`, mirroring how `refs_backends[]` in `refs.c` maps
-`ref_storage_format` to ref backend constructors.
+Rename `odb_source_type` to `odb_storage_format` and move the enum
+from `odb/source.h` to `repository.h`, mirroring how
+`ref_storage_format` lives in `repository.h`.
 
-The dispatch table stores a name and constructor function for each
-backend. Lookup helpers convert between the enum and name string:
+Rename enum values: `ODB_SOURCE_UNKNOWN` becomes
+`ODB_STORAGE_FORMAT_UNKNOWN`, `ODB_SOURCE_FILES` becomes
+`ODB_STORAGE_FORMAT_FILES`. All existing users are updated.
 
-  - `odb_storage_format_by_name()` returns the enum value for a name.
-  - `odb_storage_format_to_name()` returns the name for an enum value.
+Introduce a dispatch table `odb_backends[]` in `odb/source.c`,
+indexed by `odb_storage_format`, mirroring how `refs_backends[]`
+in `refs.c` maps `ref_storage_format` to ref backend constructors.
 
-These follow the same pattern as `ref_storage_format_by_name()` and
-`ref_storage_format_to_name()`.
+`odb_source_new()` now consults `repo->odb_storage_format` to select
+the backend constructor from the table, falling back to the files
+backend when the format is unknown.
 
-`odb_source_new()` now consults `repo->odb_storage_format` to select the
-backend constructor from the table, falling back to the files backend
-when the format is unknown.
+In `setup.c`, add support for the `extensions.objectStorage` config
+key, parsed the same way as `extensions.refStorage`. The
+`repository_format` struct gains an `odb_storage_format` field,
+initialized to `ODB_STORAGE_FORMAT_FILES` by default.
 
-In `setup.c`, add support for the `extensions.objectStorage` config key,
-parsed the same way as `extensions.refStorage`. The `repository_format`
-struct gains an `odb_storage_format` field, initialized to
-`ODB_STORAGE_FORMAT_FILES` by default, matching how `ref_storage_format`
-defaults to `REF_STORAGE_FORMAT_FILES`.
+The ODB storage format is set on the repository struct before
+calling `setup_git_env()`, so that `odb_source_new()` can select
+the correct backend when creating the object database.
+
+Add `odb_source_files_new_base()` wrapper that returns the base
+`odb_source` pointer, for use in the dispatch table.
 
 Extend the unit tests to cover the new format lookup functions,
 `odb_source_init()`, `odb_source_release()`, and the NULL safety of
@@ -32,20 +38,34 @@ Extend the unit tests to cover the new format lookup functions,
 
 Signed-off-by: Aaron Willoughby <aaron@omniband.org>
 ---
- odb/source-files.h          |  7 ++++
- odb/source.c                | 55 +++++++++++++++++++++++++++++-
- odb/source.h                |  7 ++++
- repository.h                |  3 ++
- setup.c                     | 14 ++++++++
- setup.h                     |  2 ++
- t/unit-tests/u-odb-source.c | 67 +++++++++++++++++++++++++++++++++++++
- 7 files changed, 154 insertions(+), 1 deletion(-)
+ odb/source-files.c          |  2 +-
+ odb/source-files.h          | 11 ++++-
+ odb/source.c                | 57 +++++++++++++++++++++-
+ odb/source.h                | 23 ++++-----
+ repository.h                | 11 +++++
+ setup.c                     | 21 +++++++++
+ setup.h                     |  2 +
+ t/unit-tests/u-odb-source.c | 94 +++++++++++++++++++++++++++++++++++--
+ 8 files changed, 200 insertions(+), 21 deletions(-)
 
+diff --git a/odb/source-files.c b/odb/source-files.c
+index 14cb9ad..a88f37c 100644
+--- a/odb/source-files.c
++++ b/odb/source-files.c
+@@ -210,7 +210,7 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
+ 	struct odb_source_files *files;
+ 
+ 	CALLOC_ARRAY(files, 1);
+-	odb_source_init(&files->base, odb, ODB_SOURCE_FILES, path, local);
++	odb_source_init(&files->base, odb, ODB_STORAGE_FORMAT_FILES, path, local);
+ 	files->loose = odb_source_loose_new(&files->base);
+ 	files->packed = packfile_store_new(&files->base);
+ 
 diff --git a/odb/source-files.h b/odb/source-files.h
-index 9e03c8e..b7d7ea0 100644
+index abd093b..a4f7b67 100644
 --- a/odb/source-files.h
 +++ b/odb/source-files.h
-@@ -21,6 +21,13 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
+@@ -21,13 +21,20 @@ struct odb_source_files *odb_source_files_new(struct object_database *odb,
  					      const char *path,
  					      bool local);
  
@@ -59,11 +79,28 @@ index 9e03c8e..b7d7ea0 100644
  /*
   * Cast the given object database source to the files backend. This will cause
   * a BUG in case the source doesn't use this backend.
+  */
+ static inline struct odb_source_files *odb_source_files_downcast(struct odb_source *source)
+ {
+-	if (source->type != ODB_SOURCE_FILES)
++	if (source->type != ODB_STORAGE_FORMAT_FILES)
+ 		BUG("trying to downcast source of type '%d' to files", source->type);
+ 	return container_of(source, struct odb_source_files, base);
+ }
+@@ -41,7 +48,7 @@ static inline struct odb_source_files *odb_source_files_downcast(struct odb_sour
+  */
+ static inline struct odb_source_files *odb_source_files_try(struct odb_source *source)
+ {
+-	if (source->type != ODB_SOURCE_FILES)
++	if (source->type != ODB_STORAGE_FORMAT_FILES)
+ 		return NULL;
+ 	return container_of(source, struct odb_source_files, base);
+ }
 diff --git a/odb/source.c b/odb/source.c
-index cb3818a..cf54169 100644
+index 7993dcb..cf54169 100644
 --- a/odb/source.c
 +++ b/odb/source.c
-@@ -3,12 +3,65 @@
+@@ -3,17 +3,70 @@
  #include "odb/source-files.h"
  #include "odb/source.h"
  #include "packfile.h"
@@ -130,11 +167,45 @@ index cb3818a..cf54169 100644
  }
  
  void odb_source_init(struct odb_source *source,
+ 		     struct object_database *odb,
+-		     enum odb_source_type type,
++		     enum odb_storage_format type,
+ 		     const char *path,
+ 		     bool local)
+ {
 diff --git a/odb/source.h b/odb/source.h
-index 2bcaefb..f464dc3 100644
+index caac558..f464dc3 100644
 --- a/odb/source.h
 +++ b/odb/source.h
-@@ -273,6 +273,13 @@ struct odb_source *odb_source_new(struct object_database *odb,
+@@ -2,17 +2,7 @@
+ #define ODB_SOURCE_H
+ 
+ #include "object.h"
+-
+-enum odb_source_type {
+-	/*
+-	 * The "unknown" type, which should never be in use. This type mostly
+-	 * exists to catch cases where the type field remains zeroed out.
+-	 */
+-	ODB_SOURCE_UNKNOWN,
+-
+-	/* The "files" backend that uses loose objects and packfiles. */
+-	ODB_SOURCE_FILES,
+-};
++#include "repository.h"
+ 
+ /* Flags that can be passed to `odb_read_object_info_extended()`. */
+ enum object_info_flags {
+@@ -88,7 +78,7 @@ struct odb_source {
+ 	struct object_database *odb;
+ 
+ 	/* The type used by this source. */
+-	enum odb_source_type type;
++	enum odb_storage_format type;
+ 
+ 	/*
+ 	 * Figure out whether this is the local source of the owning
+@@ -283,6 +273,13 @@ struct odb_source *odb_source_new(struct object_database *odb,
  				  const char *path,
  				  bool local);
  
@@ -148,22 +219,46 @@ index 2bcaefb..f464dc3 100644
  /*
   * Initialize the source for the given object database located at `path`.
   * `local` indicates whether or not the source is the local and thus primary
+@@ -293,7 +290,7 @@ struct odb_source *odb_source_new(struct object_database *odb,
+  */
+ void odb_source_init(struct odb_source *source,
+ 		     struct object_database *odb,
+-		     enum odb_source_type type,
++		     enum odb_storage_format type,
+ 		     const char *path,
+ 		     bool local);
+ 
 diff --git a/repository.h b/repository.h
-index 297b0a7..a60a3be 100644
+index 078059a..a916bee 100644
 --- a/repository.h
 +++ b/repository.h
-@@ -159,6 +159,9 @@ struct repository {
+@@ -15,6 +15,11 @@ struct submodule_cache;
+ struct promisor_remote_config;
+ struct remote_state;
+ 
++enum odb_storage_format {
++	ODB_STORAGE_FORMAT_UNKNOWN,
++	ODB_STORAGE_FORMAT_FILES,
++};
++
+ enum ref_storage_format {
+ 	REF_STORAGE_FORMAT_UNKNOWN,
+ 	REF_STORAGE_FORMAT_FILES,
+@@ -154,6 +159,12 @@ struct repository {
  
  	/* Repository's reference storage format, as serialized on disk. */
  	enum ref_storage_format ref_storage_format;
 +
 +	/* Repository's object storage format, as serialized on disk. */
 +	enum odb_storage_format odb_storage_format;
++
++	/*
++
  	/*
  	 * Reference storage information as needed for the backend. This contains
  	 * only the payload from the reference URI without the schema.
 diff --git a/setup.c b/setup.c
-index 393b970..9274525 100644
+index 393b970..11375f9 100644
 --- a/setup.c
 +++ b/setup.c
 @@ -16,6 +16,7 @@
@@ -192,15 +287,22 @@ index 393b970..9274525 100644
  	} else if (!strcmp(ext, "relativeworktrees")) {
  		data->relative_worktrees = git_config_bool(var, value);
  		return EXTENSION_OK;
-@@ -1970,6 +1982,8 @@ const char *setup_git_directory_gently(int *nongit_ok)
- 			repo_set_ref_storage_format(the_repository,
- 						    repo_fmt.ref_storage_format,
- 						    repo_fmt.ref_storage_payload);
-+			the_repository->odb_storage_format =
-+				repo_fmt.odb_storage_format;
- 			the_repository->repository_format_worktree_config =
- 				repo_fmt.worktree_config;
- 			the_repository->repository_format_relative_worktrees =
+@@ -1961,6 +1973,15 @@ const char *setup_git_directory_gently(int *nongit_ok)
+ 			const char *gitdir = getenv(GIT_DIR_ENVIRONMENT);
+ 			if (!gitdir)
+ 				gitdir = DEFAULT_GIT_DIR_ENVIRONMENT;
++			/*
++			 * Set the ODB storage format before creating the
++			 * object database so that odb_source_new() can
++			 * select the correct backend.
++			 */
++			if (startup_info->have_repository) {
++				the_repository->odb_storage_format =
++					repo_fmt.odb_storage_format;
++			}
+ 			setup_git_env(gitdir);
+ 		}
+ 		if (startup_info->have_repository) {
 diff --git a/setup.h b/setup.h
 index bcb16b0..a94771c 100644
 --- a/setup.h
@@ -222,10 +324,31 @@ index bcb16b0..a94771c 100644
  	.v1_only_extensions = STRING_LIST_INIT_DUP, \
  }
 diff --git a/t/unit-tests/u-odb-source.c b/t/unit-tests/u-odb-source.c
-index 089a504..e222086 100644
+index 6f11c53..eb6296d 100644
 --- a/t/unit-tests/u-odb-source.c
 +++ b/t/unit-tests/u-odb-source.c
-@@ -23,3 +23,70 @@ void test_odb_source__try_returns_null_for_unknown_type(void)
+@@ -4,13 +4,13 @@
+ 
+ /*
+  * Verify that odb_source_files_try() returns the files backend
+- * for ODB_SOURCE_FILES and NULL for other source types.
++ * for ODB_STORAGE_FORMAT_FILES and NULL for other source types.
+  */
+ void test_odb_source__try_returns_files_for_files_type(void)
+ {
+ 	struct odb_source_files files_src;
+ 	memset(&files_src, 0, sizeof(files_src));
+-	files_src.base.type = ODB_SOURCE_FILES;
++	files_src.base.type = ODB_STORAGE_FORMAT_FILES;
+ 
+ 	cl_assert(odb_source_files_try(&files_src.base) == &files_src);
+ }
+@@ -19,7 +19,95 @@ void test_odb_source__try_returns_null_for_unknown_type(void)
+ {
+ 	struct odb_source other_src;
+ 	memset(&other_src, 0, sizeof(other_src));
+-	other_src.type = ODB_SOURCE_UNKNOWN;
++	other_src.type = ODB_STORAGE_FORMAT_UNKNOWN;
  
  	cl_assert(odb_source_files_try(&other_src) == NULL);
  }
@@ -295,6 +418,27 @@ index 089a504..e222086 100644
 +{
 +	/* odb_source_free(NULL) must not crash. */
 +	odb_source_free(NULL);
++}
++
++void test_odb_source__format_by_name_helper(void)
++{
++	cl_assert_equal_i(ODB_STORAGE_FORMAT_HELPER,
++			  odb_storage_format_by_name("helper"));
++}
++
++void test_odb_source__format_to_name_helper(void)
++{
++	cl_assert_equal_s("helper",
++			  odb_storage_format_to_name(ODB_STORAGE_FORMAT_HELPER));
++}
++
++void test_odb_source__try_returns_null_for_helper_type(void)
++{
++	struct odb_source src;
++	memset(&src, 0, sizeof(src));
++	src.type = ODB_STORAGE_FORMAT_HELPER;
++
++	cl_assert(odb_source_files_try(&src) == NULL);
 +}
 -- 
 2.47.3

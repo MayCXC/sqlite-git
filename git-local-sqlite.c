@@ -1,10 +1,10 @@
 /*
- * git-helper-sqlite: unified local helper for SQLite-backed storage.
+ * git-local-sqlite: unified local helper for SQLite-backed storage.
  *
  * Handles both ODB and ref operations in a single process, following
  * the protocol defined in git's helper.h. Invoked as:
  *
- *   git-helper-sqlite <gitdir>
+ *   git-local-sqlite <gitdir>
  *
  * Stores objects in objects_loose(oid, type, size, data) and refs in
  * refs(refname, target_oid, target_symref). Both tables live in a
@@ -479,7 +479,7 @@ int main(int argc, char **argv) {
 		return remote_main(argc, argv);
 
 	if (argc < 2) {
-		fprintf(stderr, "usage: git-helper-sqlite <gitdir>\n");
+		fprintf(stderr, "usage: git-local-sqlite <gitdir>\n");
 		return 1;
 	}
 
@@ -576,7 +576,7 @@ int main(int argc, char **argv) {
  * TODO: merge git-remote-sqlite.c into this binary.
  * For now, this is a placeholder; the remote helper is still a
  * separate binary. Create a symlink to test:
- *   ln -s git-helper-sqlite git-remote-sqlite
+ *   ln -s git-local-sqlite git-remote-sqlite
  */
 static int remote_main(int argc, char **argv) {
 	(void)argc;
