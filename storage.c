@@ -23,6 +23,7 @@ static sqlite3_stmt *st_obj_read, *st_obj_write, *st_obj_exists, *st_obj_list;
 static sqlite3_stmt *st_find_base;
 static sqlite3_stmt *st_ref_read, *st_ref_write, *st_ref_delete, *st_ref_list;
 static sqlite3_stmt *st_reflog_read, *st_reflog_append, *st_reflog_exists, *st_reflog_delete;
+static sqlite3_stmt *st_lfs_read, *st_lfs_write, *st_lfs_exists;
 
 /* ---- Zlib ---- */
 
@@ -108,7 +109,13 @@ int storage_open(const char *path_arg) {
 		"  old_oid BLOB NOT NULL, new_oid BLOB NOT NULL,"
 		"  committer TEXT NOT NULL, timestamp INTEGER NOT NULL,"
 		"  tz INTEGER NOT NULL, msg TEXT NOT NULL DEFAULT '',"
-		"  PRIMARY KEY(refname, idx)) WITHOUT ROWID;",
+		"  PRIMARY KEY(refname, idx)) WITHOUT ROWID;"
+
+		"CREATE TABLE IF NOT EXISTS lfs("
+		"  oid BLOB PRIMARY KEY,"
+		"  size INTEGER NOT NULL,"
+		"  data BLOB NOT NULL"
+		") WITHOUT ROWID;",
 		0, 0, 0);
 
 	sqlite3_prepare_v2(sdb, "SELECT type, size, data, base FROM objects WHERE oid = ?", -1, &st_obj_read, 0);
@@ -124,6 +131,9 @@ int storage_open(const char *path_arg) {
 	sqlite3_prepare_v2(sdb, "INSERT INTO reflog(refname, idx, old_oid, new_oid, committer, timestamp, tz, msg) VALUES(?, COALESCE((SELECT MAX(idx)+1 FROM reflog WHERE refname = ?), 0), ?, ?, ?, ?, ?, ?)", -1, &st_reflog_append, 0);
 	sqlite3_prepare_v2(sdb, "SELECT 1 FROM reflog WHERE refname = ? LIMIT 1", -1, &st_reflog_exists, 0);
 	sqlite3_prepare_v2(sdb, "DELETE FROM reflog WHERE refname = ?", -1, &st_reflog_delete, 0);
+	sqlite3_prepare_v2(sdb, "SELECT size, data FROM lfs WHERE oid = ?", -1, &st_lfs_read, 0);
+	sqlite3_prepare_v2(sdb, "INSERT OR IGNORE INTO lfs(oid, size, data) VALUES(?,?,?)", -1, &st_lfs_write, 0);
+	sqlite3_prepare_v2(sdb, "SELECT 1 FROM lfs WHERE oid = ?", -1, &st_lfs_exists, 0);
 
 	return 0;
 }
@@ -136,6 +146,8 @@ void storage_close(void) {
 	sqlite3_finalize(st_ref_delete); sqlite3_finalize(st_ref_list);
 	sqlite3_finalize(st_reflog_read); sqlite3_finalize(st_reflog_append);
 	sqlite3_finalize(st_reflog_exists); sqlite3_finalize(st_reflog_delete);
+	sqlite3_finalize(st_lfs_read); sqlite3_finalize(st_lfs_write);
+	sqlite3_finalize(st_lfs_exists);
 	sqlite3_close(sdb);
 }
 
@@ -365,4 +377,43 @@ void storage_reflog_append(const char *refname, const git_oid *old_oid,
 	sqlite3_bind_int(st_reflog_append, 7, tz);
 	sqlite3_bind_text(st_reflog_append, 8, msg ? msg : "", -1, SQLITE_STATIC);
 	sqlite3_step(st_reflog_append);
+}
+
+/* ---- LFS ---- */
+
+int storage_lfs_read(const git_oid *oid, size_t *out_size,
+		     unsigned char **out_data) {
+	sqlite3_reset(st_lfs_read);
+	sqlite3_bind_blob(st_lfs_read, 1, oid->id, RAW, SQLITE_STATIC);
+	if (sqlite3_step(st_lfs_read) != SQLITE_ROW)
+		return -1;
+	*out_size = sqlite3_column_int(st_lfs_read, 0);
+	const void *comp = sqlite3_column_blob(st_lfs_read, 1);
+	int comp_len = sqlite3_column_bytes(st_lfs_read, 1);
+	*out_data = zdecompress(comp, comp_len, *out_size);
+	return *out_data ? 0 : -1;
+}
+
+void storage_lfs_write(const git_oid *oid, const void *data, size_t size) {
+	sqlite3_reset(st_lfs_exists);
+	sqlite3_bind_blob(st_lfs_exists, 1, oid->id, RAW, SQLITE_STATIC);
+	if (sqlite3_step(st_lfs_exists) == SQLITE_ROW)
+		return;
+
+	unsigned long comp_len;
+	unsigned char *comp = zcompress(data, size, &comp_len);
+	if (!comp) return;
+
+	sqlite3_reset(st_lfs_write);
+	sqlite3_bind_blob(st_lfs_write, 1, oid->id, RAW, SQLITE_STATIC);
+	sqlite3_bind_int64(st_lfs_write, 2, (sqlite3_int64)size);
+	sqlite3_bind_blob(st_lfs_write, 3, comp, comp_len, SQLITE_STATIC);
+	sqlite3_step(st_lfs_write);
+	free(comp);
+}
+
+int storage_lfs_exists(const git_oid *oid) {
+	sqlite3_reset(st_lfs_exists);
+	sqlite3_bind_blob(st_lfs_exists, 1, oid->id, RAW, SQLITE_STATIC);
+	return sqlite3_step(st_lfs_exists) == SQLITE_ROW;
 }
