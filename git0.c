@@ -41,16 +41,20 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* Declared in git0_backend.c */
+extern git_repository *git0_storage_repo(void);
+
 /* ---- Per-connection repo cache ---- */
 
 typedef struct git0_ctx {
   git_repository *repo;
   char repo_path[4096];
+  int borrowed; /* 1 if repo is shared (do not free) */
 } git0_ctx;
 
 static void git0_ctx_free(void *p) {
   git0_ctx *ctx = (git0_ctx *)p;
-  if (ctx->repo) git_repository_free(ctx->repo);
+  if (ctx->repo && !ctx->borrowed) git_repository_free(ctx->repo);
   sqlite3_free(ctx);
 }
 
@@ -68,6 +72,20 @@ static git_repository *git0_repo(sqlite3_context *ctx, const char *path) {
   }
   if (g->repo && strcmp(g->repo_path, path) == 0) return g->repo;
   if (g->repo) { git_repository_free(g->repo); g->repo = NULL; }
+
+  if (strcmp(path, ":storage:") == 0) {
+    g->repo = git0_storage_repo();
+    if (!g->repo) {
+      sqlite3_result_error(ctx, "storage layer not initialized", -1);
+      return NULL;
+    }
+    g->borrowed = 1;
+    strncpy(g->repo_path, path, sizeof(g->repo_path) - 1);
+    g->repo_path[sizeof(g->repo_path) - 1] = '\0';
+    return g->repo;
+  }
+  g->borrowed = 0;
+
   int rc = git_repository_open(&g->repo, path);
   if (rc != 0) {
     const git_error *e = git_error_last();
@@ -79,10 +97,15 @@ static git_repository *git0_repo(sqlite3_context *ctx, const char *path) {
   return g->repo;
 }
 
-/* Get repo for TVFs (no sqlite3_context, uses raw path) */
+/* Get repo for TVFs (no sqlite3_context, uses raw path).
+ * ":storage:" returns the storage-backed repo from git0_backend.c. */
 git_repository *git0_repo_open(const char *path, char **err) {
-  /* TVFs manage their own repo handles via cursor state.
-   * This is a simple open without caching for TVF use. */
+  if (strcmp(path, ":storage:") == 0) {
+    git_repository *r = git0_storage_repo();
+    if (!r) { *err = (char *)"storage layer not initialized"; return NULL; }
+    return r;
+  }
+
   static git_repository *tvf_repo = NULL;
   static char tvf_path[4096] = {0};
   if (tvf_repo && strcmp(tvf_path, path) == 0) return tvf_repo;
@@ -529,6 +552,61 @@ extern int git0_register_refs_vt(sqlite3 *db);
 extern int git0_register_repo(sqlite3 *db);
 extern int git0_register_lfs(sqlite3 *db);
 extern int git0_register_storage(sqlite3 *db);
+extern int git0_register_backend(sqlite3 *db);
+extern void git0_backend_cleanup(void);
+
+/* Cleanup anchor: a minimal virtual table whose xDisconnect fires when
+ * the database connection closes, finalizing storage prepared statements
+ * and freeing the libgit2 repo handle. */
+static int anchor_connect(sqlite3 *db, void *pAux, int argc,
+    const char *const*argv, sqlite3_vtab **ppVtab, char **pzErr) {
+  (void)pAux; (void)argc; (void)argv; (void)pzErr;
+  sqlite3_declare_vtab(db, "CREATE TABLE x(__hidden INT)");
+  *ppVtab = sqlite3_malloc(sizeof(sqlite3_vtab));
+  if (!*ppVtab) return SQLITE_NOMEM;
+  memset(*ppVtab, 0, sizeof(sqlite3_vtab));
+  return SQLITE_OK;
+}
+
+static int anchor_disconnect(sqlite3_vtab *pVtab) {
+  git0_backend_cleanup();
+  sqlite3_free(pVtab);
+  return SQLITE_OK;
+}
+
+static int anchor_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **pp) {
+  (void)pVtab; (void)pp; return SQLITE_ERROR;
+}
+static int anchor_close(sqlite3_vtab_cursor *p) { (void)p; return SQLITE_OK; }
+static int anchor_next(sqlite3_vtab_cursor *p) { (void)p; return SQLITE_OK; }
+static int anchor_eof(sqlite3_vtab_cursor *p) { (void)p; return 1; }
+static int anchor_column(sqlite3_vtab_cursor *p, sqlite3_context *c, int i) {
+  (void)p; (void)c; (void)i; return SQLITE_OK;
+}
+static int anchor_rowid(sqlite3_vtab_cursor *p, sqlite3_int64 *r) {
+  (void)p; *r = 0; return SQLITE_OK;
+}
+static int anchor_filter(sqlite3_vtab_cursor *p, int n, const char *s,
+    int a, sqlite3_value **v) { (void)p; (void)n; (void)s; (void)a; (void)v; return SQLITE_OK; }
+static int anchor_bestindex(sqlite3_vtab *p, sqlite3_index_info *i) {
+  (void)p; (void)i; return SQLITE_OK;
+}
+
+static sqlite3_module anchor_module = {
+  .iVersion = 0,
+  .xCreate = anchor_connect,
+  .xConnect = anchor_connect,
+  .xBestIndex = anchor_bestindex,
+  .xDisconnect = anchor_disconnect,
+  .xDestroy = anchor_disconnect,
+  .xOpen = anchor_open,
+  .xClose = anchor_close,
+  .xFilter = anchor_filter,
+  .xNext = anchor_next,
+  .xEof = anchor_eof,
+  .xColumn = anchor_column,
+  .xRowid = anchor_rowid,
+};
 
 GIT0_API int sqlite3_git_init(sqlite3 *db, char **pzErrMsg,
                                const sqlite3_api_routines *pApi) {
@@ -574,10 +652,15 @@ GIT0_API int sqlite3_git_init(sqlite3 *db, char **pzErrMsg,
   git0_register_repo(db);
   git0_register_lfs(db);
   git0_register_storage(db);
+  git0_register_backend(db);
 
   /* Initialize storage layer using this db connection so git0_*
    * functions can read/write objects and refs directly. */
   storage_open_db(db);
+
+  /* Create cleanup anchor (xDisconnect fires on db close) */
+  sqlite3_create_module(db, "git0_cleanup", &anchor_module, 0);
+  sqlite3_exec(db, "CREATE VIRTUAL TABLE IF NOT EXISTS _git0_cleanup USING git0_cleanup", 0, 0, 0);
 
   return SQLITE_OK;
 }

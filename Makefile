@@ -17,7 +17,7 @@ endif
 STORAGE = storage.c vendor/fossil-delta.c vendor/sha256.c
 
 # Extension sources
-EXT_SRCS = git0.c git0_vtab.c git0_objects.c git0_refs_vt.c git0_repo.c git0_lfs.c git0_storage.c $(STORAGE)
+EXT_SRCS = git0.c git0_vtab.c git0_objects.c git0_refs_vt.c git0_repo.c git0_lfs.c git0_storage.c git0_backend.c $(STORAGE)
 
 # Targets
 all: git0.$(EXT) git-sqlite git-lfs-sqlite-transfer
