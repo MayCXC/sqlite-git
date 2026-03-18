@@ -119,7 +119,7 @@ static void fn_git0_mktree(sqlite3_context *ctx, int argc, sqlite3_value **argv)
     tree_buf[pos++] = '\0';
 
     git_oid entry_oid;
-    git_oid_fromstr(&entry_oid, oid_hex);
+    if (git_oid_fromstr(&entry_oid, oid_hex) < 0) break;
     memcpy(tree_buf + pos, entry_oid.id, GIT_OID_SHA1_SIZE); pos += GIT_OID_SHA1_SIZE;
 
     /* Advance to next line */

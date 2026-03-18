@@ -96,6 +96,7 @@ static void cmd_fetch(const char *sha, const char *ref) {
 
 	/* BFS: walk object graph from sha */
 	char (*queue)[GIT_OID_SHA1_HEXSIZE + 1] = malloc(65536 * (GIT_OID_SHA1_HEXSIZE + 1));
+	if (!queue) { git_odb_free(odb); git_repository_free(repo); return; }
 	int head = 0, tail = 0;
 	strncpy(queue[tail++], sha, GIT_OID_SHA1_HEXSIZE + 1);
 
@@ -172,6 +173,10 @@ static void cmd_push(const char *refspec) {
 	git_oid_tostr(hex, sizeof(hex), &src_oid);
 
 	char (*queue)[GIT_OID_SHA1_HEXSIZE + 1] = malloc(65536 * (GIT_OID_SHA1_HEXSIZE + 1));
+	if (!queue) {
+		git_odb_free(odb); git_repository_free(repo);
+		printf("error %s out of memory\n", dst); fflush(stdout); return;
+	}
 	int head = 0, tail = 0;
 	strncpy(queue[tail++], hex, GIT_OID_SHA1_HEXSIZE + 1);
 

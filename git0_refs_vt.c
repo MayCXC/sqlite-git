@@ -241,7 +241,7 @@ static int refs_update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv, sqli
 
     if (target_hex && *target_hex) {
       git_oid oid_val;
-      git_oid_fromstr(&oid_val, target_hex);
+      if (git_oid_fromstr(&oid_val, target_hex) < 0) return SQLITE_ERROR;
       sqlite3_bind_blob(vtab->st_insert, 2, oid_val.id, GIT_OID_SHA1_SIZE, SQLITE_TRANSIENT);
     } else {
       sqlite3_bind_null(vtab->st_insert, 2);
@@ -260,7 +260,7 @@ static int refs_update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv, sqli
     sqlite3_reset(vtab->st_update);
     if (target_hex && *target_hex) {
       git_oid oid_val;
-      git_oid_fromstr(&oid_val, target_hex);
+      if (git_oid_fromstr(&oid_val, target_hex) < 0) return SQLITE_ERROR;
       sqlite3_bind_blob(vtab->st_update, 1, oid_val.id, GIT_OID_SHA1_SIZE, SQLITE_TRANSIENT);
     } else {
       sqlite3_bind_null(vtab->st_update, 1);

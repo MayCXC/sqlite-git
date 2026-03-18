@@ -61,10 +61,13 @@ static int find_delta_base(git_object_t type, git_oid *base_oid,
 	if (sqlite3_step(st_find_base) != SQLITE_ROW)
 		return -1;
 
-	memcpy(base_oid->id, sqlite3_column_blob(st_find_base, 0), GIT_OID_SHA1_SIZE);
+	const void *oid_blob = sqlite3_column_blob(st_find_base, 0);
+	if (!oid_blob) return -1;
+	memcpy(base_oid->id, oid_blob, GIT_OID_SHA1_SIZE);
 	size_t sz = (size_t)sqlite3_column_int64(st_find_base, 1);
 	const void *comp = sqlite3_column_blob(st_find_base, 2);
 	int comp_len = sqlite3_column_bytes(st_find_base, 2);
+	if (!comp) return -1;
 
 	if (sqlite3_column_blob(st_find_base, 3) != NULL)
 		return -1; /* only use full objects as bases */
@@ -183,8 +186,12 @@ void storage_rollback_to(const char *name) {
 
 /* ---- Object read (resolves delta chains) ---- */
 
-int storage_read_object(const git_oid *oid, git_object_t *out_type,
-			size_t *out_size, unsigned char **out_data) {
+#define MAX_DELTA_DEPTH 50
+
+static int read_object_depth(const git_oid *oid, git_object_t *out_type,
+			     size_t *out_size, unsigned char **out_data, int depth) {
+	if (depth > MAX_DELTA_DEPTH) return -1;
+
 	sqlite3_reset(st_obj_read);
 	sqlite3_bind_blob(st_obj_read, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	if (sqlite3_step(st_obj_read) != SQLITE_ROW)
@@ -205,13 +212,14 @@ int storage_read_object(const git_oid *oid, git_object_t *out_type,
 	git_oid base_oid;
 	memcpy(base_oid.id, base_blob, GIT_OID_SHA1_SIZE);
 	int delta_len = comp_len;
-	char *delta = malloc(delta_len);
+	char *delta = malloc(delta_len ? delta_len : 1);
+	if (!delta) return -1;
 	memcpy(delta, comp, delta_len);
 
 	git_object_t base_type;
 	size_t base_size;
 	unsigned char *base_data;
-	if (storage_read_object(&base_oid, &base_type, &base_size, &base_data) < 0) {
+	if (read_object_depth(&base_oid, &base_type, &base_size, &base_data, depth + 1) < 0) {
 		free(delta);
 		return -1;
 	}
@@ -219,7 +227,8 @@ int storage_read_object(const git_oid *oid, git_object_t *out_type,
 	int target_size = delta_output_size(delta, delta_len);
 	if (target_size < 0) { free(base_data); free(delta); return -1; }
 
-	*out_data = malloc(target_size);
+	*out_data = malloc(target_size ? target_size : 1);
+	if (!*out_data) { free(base_data); free(delta); return -1; }
 	if (delta_apply((const char *)base_data, base_size,
 			delta, delta_len, (char *)*out_data) < 0) {
 		free(base_data); free(delta); free(*out_data);
@@ -228,6 +237,11 @@ int storage_read_object(const git_oid *oid, git_object_t *out_type,
 	*out_size = target_size;
 	free(base_data); free(delta);
 	return 0;
+}
+
+int storage_read_object(const git_oid *oid, git_object_t *out_type,
+			size_t *out_size, unsigned char **out_data) {
+	return read_object_depth(oid, out_type, out_size, out_data, 0);
 }
 
 /* ---- Object write (zlib + delta) ---- */
@@ -332,11 +346,11 @@ void storage_ref_delete(const char *refname) {
 
 int storage_ref_list(const char *prefix, storage_ref_cb cb, void *data) {
 	if (prefix && *prefix) {
-		char *pattern = sqlite3_mprintf("%s%%", prefix);
+		char *pattern = sqlite3_mprintf("%s*", prefix);
 		if (!pattern) return -1;
 		sqlite3_stmt *st = NULL;
 		int rc = sqlite3_prepare_v3(sdb,
-			"SELECT refname, oid, symref FROM refs WHERE refname LIKE ? ORDER BY refname",
+			"SELECT refname, oid, symref FROM refs WHERE refname GLOB ? ORDER BY refname",
 			-1, 0, &st, 0);
 		if (rc != SQLITE_OK || !st) { sqlite3_free(pattern); return -1; }
 		sqlite3_bind_text(st, 1, pattern, -1, sqlite3_free);

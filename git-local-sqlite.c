@@ -56,6 +56,7 @@ static void cmd_put(const char *args) {
 	if (git_oid_fromstr(&oid, hex) != 0) return;
 
 	unsigned char *data = malloc(size ? size : 1);
+	if (!data) return;
 	size_t got = 0;
 	while (got < size) {
 		size_t n = fread(data + got, 1, size - got, stdin);
