@@ -151,6 +151,27 @@ branch (4 commits):
 Configuration: `extensions.objectStorage = helper://sqlite` and
 `extensions.refStorage = helper://sqlite` in `.git/config`.
 
+### Future: `git init` with helper backends
+
+Currently `git init` always creates a files-backend repo. The helper
+config must be set after init, and the ODB/refdb are already created
+as files before the helper takes over. This causes issues (the files
+backend leaves artifacts, the helper process starts with stale state).
+
+The ref side already supports `git init --ref-format=reftable` via
+`builtin/init-db.c` (passes format to `ref_store_create_on_disk`).
+A future patch series would add `--object-storage=helper://sqlite`
+following the same pattern:
+
+1. Add `--object-storage` flag to `builtin/init-db.c`
+2. Parse URI format (helper://name) and set `odb_storage_format`
+3. Call helper's `create` command during init (before first write)
+4. Write `extensions.objectStorage` to config
+5. Skip files-backend ODB directory creation when helper is configured
+
+Until then, sqlite-git repos are initialized via `echobox init` or
+`git0_init()` in the SQLite extension.
+
 A shared `helper_process` (one per repo, stored on `struct repository`)
 handles both ODB and ref operations in a single external process,
 matching how remote helpers handle both refs and objects.
