@@ -1,7 +1,11 @@
 #ifndef STORAGE_H
 #define STORAGE_H
 
-#include <sqlite3.h>
+#ifndef SQLITE_CORE
+  #include "sqlite3ext.h"
+#else
+  #include <sqlite3.h>
+#endif
 #include <git2.h>
 
 /*

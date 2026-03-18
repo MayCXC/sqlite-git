@@ -10,7 +10,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
-#include <sqlite3.h>
+#ifndef SQLITE_CORE
+  #include "sqlite3ext.h"
+  SQLITE_EXTENSION_INIT3
+#else
+  #include <sqlite3.h>
+#endif
 #include <git2.h>
 #include "storage.h"
 #include "vendor/delta.h"

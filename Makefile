@@ -22,11 +22,11 @@ EXT_SRCS = git0.c git0_vtab.c git0_objects.c git0_refs_vt.c git0_repo.c git0_lfs
 # Targets
 all: git0.$(EXT) git-sqlite git-lfs-sqlite-transfer
 
-git0.$(EXT): $(EXT_SRCS) git0.h storage.h
-	$(CC) -shared $(CFLAGS) -I. -o $@ $(EXT_SRCS) $(LDFLAGS) -lsqlite3 -lz
+git0.$(EXT): $(EXT_SRCS) git0.h storage.h git0_internal.h
+	$(CC) -shared $(CFLAGS) -I. -o $@ $(EXT_SRCS) $(LDFLAGS) -lz
 
 git-sqlite: git-sqlite.c git-local-sqlite.c git-remote-sqlite.c $(STORAGE)
-	$(CC) $(CFLAGS) -I. -o $@ $^ $(LDFLAGS) -lsqlite3 -lz
+	$(CC) $(CFLAGS) -DSQLITE_CORE -I. -o $@ $^ $(LDFLAGS) -lsqlite3 -lz
 
 git-local-sqlite: git-sqlite
 	ln -sf $< $@
@@ -35,7 +35,7 @@ git-remote-sqlite: git-sqlite
 	ln -sf $< $@
 
 git-lfs-sqlite-transfer: git-lfs-sqlite-transfer.c $(STORAGE)
-	$(CC) $(CFLAGS) -I. -o $@ $^ $(LDFLAGS) -lsqlite3 -lz
+	$(CC) $(CFLAGS) -DSQLITE_CORE -I. -o $@ $^ $(LDFLAGS) -lsqlite3 -lz
 
 install: git0.$(EXT) git-sqlite git-lfs-sqlite-transfer
 	install -d $(PREFIX)/lib $(PREFIX)/include $(PREFIX)/bin
