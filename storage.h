@@ -58,13 +58,18 @@ void storage_reflog_append(const char *refname, const git_oid *old_oid,
 			   long long timestamp, int tz, const char *msg);
 
 /*
- * LFS content storage. OID is the SHA-1 hash of the content
- * (not SHA-256; we use git_oid for consistency with the rest
- * of the storage layer). Data is zlib compressed.
+ * LFS content storage. OID is SHA-256 (32 bytes) per git-lfs spec.
+ * Data is zlib compressed.
  */
-int storage_lfs_read(const git_oid *oid, size_t *out_size,
-		     unsigned char **out_data);
-void storage_lfs_write(const git_oid *oid, const void *data, size_t size);
-int storage_lfs_exists(const git_oid *oid);
+#define LFS_OID_RAWSZ 32
+#define LFS_OID_HEXSZ 64
+
+void storage_lfs_sha256(const void *data, size_t len,
+			unsigned char out[LFS_OID_RAWSZ]);
+int storage_lfs_read(const unsigned char oid[LFS_OID_RAWSZ],
+		     size_t *out_size, unsigned char **out_data);
+void storage_lfs_write(const unsigned char oid[LFS_OID_RAWSZ],
+		       const void *data, size_t size);
+int storage_lfs_exists(const unsigned char oid[LFS_OID_RAWSZ]);
 
 #endif

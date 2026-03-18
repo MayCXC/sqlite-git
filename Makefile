@@ -19,14 +19,14 @@ SRCS = git0.c git0_vtab.c git0_objects.c git0_refs_vt.c git0_repo.c git0_lfs.c
 HDRS = git0.h
 
 # Targets
-all: git0.$(EXT) git-sqlite
+all: git0.$(EXT) git-sqlite git-lfs-sqlite-transfer
 
 git0.$(EXT): $(SRCS) $(HDRS)
 	$(CC) -shared $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
 
 static: git0.a
 
-git-sqlite: git-sqlite.c git-local-sqlite.c git-remote-sqlite.c storage.c vendor/fossil-delta.c
+git-sqlite: git-sqlite.c git-local-sqlite.c git-remote-sqlite.c storage.c vendor/fossil-delta.c vendor/sha256.c
 	$(CC) $(CFLAGS) -I. -o $@ $^ $(LDFLAGS) -lsqlite3 -lz
 
 git-local-sqlite: git-sqlite
@@ -34,6 +34,9 @@ git-local-sqlite: git-sqlite
 
 git-remote-sqlite: git-sqlite
 	ln -sf $< $@
+
+git-lfs-sqlite-transfer: git-lfs-sqlite-transfer.c storage.c vendor/fossil-delta.c vendor/sha256.c
+	$(CC) $(CFLAGS) -I. -o $@ $^ $(LDFLAGS) -lsqlite3 -lz
 
 git0.a: $(SRCS) $(HDRS)
 	$(CC) -c $(CFLAGS) -DSQLITE_CORE -DGIT0_STATIC git0.c -o git0.o
@@ -53,6 +56,6 @@ test: git0.$(EXT)
 	@LD_LIBRARY_PATH=$(PREFIX)/lib sqlite3 -cmd ".load ./git0" < tests/test_basic.sql
 
 clean:
-	rm -f git0.$(EXT) git0.a git0.o git0_vtab.o git-sqlite git-local-sqlite git-remote-sqlite
+	rm -f git0.$(EXT) git0.a git0.o git0_vtab.o git-sqlite git-local-sqlite git-remote-sqlite git-lfs-sqlite-transfer
 
 .PHONY: all static install test clean

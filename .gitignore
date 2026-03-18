@@ -11,4 +11,5 @@ build/
 git-sqlite
 git-local-sqlite
 git-remote-sqlite
+git-lfs-sqlite-transfer
 patches/

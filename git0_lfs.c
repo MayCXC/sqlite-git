@@ -2,18 +2,18 @@
 ** git0_lfs: large file storage in SQLite.
 **
 ** Stores large file content via the shared storage layer.
-** LFS pointer format (compatible with git-lfs):
+** LFS pointer format (fully compatible with git-lfs):
 **   version https://git-lfs.github.com/spec/v1
-**   oid sha1:<hex>
+**   oid sha256:<64-char-hex>
 **   size <bytes>
 **
 ** Functions:
 **   git0_lfs_store(data)        -> stores content, returns LFS pointer text
 **   git0_lfs_fetch(pointer)     -> returns actual content from pointer text
-**   git0_lfs_smudge(oid_hex)    -> returns content by oid
+**   git0_lfs_smudge(oid_hex)    -> returns content by sha256 hex oid
 **   git0_lfs_pointer(data)      -> generates pointer text without storing
 **
-** Storage: lfs(oid BLOB PK, size INT, data BLOB) with zlib compression.
+** Uses SHA-256 for content OIDs per the git-lfs specification.
 */
 
 #include "git0.h"
@@ -25,7 +25,21 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <git2.h>
+
+static void lfs_oid_to_hex(const unsigned char oid[LFS_OID_RAWSZ], char hex[LFS_OID_HEXSZ + 1]) {
+  for (int i = 0; i < LFS_OID_RAWSZ; i++)
+    sprintf(hex + 2*i, "%02x", oid[i]);
+  hex[LFS_OID_HEXSZ] = '\0';
+}
+
+static int lfs_oid_from_hex(const char *hex, unsigned char oid[LFS_OID_RAWSZ]) {
+  for (int i = 0; i < LFS_OID_RAWSZ; i++) {
+    unsigned int byte;
+    if (sscanf(hex + 2*i, "%02x", &byte) != 1) return -1;
+    oid[i] = (unsigned char)byte;
+  }
+  return 0;
+}
 
 /* ---- git0_lfs_pointer(data) ---- */
 
@@ -34,16 +48,16 @@ static void fn_lfs_pointer(sqlite3_context *ctx, int argc, sqlite3_value **argv)
   const void *data = sqlite3_value_blob(argv[0]);
   int len = sqlite3_value_bytes(argv[0]);
 
-  git_oid oid;
-  git_odb_hash(&oid, data, len, GIT_OBJECT_BLOB);
+  unsigned char oid[LFS_OID_RAWSZ];
+  storage_lfs_sha256(data, len, oid);
 
-  char hex[GIT_OID_SHA1_HEXSIZE + 1];
-  git_oid_tostr(hex, sizeof(hex), &oid);
+  char hex[LFS_OID_HEXSZ + 1];
+  lfs_oid_to_hex(oid, hex);
 
   char pointer[512];
   int plen = snprintf(pointer, sizeof(pointer),
     "version https://git-lfs.github.com/spec/v1\n"
-    "oid sha1:%s\n"
+    "oid sha256:%s\n"
     "size %d\n",
     hex, len);
 
@@ -57,18 +71,17 @@ static void fn_lfs_store(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   const void *data = sqlite3_value_blob(argv[0]);
   int len = sqlite3_value_bytes(argv[0]);
 
-  git_oid oid;
-  git_odb_hash(&oid, data, len, GIT_OBJECT_BLOB);
+  unsigned char oid[LFS_OID_RAWSZ];
+  storage_lfs_sha256(data, len, oid);
+  storage_lfs_write(oid, data, len);
 
-  storage_lfs_write(&oid, data, len);
-
-  char hex[GIT_OID_SHA1_HEXSIZE + 1];
-  git_oid_tostr(hex, sizeof(hex), &oid);
+  char hex[LFS_OID_HEXSZ + 1];
+  lfs_oid_to_hex(oid, hex);
 
   char pointer[512];
   int plen = snprintf(pointer, sizeof(pointer),
     "version https://git-lfs.github.com/spec/v1\n"
-    "oid sha1:%s\n"
+    "oid sha256:%s\n"
     "size %d\n",
     hex, len);
 
@@ -82,18 +95,15 @@ static void fn_lfs_fetch(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   const char *pointer = (const char *)sqlite3_value_text(argv[0]);
   if (!pointer) { sqlite3_result_null(ctx); return; }
 
-  const char *oid_line = strstr(pointer, "oid sha1:");
+  const char *oid_line = strstr(pointer, "oid sha256:");
   if (!oid_line) { sqlite3_result_null(ctx); return; }
 
-  char hex[GIT_OID_SHA1_HEXSIZE + 1] = {0};
-  sscanf(oid_line + 9, "%40s", hex);
-
-  git_oid oid;
-  if (git_oid_fromstr(&oid, hex) != 0) { sqlite3_result_null(ctx); return; }
+  unsigned char oid[LFS_OID_RAWSZ];
+  if (lfs_oid_from_hex(oid_line + 11, oid) != 0) { sqlite3_result_null(ctx); return; }
 
   size_t size;
   unsigned char *data;
-  if (storage_lfs_read(&oid, &size, &data) == 0) {
+  if (storage_lfs_read(oid, &size, &data) == 0) {
     sqlite3_result_blob(ctx, data, size, free);
   } else {
     sqlite3_result_null(ctx);
@@ -107,12 +117,12 @@ static void fn_lfs_smudge(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
   const char *hex = (const char *)sqlite3_value_text(argv[0]);
   if (!hex) { sqlite3_result_null(ctx); return; }
 
-  git_oid oid;
-  if (git_oid_fromstr(&oid, hex) != 0) { sqlite3_result_null(ctx); return; }
+  unsigned char oid[LFS_OID_RAWSZ];
+  if (lfs_oid_from_hex(hex, oid) != 0) { sqlite3_result_null(ctx); return; }
 
   size_t size;
   unsigned char *data;
-  if (storage_lfs_read(&oid, &size, &data) == 0) {
+  if (storage_lfs_read(oid, &size, &data) == 0) {
     sqlite3_result_blob(ctx, data, size, free);
   } else {
     sqlite3_result_null(ctx);

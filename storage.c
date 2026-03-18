@@ -14,6 +14,7 @@
 #include <git2.h>
 #include "storage.h"
 #include "vendor/delta.h"
+#include "vendor/sha256.h"
 
 #define RAW 20 /* GIT_OID_SHA1_SIZE */
 
@@ -381,10 +382,18 @@ void storage_reflog_append(const char *refname, const git_oid *old_oid,
 
 /* ---- LFS ---- */
 
-int storage_lfs_read(const git_oid *oid, size_t *out_size,
-		     unsigned char **out_data) {
+void storage_lfs_sha256(const void *data, size_t len,
+			unsigned char out[LFS_OID_RAWSZ]) {
+	SHA256_CTX ctx;
+	sha256_init(&ctx);
+	sha256_update(&ctx, data, len);
+	sha256_final(&ctx, out);
+}
+
+int storage_lfs_read(const unsigned char oid[LFS_OID_RAWSZ],
+		     size_t *out_size, unsigned char **out_data) {
 	sqlite3_reset(st_lfs_read);
-	sqlite3_bind_blob(st_lfs_read, 1, oid->id, RAW, SQLITE_STATIC);
+	sqlite3_bind_blob(st_lfs_read, 1, oid, LFS_OID_RAWSZ, SQLITE_STATIC);
 	if (sqlite3_step(st_lfs_read) != SQLITE_ROW)
 		return -1;
 	*out_size = sqlite3_column_int(st_lfs_read, 0);
@@ -394,9 +403,10 @@ int storage_lfs_read(const git_oid *oid, size_t *out_size,
 	return *out_data ? 0 : -1;
 }
 
-void storage_lfs_write(const git_oid *oid, const void *data, size_t size) {
+void storage_lfs_write(const unsigned char oid[LFS_OID_RAWSZ],
+		       const void *data, size_t size) {
 	sqlite3_reset(st_lfs_exists);
-	sqlite3_bind_blob(st_lfs_exists, 1, oid->id, RAW, SQLITE_STATIC);
+	sqlite3_bind_blob(st_lfs_exists, 1, oid, LFS_OID_RAWSZ, SQLITE_STATIC);
 	if (sqlite3_step(st_lfs_exists) == SQLITE_ROW)
 		return;
 
@@ -405,15 +415,15 @@ void storage_lfs_write(const git_oid *oid, const void *data, size_t size) {
 	if (!comp) return;
 
 	sqlite3_reset(st_lfs_write);
-	sqlite3_bind_blob(st_lfs_write, 1, oid->id, RAW, SQLITE_STATIC);
+	sqlite3_bind_blob(st_lfs_write, 1, oid, LFS_OID_RAWSZ, SQLITE_STATIC);
 	sqlite3_bind_int64(st_lfs_write, 2, (sqlite3_int64)size);
 	sqlite3_bind_blob(st_lfs_write, 3, comp, comp_len, SQLITE_STATIC);
 	sqlite3_step(st_lfs_write);
 	free(comp);
 }
 
-int storage_lfs_exists(const git_oid *oid) {
+int storage_lfs_exists(const unsigned char oid[LFS_OID_RAWSZ]) {
 	sqlite3_reset(st_lfs_exists);
-	sqlite3_bind_blob(st_lfs_exists, 1, oid->id, RAW, SQLITE_STATIC);
+	sqlite3_bind_blob(st_lfs_exists, 1, oid, LFS_OID_RAWSZ, SQLITE_STATIC);
 	return sqlite3_step(st_lfs_exists) == SQLITE_ROW;
 }
