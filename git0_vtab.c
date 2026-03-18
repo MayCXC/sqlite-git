@@ -25,7 +25,6 @@ SQLITE_EXTENSION_INIT3
 
 /* Shared functions (defined in git0.c) */
 extern git_repository *git0_repo_open(const char *path, char **err);
-extern void git0_oid_to_hex(const git_oid *oid, char *out);
 
 /*
 ** ========================================================
@@ -185,7 +184,7 @@ static int git_log_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, in
 
   switch (col) {
     case 0: /* oid */
-      git0_oid_to_hex(git_commit_id(c), hex);
+      git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, git_commit_id(c));
       sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
       break;
     case 1: /* message */
@@ -374,7 +373,7 @@ static int git_tree_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, i
       sqlite3_result_text(ctx, git_object_type2string(git_tree_entry_type(entry)), -1, SQLITE_STATIC);
       break;
     case 3: /* oid */
-      git0_oid_to_hex(git_tree_entry_id(entry), hex);
+      git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, git_tree_entry_id(entry));
       sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
       break;
     case 4: /* size */
@@ -525,10 +524,10 @@ static int git_refs_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, i
     case 2: { /* oid */
       git_reference *resolved = NULL;
       if (git_reference_resolve(&resolved, ref) == 0) {
-        git0_oid_to_hex(git_reference_target(resolved), hex);
+        git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, git_reference_target(resolved));
         git_reference_free(resolved);
       } else if (git_reference_target(ref)) {
-        git0_oid_to_hex(git_reference_target(ref), hex);
+        git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, git_reference_target(ref));
       } else {
         sqlite3_result_null(ctx);
         break;
@@ -695,8 +694,8 @@ static int git_diff_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, i
   switch (col) {
     case 0: sqlite3_result_text(ctx, delta_status_str(delta->status), -1, SQLITE_STATIC); break;
     case 1: sqlite3_result_text(ctx, delta->new_file.path, -1, SQLITE_TRANSIENT); break;
-    case 2: git0_oid_to_hex(&delta->old_file.id, hex); sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT); break;
-    case 3: git0_oid_to_hex(&delta->new_file.id, hex); sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT); break;
+    case 2: git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, &delta->old_file.id); sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT); break;
+    case 3: git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, &delta->new_file.id); sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT); break;
     case 4: sqlite3_result_int(ctx, (int)delta->old_file.mode); break;
     case 5: sqlite3_result_int(ctx, (int)delta->new_file.mode); break;
     default: sqlite3_result_null(ctx);
@@ -824,7 +823,7 @@ static int git_anc_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, in
   git_anc_cursor *cur = (git_anc_cursor *)pCursor;
   if (col == 0) {
     char hex[GIT_OID_MAX_HEXSIZE + 1];
-    git0_oid_to_hex(&cur->current, hex);
+    git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, &cur->current);
     sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
   } else {
     sqlite3_result_null(ctx);
@@ -1210,7 +1209,7 @@ static int git_bl_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int
   switch (col) {
     case 0: sqlite3_result_int(ctx, (int)hunk->final_start_line_number); break;
     case 1: sqlite3_result_int(ctx, (int)hunk->lines_in_hunk); break;
-    case 2: git0_oid_to_hex(&hunk->final_commit_id, hex); sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT); break;
+    case 2: git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, &hunk->final_commit_id); sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT); break;
     case 3: sqlite3_result_text(ctx, hunk->orig_path, -1, SQLITE_TRANSIENT); break;
     case 4: sqlite3_result_text(ctx, hunk->final_signature ? hunk->final_signature->name : "", -1, SQLITE_TRANSIENT); break;
     case 5: sqlite3_result_text(ctx, hunk->final_signature ? hunk->final_signature->email : "", -1, SQLITE_TRANSIENT); break;

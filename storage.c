@@ -10,6 +10,7 @@
 #include <string.h>
 #include <zlib.h>
 #include <sqlite3.h>
+#include <git2.h>
 #include "storage.h"
 #include "vendor/delta.h"
 
@@ -21,41 +22,31 @@ static sqlite3_stmt *st_find_base;
 static sqlite3_stmt *st_ref_read, *st_ref_write, *st_ref_delete, *st_ref_list;
 static sqlite3_stmt *st_reflog_read, *st_reflog_append, *st_reflog_exists, *st_reflog_delete;
 
-/* ---- Hex/binary OID conversion ---- */
+/* ---- OID conversion (delegates to libgit2) ---- */
 
 int hex2bin(const char *hex, unsigned char *bin, int binlen) {
-	for (int i = 0; i < binlen; i++) {
-		unsigned int byte;
-		if (sscanf(hex + 2*i, "%02x", &byte) != 1) return -1;
-		bin[i] = (unsigned char)byte;
-	}
+	(void)binlen;
+	git_oid oid;
+	if (git_oid_fromstr(&oid, hex) != 0) return -1;
+	memcpy(bin, oid.id, OID_RAWSZ);
 	return 0;
 }
 
 void bin2hex(const unsigned char *bin, int binlen, char *hex) {
-	for (int i = 0; i < binlen; i++)
-		sprintf(hex + 2*i, "%02x", bin[i]);
-	hex[2*binlen] = '\0';
+	(void)binlen;
+	git_oid oid;
+	memcpy(oid.id, bin, OID_RAWSZ);
+	git_oid_tostr(hex, OID_HEXSZ + 1, &oid);
 }
 
-/* ---- Type conversion ---- */
+/* ---- Type conversion (delegates to libgit2) ---- */
 
 const char *type_name(int t) {
-	switch (t) {
-		case 1: return "commit";
-		case 2: return "tree";
-		case 3: return "blob";
-		case 4: return "tag";
-		default: return "unknown";
-	}
+	return git_object_type2string((git_object_t)t);
 }
 
 int type_from_name(const char *s) {
-	if (!strcmp(s, "commit")) return 1;
-	if (!strcmp(s, "tree")) return 2;
-	if (!strcmp(s, "blob")) return 3;
-	if (!strcmp(s, "tag")) return 4;
-	return 0;
+	return (int)git_object_string2type(s);
 }
 
 /* ---- Zlib helpers ---- */

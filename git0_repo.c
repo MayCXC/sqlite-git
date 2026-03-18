@@ -20,7 +20,6 @@
 #include <string.h>
 #include <time.h>
 
-extern void git0_oid_to_hex(const git_oid *oid, char *out);
 
 /* ---- Helper: execute SQL on a database ---- */
 
@@ -92,7 +91,7 @@ static void fn_git0_init(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   git_oid empty_tree_oid;
   git_odb_hash(&empty_tree_oid, NULL, 0, GIT_OBJECT_TREE);
   char tree_hex[GIT_OID_MAX_HEXSIZE + 1];
-  git0_oid_to_hex(&empty_tree_oid, tree_hex);
+  git_oid_tostr(tree_hex, GIT_OID_MAX_HEXSIZE + 1, &empty_tree_oid);
 
   /* Insert empty tree object */
   sqlite3_stmt *st;
@@ -121,7 +120,7 @@ static void fn_git0_init(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   git_oid commit_oid;
   git_odb_hash(&commit_oid, commit_buf, commit_len, GIT_OBJECT_COMMIT);
   char commit_hex[GIT_OID_MAX_HEXSIZE + 1];
-  git0_oid_to_hex(&commit_oid, commit_hex);
+  git_oid_tostr(commit_hex, GIT_OID_MAX_HEXSIZE + 1, &commit_oid);
 
   /* Insert commit object */
   sqlite3_prepare_v2(db,
@@ -171,7 +170,7 @@ static void fn_git0_add(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   git_oid oid;
   git_odb_hash(&oid, data, data_len, type);
   char hex[GIT_OID_MAX_HEXSIZE + 1];
-  git0_oid_to_hex(&oid, hex);
+  git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, &oid);
 
   sqlite3_stmt *st;
   sqlite3_prepare_v2(db,
@@ -248,7 +247,7 @@ static void fn_git0_mktree(sqlite3_context *ctx, int argc, sqlite3_value **argv)
   git_oid tree_oid;
   git_odb_hash(&tree_oid, tree_buf, tree_len, GIT_OBJECT_TREE);
   char hex[GIT_OID_MAX_HEXSIZE + 1];
-  git0_oid_to_hex(&tree_oid, hex);
+  git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, &tree_oid);
 
   /* Insert tree into objects */
   sqlite3_stmt *st_tree;
@@ -301,7 +300,7 @@ static void fn_git0_mkcommit(sqlite3_context *ctx, int argc, sqlite3_value **arg
   git_oid oid;
   git_odb_hash(&oid, commit_buf, len, GIT_OBJECT_COMMIT);
   char hex[GIT_OID_MAX_HEXSIZE + 1];
-  git0_oid_to_hex(&oid, hex);
+  git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, &oid);
 
   sqlite3_stmt *st;
   sqlite3_prepare_v2(db,

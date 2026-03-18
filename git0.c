@@ -95,9 +95,6 @@ git_repository *git0_repo_open(const char *path, char **err) {
   return tvf_repo;
 }
 
-void git0_oid_to_hex(const git_oid *oid, char *out) {
-  git_oid_tostr(out, GIT_OID_MAX_HEXSIZE + 1, oid);
-}
 
 static git_object *resolve_rev(git_repository *repo, const char *spec, sqlite3_context *ctx) {
   git_object *obj = NULL;
@@ -251,7 +248,7 @@ static void fn_git_hash(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   git_oid oid;
   git_odb_hash(&oid, data, len, type);
   char hex[GIT_OID_MAX_HEXSIZE + 1];
-  git0_oid_to_hex(&oid, hex);
+  git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, &oid);
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
 }
 
@@ -275,7 +272,7 @@ static void fn_git_write(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     return;
   }
   char hex[GIT_OID_MAX_HEXSIZE + 1];
-  git0_oid_to_hex(&oid, hex);
+  git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, &oid);
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
 }
 
@@ -288,7 +285,7 @@ static void fn_git_rev_parse(sqlite3_context *ctx, int argc, sqlite3_value **arg
   git_object *obj = resolve_rev(repo, (const char *)sqlite3_value_text(argv[1]), ctx);
   if (!obj) return;
   char hex[GIT_OID_MAX_HEXSIZE + 1];
-  git0_oid_to_hex(git_object_id(obj), hex);
+  git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, git_object_id(obj));
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
   git_object_free(obj);
 }
@@ -348,7 +345,7 @@ static void fn_git_commit_tree(sqlite3_context *ctx, int argc, sqlite3_value **a
   git_commit *c = resolve_commit(repo, (const char *)sqlite3_value_text(argv[1]), ctx);
   if (!c) return;
   char hex[GIT_OID_MAX_HEXSIZE + 1];
-  git0_oid_to_hex(git_commit_tree_id(c), hex);
+  git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, git_commit_tree_id(c));
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
   git_commit_free(c);
 }
@@ -377,7 +374,7 @@ static void fn_git_commit_parent(sqlite3_context *ctx, int argc, sqlite3_value *
   unsigned int n = (unsigned int)sqlite3_value_int(argv[2]);
   if (n >= git_commit_parentcount(c)) { sqlite3_result_null(ctx); git_commit_free(c); return; }
   char hex[GIT_OID_MAX_HEXSIZE + 1];
-  git0_oid_to_hex(git_commit_parent_id(c, n), hex);
+  git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, git_commit_parent_id(c, n));
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
   git_commit_free(c);
 }
@@ -412,7 +409,7 @@ static void fn_git_ref(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   }
   if (target) {
     char hex[GIT_OID_MAX_HEXSIZE + 1];
-    git0_oid_to_hex(target, hex);
+    git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, target);
     sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
   } else {
     sqlite3_result_null(ctx);
@@ -476,7 +473,7 @@ static void fn_git_merge_base(sqlite3_context *ctx, int argc, sqlite3_value **ar
   git_object_free(o2);
   if (rc != 0) { sqlite3_result_null(ctx); return; }
   char hex[GIT_OID_MAX_HEXSIZE + 1];
-  git0_oid_to_hex(&base, hex);
+  git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, &base);
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
 }
 

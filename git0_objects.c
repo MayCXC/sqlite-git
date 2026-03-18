@@ -27,28 +27,12 @@
 #include <string.h>
 #include <stdlib.h>
 
-extern void git0_oid_to_hex(const git_oid *oid, char *out);
 
-/* Object type conversions (git_object_t to storage int) */
-static int git_type_to_storage(git_object_t t) {
-  switch (t) {
-    case GIT_OBJECT_COMMIT: return 1;
-    case GIT_OBJECT_TREE: return 2;
-    case GIT_OBJECT_BLOB: return 3;
-    case GIT_OBJECT_TAG: return 4;
-    default: return 0;
-  }
-}
-
-static git_object_t storage_to_git_type(int t) {
-  switch (t) {
-    case 1: return GIT_OBJECT_COMMIT;
-    case 2: return GIT_OBJECT_TREE;
-    case 3: return GIT_OBJECT_BLOB;
-    case 4: return GIT_OBJECT_TAG;
-    default: return GIT_OBJECT_INVALID;
-  }
-}
+/*
+ * git_object_t values match our storage ints directly:
+ * GIT_OBJECT_COMMIT=1, TREE=2, BLOB=3, TAG=4.
+ * No conversion needed; cast between int and git_object_t.
+ */
 
 /* ---- Virtual table structure ---- */
 
@@ -264,7 +248,7 @@ static int obj_update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
 
   /* Compute OID using git's format: "<type> <size>\0<data>" */
   git_oid oid;
-  git_odb_hash(&oid, data, data_len, storage_to_git_type(type));
+  git_odb_hash(&oid, data, data_len, (git_object_t)type);
 
   /* Write via storage layer (handles compression + delta) */
   storage_write_object(oid.id, type, data, data_len);
