@@ -159,7 +159,9 @@ int storage_open_db(sqlite3 *db, int persistent) {
 		"  oid BLOB PRIMARY KEY,"
 		"  size INTEGER NOT NULL,"
 		"  data BLOB NOT NULL"
-		") WITHOUT ROWID;",
+		") WITHOUT ROWID;"
+		"CREATE INDEX IF NOT EXISTS idx_objects_type_base"
+		"  ON objects(type) WHERE base IS NULL;",
 		0, 0, 0);
 	return 0;
 }
