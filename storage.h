@@ -9,6 +9,7 @@
  * If path ends with /objects, strips it to find the gitdir root.
  */
 int storage_open(const char *path_arg);
+int storage_open_db(sqlite3 *db);
 void storage_close(void);
 void storage_destroy(void);
 sqlite3 *storage_db(void);

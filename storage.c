@@ -18,6 +18,7 @@
 
 
 static sqlite3 *sdb;
+static int sdb_owned; /* 1 if we opened the db, 0 if borrowed */
 
 static sqlite3_stmt *st_obj_read, *st_obj_write, *st_obj_exists, *st_obj_list;
 static sqlite3_stmt *st_find_base;
@@ -81,6 +82,8 @@ static int find_delta_base(git_object_t type, git_oid *base_oid,
 
 /* ---- Database ---- */
 
+static int storage_init_db(sqlite3 *db);
+
 int storage_open(const char *path_arg) {
 	size_t len = strlen(path_arg);
 	char *gitdir = sqlite3_mprintf("%s", path_arg);
@@ -98,8 +101,19 @@ int storage_open(const char *path_arg) {
 	sqlite3_free(path);
 	if (rc != SQLITE_OK)
 		return -1;
+	sdb_owned = 1;
 
-	sqlite3_exec(sdb,
+	return storage_init_db(sdb);
+}
+
+int storage_open_db(sqlite3 *db) {
+	if (sdb) return 0;
+	sdb = db;
+	return storage_init_db(sdb);
+}
+
+static int storage_init_db(sqlite3 *db) {
+	sqlite3_exec(db,
 		"PRAGMA busy_timeout = 5000;"
 		"PRAGMA synchronous = NORMAL;"
 		"PRAGMA journal_mode = WAL;"
@@ -125,24 +139,24 @@ int storage_open(const char *path_arg) {
 		") WITHOUT ROWID;",
 		0, 0, 0);
 
-	sqlite3_prepare_v3(sdb, "SELECT type, size, data, base FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_read, 0);
-	sqlite3_prepare_v3(sdb, "INSERT OR IGNORE INTO objects(oid, type, size, data, base) VALUES(?,?,?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_write, 0);
-	sqlite3_prepare_v3(sdb, "SELECT 1 FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_exists, 0);
-	sqlite3_prepare_v3(sdb, "SELECT oid, type, size FROM objects",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_list, 0);
-	sqlite3_prepare_v3(sdb, "SELECT oid, size, data, base FROM objects WHERE type = ? AND base IS NULL LIMIT 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_find_base, 0);
-	sqlite3_prepare_v3(sdb, "SELECT oid, symref FROM refs WHERE refname = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_ref_read, 0);
-	sqlite3_prepare_v3(sdb, "INSERT OR REPLACE INTO refs(refname, oid, symref) VALUES(?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_ref_write, 0);
-	sqlite3_prepare_v3(sdb, "DELETE FROM refs WHERE refname = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_ref_delete, 0);
-	sqlite3_prepare_v3(sdb, "SELECT refname, oid, symref FROM refs ORDER BY refname",  -1, SQLITE_PREPARE_PERSISTENT, &st_ref_list, 0);
-	sqlite3_prepare_v3(sdb, "SELECT old_oid, new_oid, committer, timestamp, tz, msg FROM reflog WHERE refname = ? ORDER BY idx ASC",  -1, SQLITE_PREPARE_PERSISTENT, &st_reflog_read, 0);
-	sqlite3_prepare_v3(sdb, "SELECT old_oid, new_oid, committer, timestamp, tz, msg FROM reflog WHERE refname = ? ORDER BY idx DESC",  -1, SQLITE_PREPARE_PERSISTENT, &st_reflog_read_rev, 0);
-	sqlite3_prepare_v3(sdb, "SELECT DISTINCT refname FROM reflog ORDER BY refname",  -1, SQLITE_PREPARE_PERSISTENT, &st_reflog_list, 0);
-	sqlite3_prepare_v3(sdb, "INSERT INTO reflog(refname, idx, old_oid, new_oid, committer, timestamp, tz, msg) VALUES(?, COALESCE((SELECT MAX(idx)+1 FROM reflog WHERE refname = ?), 0), ?, ?, ?, ?, ?, ?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_reflog_append, 0);
-	sqlite3_prepare_v3(sdb, "SELECT 1 FROM reflog WHERE refname = ? LIMIT 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_reflog_exists, 0);
-	sqlite3_prepare_v3(sdb, "DELETE FROM reflog WHERE refname = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_reflog_delete, 0);
-	sqlite3_prepare_v3(sdb, "SELECT size, data FROM lfs WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_lfs_read, 0);
-	sqlite3_prepare_v3(sdb, "INSERT OR IGNORE INTO lfs(oid, size, data) VALUES(?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_lfs_write, 0);
-	sqlite3_prepare_v3(sdb, "SELECT 1 FROM lfs WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_lfs_exists, 0);
+	sqlite3_prepare_v3(db, "SELECT type, size, data, base FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_read, 0);
+	sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO objects(oid, type, size, data, base) VALUES(?,?,?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_write, 0);
+	sqlite3_prepare_v3(db, "SELECT 1 FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_exists, 0);
+	sqlite3_prepare_v3(db, "SELECT oid, type, size FROM objects",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_list, 0);
+	sqlite3_prepare_v3(db, "SELECT oid, size, data, base FROM objects WHERE type = ? AND base IS NULL LIMIT 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_find_base, 0);
+	sqlite3_prepare_v3(db, "SELECT oid, symref FROM refs WHERE refname = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_ref_read, 0);
+	sqlite3_prepare_v3(db, "INSERT OR REPLACE INTO refs(refname, oid, symref) VALUES(?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_ref_write, 0);
+	sqlite3_prepare_v3(db, "DELETE FROM refs WHERE refname = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_ref_delete, 0);
+	sqlite3_prepare_v3(db, "SELECT refname, oid, symref FROM refs ORDER BY refname",  -1, SQLITE_PREPARE_PERSISTENT, &st_ref_list, 0);
+	sqlite3_prepare_v3(db, "SELECT old_oid, new_oid, committer, timestamp, tz, msg FROM reflog WHERE refname = ? ORDER BY idx ASC",  -1, SQLITE_PREPARE_PERSISTENT, &st_reflog_read, 0);
+	sqlite3_prepare_v3(db, "SELECT old_oid, new_oid, committer, timestamp, tz, msg FROM reflog WHERE refname = ? ORDER BY idx DESC",  -1, SQLITE_PREPARE_PERSISTENT, &st_reflog_read_rev, 0);
+	sqlite3_prepare_v3(db, "SELECT DISTINCT refname FROM reflog ORDER BY refname",  -1, SQLITE_PREPARE_PERSISTENT, &st_reflog_list, 0);
+	sqlite3_prepare_v3(db, "INSERT INTO reflog(refname, idx, old_oid, new_oid, committer, timestamp, tz, msg) VALUES(?, COALESCE((SELECT MAX(idx)+1 FROM reflog WHERE refname = ?), 0), ?, ?, ?, ?, ?, ?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_reflog_append, 0);
+	sqlite3_prepare_v3(db, "SELECT 1 FROM reflog WHERE refname = ? LIMIT 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_reflog_exists, 0);
+	sqlite3_prepare_v3(db, "DELETE FROM reflog WHERE refname = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_reflog_delete, 0);
+	sqlite3_prepare_v3(db, "SELECT size, data FROM lfs WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_lfs_read, 0);
+	sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO lfs(oid, size, data) VALUES(?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_lfs_write, 0);
+	sqlite3_prepare_v3(db, "SELECT 1 FROM lfs WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_lfs_exists, 0);
 
 	return 0;
 }
@@ -158,7 +172,8 @@ void storage_close(void) {
 	sqlite3_finalize(st_reflog_exists); sqlite3_finalize(st_reflog_delete);
 	sqlite3_finalize(st_lfs_read); sqlite3_finalize(st_lfs_write);
 	sqlite3_finalize(st_lfs_exists);
-	sqlite3_close(sdb);
+	if (sdb_owned) sqlite3_close(sdb);
+	sdb = NULL;
 }
 
 sqlite3 *storage_db(void) { return sdb; }

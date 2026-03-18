@@ -30,6 +30,7 @@
 */
 
 #include "git0.h"
+#include "storage.h"
 
 #ifndef SQLITE_CORE
   SQLITE_EXTENSION_INIT1
@@ -527,6 +528,7 @@ extern int git0_register_objects(sqlite3 *db);
 extern int git0_register_refs_vt(sqlite3 *db);
 extern int git0_register_repo(sqlite3 *db);
 extern int git0_register_lfs(sqlite3 *db);
+extern int git0_register_storage(sqlite3 *db);
 
 GIT0_API int sqlite3_git_init(sqlite3 *db, char **pzErrMsg,
                                const sqlite3_api_routines *pApi) {
@@ -571,6 +573,11 @@ GIT0_API int sqlite3_git_init(sqlite3 *db, char **pzErrMsg,
   git0_register_refs_vt(db);
   git0_register_repo(db);
   git0_register_lfs(db);
+  git0_register_storage(db);
+
+  /* Initialize storage layer using this db connection so git0_*
+   * functions can read/write objects and refs directly. */
+  storage_open_db(db);
 
   return SQLITE_OK;
 }

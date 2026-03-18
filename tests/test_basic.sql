@@ -78,4 +78,44 @@ DROP TABLE test_refs;
 -- Phase 5: LFS pointer generation (no storage needed)
 SELECT 'lfs_pointer: ' || length(git0_lfs_pointer('large content here')) || ' bytes';
 
+-- Storage-native functions (use the same db connection)
+SELECT 'storage_type: ' || git0_type(git0_add('test.txt', 'storage test'));
+SELECT 'storage_size: ' || git0_size(git0_add('test.txt', 'storage test'));
+SELECT 'storage_exists: ' || git0_exists(git0_add('test.txt', 'storage test'));
+SELECT 'storage_cat: ' || length(git0_cat(git0_add('test.txt', 'storage test')));
+SELECT 'storage_blob: ' || CAST(git0_blob(git0_add('test.txt', 'storage test')) AS TEXT);
+
+-- Ref operations
+SELECT 'storage_ref: ' || git0_ref('HEAD');
+SELECT 'storage_ref_main: ' || git0_ref('refs/heads/main');
+
+-- Commit accessors
+SELECT 'storage_tree: ' || git0_commit_tree(git0_ref('HEAD'));
+SELECT 'storage_summary: ' || git0_commit_summary(git0_ref('HEAD'));
+SELECT 'storage_author: ' || git0_commit_author(git0_ref('HEAD'));
+SELECT 'storage_parents: ' || git0_commit_parents(git0_ref('HEAD'));
+
+-- Commit with content, then read blob by path
+SELECT git0_ref_create('refs/heads/main',
+  git0_mkcommit(
+    git0_mktree('100644 file.txt ' || git0_add('file.txt', 'path test')),
+    git0_ref('HEAD'),
+    'test commit'
+  )
+);
+SELECT 'storage_blob_path: ' || CAST(git0_blob(git0_ref('refs/heads/main'), 'file.txt') AS TEXT);
+
+-- Commit parent
+SELECT 'storage_parent0: ' || git0_commit_parent(git0_ref('refs/heads/main'), 0);
+
+-- Refs list TVF
+SELECT 'storage_refs: ' || count(*) || ' refs' FROM git0_refs_list;
+
+-- LFS round-trip (storage-backed)
+SELECT 'storage_lfs: ' || (CAST(git0_lfs_fetch(git0_lfs_store('lfs round trip')) AS TEXT) = 'lfs round trip');
+
+-- Ref delete
+SELECT git0_ref_delete('refs/heads/main');
+SELECT 'storage_ref_deleted: ' || COALESCE(git0_ref('refs/heads/main'), 'null');
+
 SELECT 'All tests passed.';

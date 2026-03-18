@@ -17,7 +17,7 @@ endif
 STORAGE = storage.c vendor/fossil-delta.c vendor/sha256.c
 
 # Extension sources
-EXT_SRCS = git0.c git0_vtab.c git0_objects.c git0_refs_vt.c git0_repo.c git0_lfs.c $(STORAGE)
+EXT_SRCS = git0.c git0_vtab.c git0_objects.c git0_refs_vt.c git0_repo.c git0_lfs.c git0_storage.c $(STORAGE)
 
 # Targets
 all: git0.$(EXT) git-sqlite git-lfs-sqlite-transfer
@@ -47,7 +47,9 @@ install: git0.$(EXT) git-sqlite git-lfs-sqlite-transfer
 
 test: all git-local-sqlite
 	bash tests/test_helper.sh
-	sqlite3 :memory: -cmd ".load ./git0" <tests/test_basic.sql
+	@rm -f /tmp/git0-test.db
+	sqlite3 /tmp/git0-test.db -cmd ".load ./git0" <tests/test_basic.sql
+	@rm -f /tmp/git0-test.db
 
 clean:
 	rm -f git0.$(EXT) git-sqlite git-local-sqlite git-remote-sqlite git-lfs-sqlite-transfer *.o *.a
