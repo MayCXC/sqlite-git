@@ -74,6 +74,7 @@ static git_repository *git0_repo(sqlite3_context *ctx, const char *path) {
     return NULL;
   }
   strncpy(g->repo_path, path, sizeof(g->repo_path) - 1);
+  g->repo_path[sizeof(g->repo_path) - 1] = '\0';
   return g->repo;
 }
 
@@ -92,6 +93,7 @@ git_repository *git0_repo_open(const char *path, char **err) {
     return NULL;
   }
   strncpy(tvf_path, path, sizeof(tvf_path) - 1);
+  tvf_path[sizeof(tvf_path) - 1] = '\0';
   return tvf_repo;
 }
 
@@ -159,8 +161,8 @@ static void fn_git_blob(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
       sqlite3_result_error(ctx, e ? e->message : "blob lookup failed", -1);
       return;
     }
-    sqlite3_result_blob(ctx, git_blob_rawcontent(blob),
-                        (int)git_blob_rawsize(blob), SQLITE_TRANSIENT);
+    sqlite3_result_blob64(ctx, git_blob_rawcontent(blob),
+                         git_blob_rawsize(blob), SQLITE_TRANSIENT);
     git_blob_free(blob);
   } else {
     const char *rev = (const char *)sqlite3_value_text(argv[1]);
@@ -168,7 +170,11 @@ static void fn_git_blob(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     git_commit *commit = resolve_commit(repo, rev, ctx);
     if (!commit) return;
     git_tree *tree = NULL;
-    git_commit_tree(&tree, commit);
+    if (git_commit_tree(&tree, commit) != 0) {
+      git_commit_free(commit);
+      sqlite3_result_null(ctx);
+      return;
+    }
     git_commit_free(commit);
     git_tree_entry *entry = NULL;
     if (git_tree_entry_bypath(&entry, tree, path) != 0) {
@@ -184,8 +190,8 @@ static void fn_git_blob(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
       sqlite3_result_error(ctx, e ? e->message : "blob lookup failed", -1);
       return;
     }
-    sqlite3_result_blob(ctx, git_blob_rawcontent(blob),
-                        (int)git_blob_rawsize(blob), SQLITE_TRANSIENT);
+    sqlite3_result_blob64(ctx, git_blob_rawcontent(blob),
+                         git_blob_rawsize(blob), SQLITE_TRANSIENT);
     git_blob_free(blob);
     git_tree_entry_free(entry);
     git_tree_free(tree);

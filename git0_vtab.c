@@ -54,6 +54,7 @@ static int git_log_connect(sqlite3 *db, void *pAux, int argc, const char *const*
     "parents INT, repo TEXT HIDDEN, rev TEXT HIDDEN, path TEXT HIDDEN)");
   if (rc != SQLITE_OK) return rc;
   git_log_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
+  if (!vtab) return SQLITE_NOMEM;
   memset(vtab, 0, sizeof(*vtab));
   *ppVtab = &vtab->base;
   return SQLITE_OK;
@@ -66,6 +67,7 @@ static int git_log_disconnect(sqlite3_vtab *pVtab) {
 
 static int git_log_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
   git_log_cursor *cur = sqlite3_malloc(sizeof(*cur));
+  if (!cur) return SQLITE_NOMEM;
   memset(cur, 0, sizeof(*cur));
   *ppCursor = &cur->base;
   return SQLITE_OK;
@@ -284,6 +286,7 @@ static int git_tree_connect(sqlite3 *db, void *pAux, int argc, const char *const
     "repo TEXT HIDDEN, rev TEXT HIDDEN, path TEXT HIDDEN)");
   if (rc != SQLITE_OK) return rc;
   git_tree_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
+  if (!vtab) return SQLITE_NOMEM;
   memset(vtab, 0, sizeof(*vtab));
   *ppVtab = &vtab->base;
   return SQLITE_OK;
@@ -291,6 +294,7 @@ static int git_tree_connect(sqlite3 *db, void *pAux, int argc, const char *const
 
 static int git_tree_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
   git_tree_cursor *cur = sqlite3_malloc(sizeof(*cur));
+  if (!cur) return SQLITE_NOMEM;
   memset(cur, 0, sizeof(*cur));
   *ppCursor = &cur->base;
   return SQLITE_OK;
@@ -445,6 +449,7 @@ static int git_refs_connect(sqlite3 *db, void *pAux, int argc, const char *const
     "repo TEXT HIDDEN, pattern TEXT HIDDEN)");
   if (rc != SQLITE_OK) return rc;
   git_refs_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
+  if (!vtab) return SQLITE_NOMEM;
   memset(vtab, 0, sizeof(*vtab));
   *ppVtab = &vtab->base;
   return SQLITE_OK;
@@ -452,6 +457,7 @@ static int git_refs_connect(sqlite3 *db, void *pAux, int argc, const char *const
 
 static int git_refs_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
   git_refs_cursor *cur = sqlite3_malloc(sizeof(*cur));
+  if (!cur) return SQLITE_NOMEM;
   memset(cur, 0, sizeof(*cur));
   *ppCursor = &cur->base;
   return SQLITE_OK;
@@ -598,6 +604,7 @@ static int git_diff_connect(sqlite3 *db, void *pAux, int argc, const char *const
     "repo TEXT HIDDEN, old_rev TEXT HIDDEN, new_rev TEXT HIDDEN)");
   if (rc != SQLITE_OK) return rc;
   git_diff_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
+  if (!vtab) return SQLITE_NOMEM;
   memset(vtab, 0, sizeof(*vtab));
   *ppVtab = &vtab->base;
   return SQLITE_OK;
@@ -605,6 +612,7 @@ static int git_diff_connect(sqlite3 *db, void *pAux, int argc, const char *const
 
 static int git_diff_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
   git_diff_cursor *cur = sqlite3_malloc(sizeof(*cur));
+  if (!cur) return SQLITE_NOMEM;
   memset(cur, 0, sizeof(*cur));
   *ppCursor = &cur->base;
   return SQLITE_OK;
@@ -757,6 +765,7 @@ static int git_anc_connect(sqlite3 *db, void *pAux, int argc, const char *const*
   int rc = sqlite3_declare_vtab(db, "CREATE TABLE x(oid TEXT, repo TEXT HIDDEN, rev TEXT HIDDEN)");
   if (rc != SQLITE_OK) return rc;
   git_anc_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
+  if (!vtab) return SQLITE_NOMEM;
   memset(vtab, 0, sizeof(*vtab));
   *ppVtab = &vtab->base;
   return SQLITE_OK;
@@ -764,6 +773,7 @@ static int git_anc_connect(sqlite3 *db, void *pAux, int argc, const char *const*
 
 static int git_anc_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
   git_anc_cursor *cur = sqlite3_malloc(sizeof(*cur));
+  if (!cur) return SQLITE_NOMEM;
   memset(cur, 0, sizeof(*cur));
   *ppCursor = &cur->base;
   return SQLITE_OK;
@@ -885,6 +895,7 @@ static int git_cfgl_connect(sqlite3 *db, void *pAux, int argc, const char *const
   int rc = sqlite3_declare_vtab(db, "CREATE TABLE x(key TEXT, value TEXT, repo TEXT HIDDEN)");
   if (rc != SQLITE_OK) return rc;
   git_cfgl_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
+  if (!vtab) return SQLITE_NOMEM;
   memset(vtab, 0, sizeof(*vtab));
   *ppVtab = &vtab->base;
   return SQLITE_OK;
@@ -892,6 +903,7 @@ static int git_cfgl_connect(sqlite3 *db, void *pAux, int argc, const char *const
 
 static int git_cfgl_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
   git_cfgl_cursor *cur = sqlite3_malloc(sizeof(*cur));
+  if (!cur) return SQLITE_NOMEM;
   memset(cur, 0, sizeof(*cur));
   *ppCursor = &cur->base;
   return SQLITE_OK;
@@ -1003,6 +1015,7 @@ static int git_stat_connect(sqlite3 *db, void *pAux, int argc, const char *const
     "CREATE TABLE x(path TEXT, status TEXT, repo TEXT HIDDEN)");
   if (rc != SQLITE_OK) return rc;
   git_stat_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
+  if (!vtab) return SQLITE_NOMEM;
   memset(vtab, 0, sizeof(*vtab));
   *ppVtab = &vtab->base;
   return SQLITE_OK;
@@ -1010,6 +1023,7 @@ static int git_stat_connect(sqlite3 *db, void *pAux, int argc, const char *const
 
 static int git_stat_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
   git_stat_cursor *cur = sqlite3_malloc(sizeof(*cur));
+  if (!cur) return SQLITE_NOMEM;
   memset(cur, 0, sizeof(*cur));
   *ppCursor = &cur->base;
   return SQLITE_OK;
@@ -1136,6 +1150,7 @@ static int git_bl_connect(sqlite3 *db, void *pAux, int argc, const char *const*a
     "repo TEXT HIDDEN, path TEXT HIDDEN, rev TEXT HIDDEN)");
   if (rc != SQLITE_OK) return rc;
   git_bl_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
+  if (!vtab) return SQLITE_NOMEM;
   memset(vtab, 0, sizeof(*vtab));
   *ppVtab = &vtab->base;
   return SQLITE_OK;
@@ -1143,6 +1158,7 @@ static int git_bl_connect(sqlite3 *db, void *pAux, int argc, const char *const*a
 
 static int git_bl_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
   git_bl_cursor *cur = sqlite3_malloc(sizeof(*cur));
+  if (!cur) return SQLITE_NOMEM;
   memset(cur, 0, sizeof(*cur));
   *ppCursor = &cur->base;
   return SQLITE_OK;

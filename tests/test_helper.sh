@@ -262,6 +262,40 @@ TXN_COMMIT=$(printf 'capabilities\nodb-transaction-commit\n' \
 check "odb-transaction-commit: returns ok" \
 	'test "$TXN_COMMIT" = "ok"'
 
+# ---- Missing capabilities: create, remove, transaction-abort ----
+
+DB="$TMPDIR/misc-test"
+
+CREATE_OK=$(printf 'capabilities\ncreate\n' \
+	| "$HELPER" "$DB" 2>/dev/null | tail -1)
+
+check "create: returns ok" \
+	'test "$CREATE_OK" = "ok"'
+
+# Store something so remove has work to do
+printf 'capabilities\nput %s blob 5\nhello' \
+	"aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d" \
+	| "$HELPER" "$DB" >/dev/null 2>&1
+
+REMOVE_OK=$(printf 'capabilities\nremove\n' \
+	| "$HELPER" "$DB" 2>/dev/null | tail -1)
+
+check "remove: returns ok" \
+	'test "$REMOVE_OK" = "ok"'
+
+# transaction-abort: begin, update, abort, verify ref was not created
+DB="$TMPDIR/abort-test"
+REF_OID="95d09f2b10159347eece71399a7e2e907ea3df4f"
+
+printf 'capabilities\ntransaction-begin\ntransaction-update refs/heads/aborted %s\ntransaction-abort\n' \
+	"$REF_OID" | "$HELPER" "$DB" >/dev/null 2>&1
+
+ABORTED=$(printf 'capabilities\nread refs/heads/aborted\n' \
+	| "$HELPER" "$DB" 2>/dev/null | tail -1)
+
+check "transaction-abort: ref not created after abort" \
+	'test "$ABORTED" = "missing"'
+
 # ---- LFS transfer adapter ----
 
 DB="$TMPDIR/lfs-test"
