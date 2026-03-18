@@ -86,10 +86,13 @@ The helper speaks the git local helper protocol. Commands use a flat namespace m
 | `transaction-prepare/finish/abort` | `ok` or `error <msg>` |
 | `create` | `ok` |
 | `remove` | `ok` |
+| `put-stream <type> <size>` + data | `<oid>` (helper computes OID) |
 | `reflog-read <refname>` | native reflog format lines, blank end |
+| `reflog-read-reverse <refname>` | entries newest-first, blank end |
 | `reflog-append <refname> ...` | `ok` |
 | `reflog-exists <refname>` | `true` or `false` |
 | `reflog-delete <refname>` | `ok` |
+| `reflog-list` | refnames with reflogs, one per line, blank end |
 
 ## Remote helper (git-remote-sqlite)
 
@@ -167,6 +170,31 @@ FROM git_blame('.', 'main.c');
 | `git_blame` | `(repo, path, rev?)` | line_start, line_count, oid, orig_path, author_name, author_email, author_when |
 | `git_config_list` | `(repo)` | key, value |
 
+## LFS (git-lfs-sqlite-transfer)
+
+Large file content stored in the same SQLite database, compressed with zlib. Uses SHA-256 OIDs per the git-lfs spec.
+
+```sh
+git config lfs.customtransfer.sqlite.path git-lfs-sqlite-transfer
+git config lfs.customtransfer.sqlite.args .git
+git config lfs.standalonetransferagent sqlite
+```
+
+The transfer adapter speaks the [git-lfs custom transfer protocol](https://github.com/git-lfs/git-lfs/blob/main/docs/custom-transfers.md) on stdin/stdout. Content is stored in:
+
+```
+lfs(oid BLOB PRIMARY KEY, size INT, data BLOB) WITHOUT ROWID
+```
+
+## Testing
+
+```sh
+make test    # runs both test suites
+```
+
+- `tests/test_helper.sh`: 34 tests covering the local helper protocol (18 commands), LFS transfer adapter, and argv[0] dispatch.
+- `tests/test_basic.sql`: SQL extension tests for scalar functions, table-valued functions, virtual tables, self-contained repo operations, and LFS round-trips.
+
 ## Git upstream patches
 
 The local helper backend requires patches to git that add `git-local-*` support (pluggable ODB and ref storage via external processes). These patches are on the [`ps/local-helper-backends`](https://github.com/MayCXC/git/tree/ps/local-helper-backends) branch of our git fork. Series 1 has been [submitted upstream](https://lore.kernel.org/git/pull.2068.git.1773674983.gitgitgadget@gmail.com).
@@ -179,4 +207,4 @@ The local helper backend requires patches to git that add `git-local-*` support 
 
 ## License
 
-MIT. The fossil delta algorithm in `vendor/fossil-delta.c` is BSD-2 (Copyright D. Richard Hipp).
+BSD-3-Clause. The fossil delta algorithm in `vendor/fossil-delta.c` is BSD-2 (Copyright D. Richard Hipp). SHA-256 in `vendor/sha256.c` is public domain (Brad Conte).

@@ -45,7 +45,11 @@ install: git0.$(EXT) git-sqlite git-lfs-sqlite-transfer
 	ln -sf git-sqlite $(PREFIX)/bin/git-local-sqlite
 	ln -sf git-sqlite $(PREFIX)/bin/git-remote-sqlite
 
+test: all git-local-sqlite
+	bash tests/test_helper.sh
+	sqlite3 :memory: -cmd ".load ./git0" <tests/test_basic.sql
+
 clean:
 	rm -f git0.$(EXT) git-sqlite git-local-sqlite git-remote-sqlite git-lfs-sqlite-transfer *.o *.a
 
-.PHONY: all install clean
+.PHONY: all install test clean
