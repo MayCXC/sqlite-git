@@ -47,19 +47,6 @@ static long long json_int(const char *json, const char *key) {
 	return strtoll(p + strlen(search), NULL, 10);
 }
 
-static void lfs_hex2bin(const char *hex, unsigned char *bin) {
-	for (int i = 0; i < LFS_OID_RAWSZ; i++) {
-		unsigned int b;
-		sscanf(hex + 2*i, "%02x", &b);
-		bin[i] = (unsigned char)b;
-	}
-}
-
-static void lfs_bin2hex(const unsigned char *bin, char *hex) {
-	for (int i = 0; i < LFS_OID_RAWSZ; i++)
-		sprintf(hex + 2*i, "%02x", bin[i]);
-	hex[LFS_OID_HEXSZ] = '\0';
-}
 
 int main(int argc, char **argv) {
 	if (argc < 2) {
@@ -90,7 +77,7 @@ int main(int argc, char **argv) {
 			(void)size;
 
 			unsigned char oid[LFS_OID_RAWSZ];
-			lfs_hex2bin(oid_hex, oid);
+			storage_lfs_oid_from_hex(oid_hex, oid);
 
 			size_t out_size;
 			unsigned char *data;
@@ -119,7 +106,7 @@ int main(int argc, char **argv) {
 			json_string(line, "path", path, sizeof(path));
 
 			unsigned char oid[LFS_OID_RAWSZ];
-			lfs_hex2bin(oid_hex, oid);
+			storage_lfs_oid_from_hex(oid_hex, oid);
 
 			/* Read content from the file git-lfs provides */
 			FILE *f = fopen(path, "rb");

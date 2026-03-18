@@ -13,6 +13,49 @@
 #include <git2.h>
 #include "storage.h"
 
+/*
+ * Extract referenced OIDs from a git object. Queues hex OIDs
+ * for BFS traversal of the object graph.
+ */
+static void queue_referenced_oids(git_object_t type, const void *data,
+				  size_t size, char (*queue)[GIT_OID_SHA1_HEXSIZE + 1],
+				  int *tail, int max) {
+	if (type == GIT_OBJECT_COMMIT) {
+		const char *p = (const char *)data;
+		const char *end = p + size;
+		while (p < end) {
+			if (strncmp(p, "tree ", 5) == 0 && *tail < max) {
+				strncpy(queue[(*tail)++], p + 5, 40);
+				queue[*tail - 1][40] = '\0';
+			} else if (strncmp(p, "parent ", 7) == 0 && *tail < max) {
+				strncpy(queue[(*tail)++], p + 7, 40);
+				queue[*tail - 1][40] = '\0';
+			}
+			while (p < end && *p != '\n') p++;
+			if (p < end) p++;
+			if (p < end && *p == '\n') break;
+		}
+	} else if (type == GIT_OBJECT_TREE) {
+		const unsigned char *p = (const unsigned char *)data;
+		const unsigned char *end = p + size;
+		while (p < end) {
+			while (p < end && *p != ' ') p++;
+			if (p >= end) break;
+			p++;
+			while (p < end && *p != 0) p++;
+			if (p >= end) break;
+			p++;
+			if (p + GIT_OID_SHA1_SIZE > end) break;
+			if (*tail < max) {
+				git_oid entry;
+				memcpy(entry.id, p, GIT_OID_SHA1_SIZE);
+				git_oid_tostr(queue[(*tail)++], GIT_OID_SHA1_HEXSIZE + 1, &entry);
+			}
+			p += GIT_OID_SHA1_SIZE;
+		}
+	}
+}
+
 static void cmd_capabilities(void) {
 	printf("fetch\npush\n\n");
 	fflush(stdout);
@@ -71,43 +114,7 @@ static void cmd_fetch(const char *sha, const char *ref) {
 		git_oid written;
 		git_odb_write(&written, odb, data, size, (git_object_t)type);
 
-		/* Parse object to find referenced oids */
-		if (type == 1) { /* commit */
-			const char *p = (const char *)data;
-			const char *end = p + size;
-			while (p < end) {
-				if (strncmp(p, "tree ", 5) == 0 && tail < 65536) {
-					strncpy(queue[tail], p + 5, 40);
-					queue[tail][40] = '\0';
-					tail++;
-				} else if (strncmp(p, "parent ", 7) == 0 && tail < 65536) {
-					strncpy(queue[tail], p + 7, 40);
-					queue[tail][40] = '\0';
-					tail++;
-				}
-				while (p < end && *p != '\n') p++;
-				if (p < end) p++;
-				if (p < end && *p == '\n') break;
-			}
-		} else if (type == 2) { /* tree */
-			const unsigned char *p = data;
-			const unsigned char *end = p + size;
-			while (p < end) {
-				while (p < end && *p != ' ') p++;
-				if (p >= end) break;
-				p++;
-				while (p < end && *p != 0) p++;
-				if (p >= end) break;
-				p++;
-				if (p + 20 > end) break;
-				if (tail < 65536) {
-					git_oid entry_oid; memcpy(entry_oid.id, p, GIT_OID_SHA1_SIZE); git_oid_tostr(queue[tail], GIT_OID_SHA1_HEXSIZE + 1, &entry_oid);
-					tail++;
-				}
-				p += 20;
-			}
-		}
-
+		queue_referenced_oids(type, data, size, queue, &tail, 65536);
 		free(data);
 		head++;
 	}
@@ -187,43 +194,7 @@ static void cmd_push(const char *refspec) {
 		/* Write to SQLite with compression + delta */
 		storage_write_object(&cur_oid, (git_object_t)type, data, size);
 
-		/* Parse to find referenced oids */
-		if (type == GIT_OBJECT_COMMIT) {
-			const char *p = (const char *)data;
-			const char *end = p + size;
-			while (p < end) {
-				if (strncmp(p, "tree ", 5) == 0 && tail < 65536) {
-					strncpy(queue[tail], p + 5, 40);
-					queue[tail][40] = '\0';
-					tail++;
-				} else if (strncmp(p, "parent ", 7) == 0 && tail < 65536) {
-					strncpy(queue[tail], p + 7, 40);
-					queue[tail][40] = '\0';
-					tail++;
-				}
-				while (p < end && *p != '\n') p++;
-				if (p < end) p++;
-				if (p < end && *p == '\n') break;
-			}
-		} else if (type == GIT_OBJECT_TREE) {
-			const unsigned char *p = (const unsigned char *)data;
-			const unsigned char *end = p + size;
-			while (p < end) {
-				while (p < end && *p != ' ') p++;
-				if (p >= end) break;
-				p++;
-				while (p < end && *p != 0) p++;
-				if (p >= end) break;
-				p++;
-				if (p + 20 > end) break;
-				if (tail < 65536) {
-					git_oid entry_oid; memcpy(entry_oid.id, p, GIT_OID_SHA1_SIZE); git_oid_tostr(queue[tail], GIT_OID_SHA1_HEXSIZE + 1, &entry_oid);
-					tail++;
-				}
-				p += 20;
-			}
-		}
-
+		queue_referenced_oids((git_object_t)type, data, size, queue, &tail, 65536);
 		git_odb_object_free(obj);
 		head++;
 	}

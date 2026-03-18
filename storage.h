@@ -66,6 +66,10 @@ void storage_reflog_append(const char *refname, const git_oid *old_oid,
 
 void storage_lfs_sha256(const void *data, size_t len,
 			unsigned char out[LFS_OID_RAWSZ]);
+void storage_lfs_oid_to_hex(const unsigned char oid[LFS_OID_RAWSZ],
+			    char hex[LFS_OID_HEXSZ + 1]);
+int storage_lfs_oid_from_hex(const char *hex,
+			     unsigned char oid[LFS_OID_RAWSZ]);
 int storage_lfs_read(const unsigned char oid[LFS_OID_RAWSZ],
 		     size_t *out_size, unsigned char **out_data);
 void storage_lfs_write(const unsigned char oid[LFS_OID_RAWSZ],

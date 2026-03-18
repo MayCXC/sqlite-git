@@ -390,6 +390,23 @@ void storage_lfs_sha256(const void *data, size_t len,
 	sha256_final(&ctx, out);
 }
 
+void storage_lfs_oid_to_hex(const unsigned char oid[LFS_OID_RAWSZ],
+			    char hex[LFS_OID_HEXSZ + 1]) {
+	for (int i = 0; i < LFS_OID_RAWSZ; i++)
+		sprintf(hex + 2*i, "%02x", oid[i]);
+	hex[LFS_OID_HEXSZ] = '\0';
+}
+
+int storage_lfs_oid_from_hex(const char *hex,
+			     unsigned char oid[LFS_OID_RAWSZ]) {
+	for (int i = 0; i < LFS_OID_RAWSZ; i++) {
+		unsigned int b;
+		if (sscanf(hex + 2*i, "%02x", &b) != 1) return -1;
+		oid[i] = (unsigned char)b;
+	}
+	return 0;
+}
+
 int storage_lfs_read(const unsigned char oid[LFS_OID_RAWSZ],
 		     size_t *out_size, unsigned char **out_data) {
 	sqlite3_reset(st_lfs_read);

@@ -26,20 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 
-static void lfs_oid_to_hex(const unsigned char oid[LFS_OID_RAWSZ], char hex[LFS_OID_HEXSZ + 1]) {
-  for (int i = 0; i < LFS_OID_RAWSZ; i++)
-    sprintf(hex + 2*i, "%02x", oid[i]);
-  hex[LFS_OID_HEXSZ] = '\0';
-}
 
-static int lfs_oid_from_hex(const char *hex, unsigned char oid[LFS_OID_RAWSZ]) {
-  for (int i = 0; i < LFS_OID_RAWSZ; i++) {
-    unsigned int byte;
-    if (sscanf(hex + 2*i, "%02x", &byte) != 1) return -1;
-    oid[i] = (unsigned char)byte;
-  }
-  return 0;
-}
 
 /* ---- git0_lfs_pointer(data) ---- */
 
@@ -52,7 +39,7 @@ static void fn_lfs_pointer(sqlite3_context *ctx, int argc, sqlite3_value **argv)
   storage_lfs_sha256(data, len, oid);
 
   char hex[LFS_OID_HEXSZ + 1];
-  lfs_oid_to_hex(oid, hex);
+  storage_lfs_oid_to_hex(oid, hex);
 
   char pointer[512];
   int plen = snprintf(pointer, sizeof(pointer),
@@ -76,7 +63,7 @@ static void fn_lfs_store(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   storage_lfs_write(oid, data, len);
 
   char hex[LFS_OID_HEXSZ + 1];
-  lfs_oid_to_hex(oid, hex);
+  storage_lfs_oid_to_hex(oid, hex);
 
   char pointer[512];
   int plen = snprintf(pointer, sizeof(pointer),
@@ -99,7 +86,7 @@ static void fn_lfs_fetch(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   if (!oid_line) { sqlite3_result_null(ctx); return; }
 
   unsigned char oid[LFS_OID_RAWSZ];
-  if (lfs_oid_from_hex(oid_line + 11, oid) != 0) { sqlite3_result_null(ctx); return; }
+  if (storage_lfs_oid_from_hex(oid_line + 11, oid) != 0) { sqlite3_result_null(ctx); return; }
 
   size_t size;
   unsigned char *data;
@@ -118,7 +105,7 @@ static void fn_lfs_smudge(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
   if (!hex) { sqlite3_result_null(ctx); return; }
 
   unsigned char oid[LFS_OID_RAWSZ];
-  if (lfs_oid_from_hex(hex, oid) != 0) { sqlite3_result_null(ctx); return; }
+  if (storage_lfs_oid_from_hex(hex, oid) != 0) { sqlite3_result_null(ctx); return; }
 
   size_t size;
   unsigned char *data;
