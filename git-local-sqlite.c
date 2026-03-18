@@ -62,7 +62,7 @@ static void cmd_put(const char *args) {
 		if (n == 0) break;
 		got += n;
 	}
-	storage_write_object(&oid, git_object_string2type(type_str), data, size);
+	storage_write_object(&oid, git_object_string2type(type_str), data, got);
 	free(data);
 	printf("%s\n", hex); fflush(stdout);
 }

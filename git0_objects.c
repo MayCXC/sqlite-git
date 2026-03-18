@@ -206,7 +206,7 @@ static int obj_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int co
                           -1, SQLITE_STATIC);
       break;
     case 2: /* size */
-      sqlite3_result_int(ctx, sqlite3_column_int(cur->st, 2));
+      sqlite3_result_int64(ctx, sqlite3_column_int64(cur->st, 2));
       break;
     case 3: { /* data BLOB (decompressed, delta-resolved) */
       const void *oid_blob = sqlite3_column_blob(cur->st, 0);
@@ -214,7 +214,7 @@ static int obj_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int co
         git_oid read_oid; memcpy(read_oid.id, oid_blob, GIT_OID_SHA1_SIZE);
         git_object_t type; size_t size; unsigned char *data;
         if (storage_read_object(&read_oid, &type, &size, &data) == 0) {
-          sqlite3_result_blob(ctx, data, size, free);
+          sqlite3_result_blob64(ctx, data, size, free);
         } else {
           sqlite3_result_null(ctx);
         }
@@ -244,15 +244,15 @@ static int obj_update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
 
   if (!type_str || !data) return SQLITE_ERROR;
 
-  int type = git_object_string2type(type_str);
-  if (!type) return SQLITE_ERROR;
+  git_object_t type = git_object_string2type(type_str);
+  if (type == GIT_OBJECT_INVALID) return SQLITE_ERROR;
 
   /* Compute OID using git's format: "<type> <size>\0<data>" */
   git_oid oid;
-  git_odb_hash(&oid, data, data_len, (git_object_t)type);
+  git_odb_hash(&oid, data, data_len, type);
 
   /* Write via storage layer (handles compression + delta) */
-  storage_write_object(&oid, (git_object_t)type, data, data_len);
+  storage_write_object(&oid, type, data, data_len);
 
   return SQLITE_OK;
 }

@@ -98,6 +98,7 @@ int main(int argc, char **argv) {
 						fclose(f);
 					} else {
 						close(fd);
+						unlink(tmppath);
 					}
 				}
 				free(data);

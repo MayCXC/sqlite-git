@@ -62,7 +62,7 @@ static int find_delta_base(git_object_t type, git_oid *base_oid,
 		return -1;
 
 	memcpy(base_oid->id, sqlite3_column_blob(st_find_base, 0), GIT_OID_SHA1_SIZE);
-	int sz = sqlite3_column_int(st_find_base, 1);
+	size_t sz = (size_t)sqlite3_column_int64(st_find_base, 1);
 	const void *comp = sqlite3_column_blob(st_find_base, 2);
 	int comp_len = sqlite3_column_bytes(st_find_base, 2);
 
@@ -191,7 +191,7 @@ int storage_read_object(const git_oid *oid, git_object_t *out_type,
 		return -1;
 
 	*out_type = (git_object_t)sqlite3_column_int(st_obj_read, 0);
-	*out_size = sqlite3_column_int(st_obj_read, 1);
+	*out_size = (size_t)sqlite3_column_int64(st_obj_read, 1);
 	const void *comp = sqlite3_column_blob(st_obj_read, 2);
 	int comp_len = sqlite3_column_bytes(st_obj_read, 2);
 	const void *base_blob = sqlite3_column_blob(st_obj_read, 3);
@@ -293,7 +293,7 @@ int storage_obj_list(storage_obj_cb cb, void *data) {
 		git_oid oid;
 		memcpy(oid.id, sqlite3_column_blob(st_obj_list, 0), GIT_OID_SHA1_SIZE);
 		git_object_t type = (git_object_t)sqlite3_column_int(st_obj_list, 1);
-		size_t size = sqlite3_column_int(st_obj_list, 2);
+		size_t size = (size_t)sqlite3_column_int64(st_obj_list, 2);
 		if (cb(&oid, type, size, data)) return 1;
 	}
 	return 0;
@@ -334,10 +334,11 @@ int storage_ref_list(const char *prefix, storage_ref_cb cb, void *data) {
 	if (prefix && *prefix) {
 		char *pattern = sqlite3_mprintf("%s%%", prefix);
 		if (!pattern) return -1;
-		sqlite3_stmt *st;
-		sqlite3_prepare_v3(sdb,
+		sqlite3_stmt *st = NULL;
+		int rc = sqlite3_prepare_v3(sdb,
 			"SELECT refname, oid, symref FROM refs WHERE refname LIKE ? ORDER BY refname",
 			-1, 0, &st, 0);
+		if (rc != SQLITE_OK || !st) { sqlite3_free(pattern); return -1; }
 		sqlite3_bind_text(st, 1, pattern, -1, sqlite3_free);
 		while (sqlite3_step(st) == SQLITE_ROW) {
 			const char *name = (const char *)sqlite3_column_text(st, 0);
@@ -440,7 +441,7 @@ int storage_lfs_read(const unsigned char oid[LFS_OID_RAWSZ],
 	sqlite3_bind_blob(st_lfs_read, 1, oid, LFS_OID_RAWSZ, SQLITE_STATIC);
 	if (sqlite3_step(st_lfs_read) != SQLITE_ROW)
 		return -1;
-	*out_size = sqlite3_column_int(st_lfs_read, 0);
+	*out_size = (size_t)sqlite3_column_int64(st_lfs_read, 0);
 	const void *comp = sqlite3_column_blob(st_lfs_read, 1);
 	int comp_len = sqlite3_column_bytes(st_lfs_read, 1);
 	*out_data = zdecompress(comp, comp_len, *out_size);

@@ -45,8 +45,8 @@ static void fn_lfs_pointer(sqlite3_context *ctx, int argc, sqlite3_value **argv)
   int plen = snprintf(pointer, sizeof(pointer),
     "version https://git-lfs.github.com/spec/v1\n"
     "oid sha256:%s\n"
-    "size %d\n",
-    hex, len);
+    "size %lld\n",
+    hex, (long long)len);
 
   sqlite3_result_text(ctx, pointer, plen, SQLITE_TRANSIENT);
 }
@@ -69,8 +69,8 @@ static void fn_lfs_store(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   int plen = snprintf(pointer, sizeof(pointer),
     "version https://git-lfs.github.com/spec/v1\n"
     "oid sha256:%s\n"
-    "size %d\n",
-    hex, len);
+    "size %lld\n",
+    hex, (long long)len);
 
   sqlite3_result_text(ctx, pointer, plen, SQLITE_TRANSIENT);
 }
@@ -91,7 +91,7 @@ static void fn_lfs_fetch(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   size_t size;
   unsigned char *data;
   if (storage_lfs_read(oid, &size, &data) == 0) {
-    sqlite3_result_blob(ctx, data, size, free);
+    sqlite3_result_blob64(ctx, data, size, free);
   } else {
     sqlite3_result_null(ctx);
   }
@@ -110,7 +110,7 @@ static void fn_lfs_smudge(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
   size_t size;
   unsigned char *data;
   if (storage_lfs_read(oid, &size, &data) == 0) {
-    sqlite3_result_blob(ctx, data, size, free);
+    sqlite3_result_blob64(ctx, data, size, free);
   } else {
     sqlite3_result_null(ctx);
   }
