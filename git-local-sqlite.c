@@ -13,9 +13,10 @@
 
 
 static void cmd_capabilities(void) {
-	printf("get\ninfo\nput\nhave\nlist-objects\nodb-transaction\n"
+	printf("get\ninfo\nput\nput-stream\nhave\nlist-objects\nodb-transaction\n"
 	       "read\nlist\ntransaction\ncreate\nremove\n"
-	       "reflog-read\nreflog-append\nreflog-exists\nreflog-delete\n\n");
+	       "reflog-read\nreflog-read-reverse\nreflog-append\n"
+	       "reflog-exists\nreflog-delete\nreflog-list\n\n");
 	fflush(stdout);
 }
 
@@ -248,6 +249,60 @@ static void cmd_reflog_delete(const char *refname) {
 	printf("ok\n"); fflush(stdout);
 }
 
+/* ---- New protocol commands ---- */
+
+static int print_reflog_name(const char *refname, void *data) {
+	(void)data;
+	printf("%s\n", refname);
+	return 0;
+}
+
+static void cmd_reflog_list(void) {
+	storage_reflog_list(print_reflog_name, NULL);
+	printf("\n"); fflush(stdout);
+}
+
+static int print_reflog_reverse(const git_oid *old_oid, const git_oid *new_oid,
+				const char *committer, long long ts, int tz,
+				const char *msg, void *data) {
+	(void)data;
+	char old_hex[GIT_OID_SHA1_HEXSIZE + 1], new_hex[GIT_OID_SHA1_HEXSIZE + 1];
+	git_oid_tostr(old_hex, sizeof(old_hex), old_oid);
+	git_oid_tostr(new_hex, sizeof(new_hex), new_oid);
+	printf("%s %s %s %lld %+05d\t%s\n", old_hex, new_hex, committer, ts, tz, msg ? msg : "");
+	return 0;
+}
+
+static void cmd_reflog_read_reverse(const char *refname) {
+	storage_reflog_read_reverse(refname, print_reflog_reverse, NULL);
+	printf("\n"); fflush(stdout);
+}
+
+static void cmd_put_stream(const char *args) {
+	char type_str[32];
+	unsigned long size;
+	if (sscanf(args, "%31s %lu", type_str, &size) != 2) return;
+
+	unsigned char *data = malloc(size ? size : 1);
+	if (!data) return;
+	size_t got = 0;
+	while (got < size) {
+		size_t n = fread(data + got, 1, size - got, stdin);
+		if (n == 0) break;
+		got += n;
+	}
+
+	git_object_t type = git_object_string2type(type_str);
+	git_oid oid;
+	git_odb_hash(&oid, data, got, type);
+	storage_write_object(&oid, type, data, got);
+	free(data);
+
+	char hex[GIT_OID_SHA1_HEXSIZE + 1];
+	git_oid_tostr(hex, sizeof(hex), &oid);
+	printf("%s\n", hex); fflush(stdout);
+}
+
 /* ---- Main loop ---- */
 
 int local_main(int argc, char **argv) {
@@ -281,10 +336,13 @@ int local_main(int argc, char **argv) {
 		else if (!strcmp(line, "transaction-prepare")) cmd_txn_prepare();
 		else if (!strcmp(line, "transaction-finish")) cmd_txn_finish();
 		else if (!strcmp(line, "transaction-abort")) cmd_txn_abort();
+		else if (!strncmp(line, "put-stream ", 11)) cmd_put_stream(line + 11);
+		else if (!strncmp(line, "reflog-read-reverse ", 20)) cmd_reflog_read_reverse(line + 20);
 		else if (!strncmp(line, "reflog-read ", 12)) cmd_reflog_read(line + 12);
 		else if (!strncmp(line, "reflog-append ", 14)) cmd_reflog_append(line + 14);
 		else if (!strncmp(line, "reflog-exists ", 14)) cmd_reflog_exists(line + 14);
 		else if (!strncmp(line, "reflog-delete ", 14)) cmd_reflog_delete(line + 14);
+		else if (!strcmp(line, "reflog-list")) cmd_reflog_list();
 	}
 
 	storage_close();

@@ -61,6 +61,12 @@ typedef int (*storage_reflog_cb)(const git_oid *old_oid, const git_oid *new_oid,
 				 int tz, const char *msg, void *data);
 int storage_reflog_read(const char *refname, storage_reflog_cb cb, void *data);
 
+int storage_reflog_read_reverse(const char *refname, storage_reflog_cb cb, void *data);
+
+/* Reflog name listing callback. */
+typedef int (*storage_reflog_name_cb)(const char *refname, void *data);
+int storage_reflog_list(storage_reflog_name_cb cb, void *data);
+
 void storage_reflog_append(const char *refname, const git_oid *old_oid,
 			   const git_oid *new_oid, const char *committer,
 			   long long timestamp, int tz, const char *msg);
