@@ -271,19 +271,27 @@ static sqlite3_module git_log_module = {
 
 typedef struct { sqlite3_vtab base; } git_tree_vtab;
 
+#define TREE_STACK_MAX 32
+
 typedef struct {
   sqlite3_vtab_cursor base;
   git_repository *repo;
   git_tree *tree;
   size_t count;
   size_t idx;
+  /* Stack for recursive traversal */
+  int recursive;
+  int depth;
+  struct { git_tree *tree; size_t count; size_t idx; } stack[TREE_STACK_MAX];
+  char prefix[4096]; /* accumulated path prefix */
+  char full_name[4096]; /* current entry full path */
 } git_tree_cursor;
 
 static int git_tree_connect(sqlite3 *db, void *pAux, int argc, const char *const*argv,
                             sqlite3_vtab **ppVtab, char **pzErr) {
   int rc = sqlite3_declare_vtab(db,
     "CREATE TABLE x(name TEXT, mode INT, type TEXT, oid TEXT, size INT, "
-    "repo TEXT HIDDEN, rev TEXT HIDDEN, path TEXT HIDDEN)");
+    "repo TEXT HIDDEN, rev TEXT HIDDEN, path TEXT HIDDEN, recursive INT HIDDEN)");
   if (rc != SQLITE_OK) return rc;
   git_tree_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
   if (!vtab) return SQLITE_NOMEM;
@@ -303,9 +311,14 @@ static int git_tree_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
 static int git_tree_close(sqlite3_vtab_cursor *pCursor) {
   git_tree_cursor *cur = (git_tree_cursor *)pCursor;
   if (cur->tree) git_tree_free(cur->tree);
+  for (int i = 0; i < cur->depth; i++)
+    if (cur->stack[i].tree) git_tree_free(cur->stack[i].tree);
   sqlite3_free(cur);
   return SQLITE_OK;
 }
+
+static void tree_build_full_name(git_tree_cursor *cur);
+static int tree_descend(git_tree_cursor *cur);
 
 static int git_tree_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
                            int argc, sqlite3_value **argv) {
@@ -317,6 +330,10 @@ static int git_tree_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char 
   const char *rev = argc > 1 ? (const char *)sqlite3_value_text(argv[1]) : "HEAD";
   const char *path = argc > 2 && sqlite3_value_type(argv[2]) != SQLITE_NULL
     ? (const char *)sqlite3_value_text(argv[2]) : NULL;
+  cur->recursive = argc > 3 && sqlite3_value_int(argv[3]);
+  cur->depth = 0;
+  cur->prefix[0] = '\0';
+  cur->full_name[0] = '\0';
 
   char *err = NULL;
   cur->repo = git0_repo_open(repo_path, &err);
@@ -348,17 +365,101 @@ static int git_tree_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char 
   }
 
   cur->count = cur->tree ? git_tree_entrycount(cur->tree) : 0;
+
+  /* In recursive mode, descend into initial tree entries */
+  if (cur->recursive && cur->count > 0) {
+    while (cur->idx < cur->count) {
+      const git_tree_entry *entry = git_tree_entry_byindex(cur->tree, cur->idx);
+      if (entry && git_tree_entry_type(entry) == GIT_OBJECT_TREE) {
+        if (tree_descend(cur)) continue;
+      }
+      break;
+    }
+  }
   return SQLITE_OK;
 }
 
+static void tree_build_full_name(git_tree_cursor *cur) {
+  const git_tree_entry *entry = git_tree_entry_byindex(cur->tree, cur->idx);
+  if (!entry) { cur->full_name[0] = '\0'; return; }
+  const char *name = git_tree_entry_name(entry);
+  if (cur->prefix[0])
+    snprintf(cur->full_name, sizeof(cur->full_name), "%s/%s", cur->prefix, name);
+  else
+    snprintf(cur->full_name, sizeof(cur->full_name), "%s", name);
+}
+
+static int tree_descend(git_tree_cursor *cur) {
+  const git_tree_entry *entry = git_tree_entry_byindex(cur->tree, cur->idx);
+  if (!entry || git_tree_entry_type(entry) != GIT_OBJECT_TREE)
+    return 0;
+  if (cur->depth >= TREE_STACK_MAX - 1) return 0;
+
+  git_tree *subtree = NULL;
+  if (git_tree_lookup(&subtree, cur->repo, git_tree_entry_id(entry)) != 0)
+    return 0;
+
+  /* Push current state */
+  cur->stack[cur->depth].tree = cur->tree;
+  cur->stack[cur->depth].count = cur->count;
+  cur->stack[cur->depth].idx = cur->idx;
+  cur->depth++;
+
+  /* Build new prefix */
+  tree_build_full_name(cur);
+  snprintf(cur->prefix, sizeof(cur->prefix), "%s", cur->full_name);
+
+  /* Descend */
+  cur->tree = subtree;
+  cur->count = git_tree_entrycount(subtree);
+  cur->idx = 0;
+  return 1;
+}
+
 static int git_tree_next(sqlite3_vtab_cursor *pCursor) {
-  ((git_tree_cursor *)pCursor)->idx++;
+  git_tree_cursor *cur = (git_tree_cursor *)pCursor;
+  cur->idx++;
+
+  if (!cur->recursive) return SQLITE_OK;
+
+  /* Skip past exhausted levels */
+  while (cur->idx >= cur->count && cur->depth > 0) {
+    cur->depth--;
+    git_tree_free(cur->tree);
+    cur->tree = cur->stack[cur->depth].tree;
+    cur->count = cur->stack[cur->depth].count;
+    cur->idx = cur->stack[cur->depth].idx + 1;
+
+    /* Rebuild prefix from stack */
+    cur->prefix[0] = '\0';
+    for (int i = 0; i < cur->depth; i++) {
+      const git_tree_entry *e = git_tree_entry_byindex(cur->stack[i].tree, cur->stack[i].idx);
+      if (e) {
+        if (cur->prefix[0])
+          snprintf(cur->prefix + strlen(cur->prefix),
+                   sizeof(cur->prefix) - strlen(cur->prefix),
+                   "/%s", git_tree_entry_name(e));
+        else
+          snprintf(cur->prefix, sizeof(cur->prefix), "%s", git_tree_entry_name(e));
+      }
+    }
+  }
+
+  /* If current entry is a tree, descend into it */
+  while (cur->idx < cur->count) {
+    const git_tree_entry *entry = git_tree_entry_byindex(cur->tree, cur->idx);
+    if (entry && git_tree_entry_type(entry) == GIT_OBJECT_TREE) {
+      if (tree_descend(cur)) continue;
+    }
+    break;
+  }
+
   return SQLITE_OK;
 }
 
 static int git_tree_eof(sqlite3_vtab_cursor *pCursor) {
   git_tree_cursor *cur = (git_tree_cursor *)pCursor;
-  return cur->idx >= cur->count;
+  return cur->idx >= cur->count && cur->depth == 0;
 }
 
 static int git_tree_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int col) {
@@ -368,7 +469,12 @@ static int git_tree_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, i
 
   switch (col) {
     case 0: /* name */
-      sqlite3_result_text(ctx, git_tree_entry_name(entry), -1, SQLITE_TRANSIENT);
+      if (cur->recursive && cur->prefix[0]) {
+        tree_build_full_name(cur);
+        sqlite3_result_text(ctx, cur->full_name, -1, SQLITE_TRANSIENT);
+      } else {
+        sqlite3_result_text(ctx, git_tree_entry_name(entry), -1, SQLITE_TRANSIENT);
+      }
       break;
     case 1: /* mode */
       sqlite3_result_int(ctx, (int)git_tree_entry_filemode(entry));
@@ -410,7 +516,7 @@ static int git_tree_bestindex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
     if (!pInfo->aConstraint[i].usable) continue;
     if (pInfo->aConstraint[i].op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
     int col = pInfo->aConstraint[i].iColumn;
-    if (col == 5 || col == 6 || col == 7) {
+    if (col == 5 || col == 6 || col == 7 || col == 8) {
       pInfo->aConstraintUsage[i].argvIndex = ++argIdx;
       pInfo->aConstraintUsage[i].omit = 1;
     }
