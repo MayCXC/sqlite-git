@@ -186,6 +186,37 @@ A shared `helper_process` (one per repo, stored on `struct repository`)
 handles both ODB and ref operations in a single external process,
 matching how remote helpers handle both refs and objects.
 
+### Future: backend-transparent object receive
+
+`git fetch` over SSH/HTTPS receives a pack and calls `index-pack`
+which writes directly to `.git/objects/pack/`, bypassing the ODB
+source chain. Objects land in the files backend, invisible to the
+helper. Refs update correctly (the ref backend is transparent), but
+objects do not.
+
+The ref side achieved backend transparency with reftable: remote
+operations update refs through `ref_store_transaction_*` which
+dispatches to whatever backend is configured. The ODB side never
+needed this because there was only one backend.
+
+Proposed series: "ODB: make object receive backend-transparent"
+
+1. When ODB backend is not files, use `unpack-objects` path instead
+   of keeping the pack file. `git unpack-objects` already reads a
+   pack stream and writes individual objects, but hardcodes the
+   files backend. Route through `odb_write_object` instead.
+
+2. Wire into fetch/transport: when the local repo uses a non-files
+   ODB backend, tell the receive path to unpack through the ODB
+   source chain.
+
+3. This makes `git fetch origin` work with any local ODB backend
+   (helper, future sqlite-native, etc.) the same way `git fetch`
+   already works with any ref backend.
+
+Until then, cross-backend fetch requires `git-remote-sqlite` for
+sqlite-to-sqlite transfer, or a post-fetch migration script.
+
 ## Dependencies
 
 - **libgit2** (1.7+): git operations, custom ODB/refdb backend
