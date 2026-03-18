@@ -110,6 +110,9 @@ static void fn_git0_mktree(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 
     int mode_len = strlen(mode);
     int name_len = strlen(name);
+    int need = mode_len + 1 + name_len + 1 + GIT_OID_SHA1_SIZE;
+    if (pos + need > (int)sizeof(tree_buf)) break;
+
     memcpy(tree_buf + pos, mode, mode_len); pos += mode_len;
     tree_buf[pos++] = ' ';
     memcpy(tree_buf + pos, name, name_len); pos += name_len;

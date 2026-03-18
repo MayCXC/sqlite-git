@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "storage.h"
 
 /* Minimal JSON helpers (no dependency on a JSON library) */
@@ -77,18 +78,27 @@ int main(int argc, char **argv) {
 			(void)size;
 
 			unsigned char oid[LFS_OID_RAWSZ];
-			storage_lfs_oid_from_hex(oid_hex, oid);
+			if (storage_lfs_oid_from_hex(oid_hex, oid) != 0) {
+				printf("{\"event\":\"complete\",\"oid\":\"%s\","
+				       "\"error\":{\"code\":400,\"message\":\"bad oid\"}}\n",
+				       oid_hex);
+				fflush(stdout);
+				continue;
+			}
 
 			size_t out_size;
 			unsigned char *data;
 			if (storage_lfs_read(oid, &out_size, &data) == 0) {
-				/* Write content to a temp file for git-lfs to read */
-				char tmppath[4096];
-				snprintf(tmppath, sizeof(tmppath), "/tmp/lfs-%s", oid_hex);
-				FILE *f = fopen(tmppath, "wb");
-				if (f) {
-					fwrite(data, 1, out_size, f);
-					fclose(f);
+				char tmppath[] = "/tmp/lfs-XXXXXX";
+				int fd = mkstemp(tmppath);
+				if (fd >= 0) {
+					FILE *f = fdopen(fd, "wb");
+					if (f) {
+						fwrite(data, 1, out_size, f);
+						fclose(f);
+					} else {
+						close(fd);
+					}
 				}
 				free(data);
 				printf("{\"event\":\"complete\",\"oid\":\"%s\",\"path\":\"%s\"}\n",
@@ -106,13 +116,22 @@ int main(int argc, char **argv) {
 			json_string(line, "path", path, sizeof(path));
 
 			unsigned char oid[LFS_OID_RAWSZ];
-			storage_lfs_oid_from_hex(oid_hex, oid);
+			if (storage_lfs_oid_from_hex(oid_hex, oid) != 0 || size < 0) {
+				printf("{\"event\":\"complete\",\"oid\":\"%s\","
+				       "\"error\":{\"code\":400,\"message\":\"bad oid or size\"}}\n",
+				       oid_hex);
+				fflush(stdout);
+				continue;
+			}
 
 			/* Read content from the file git-lfs provides */
 			FILE *f = fopen(path, "rb");
 			if (f) {
-				unsigned char *data = malloc(size);
-				size_t got = fread(data, 1, size, f);
+				unsigned char *data = malloc(size ? (size_t)size : 1);
+				if (!data) { fclose(f); printf("{\"event\":\"complete\",\"oid\":\"%s\","
+					"\"error\":{\"code\":500,\"message\":\"out of memory\"}}\n", oid_hex);
+					fflush(stdout); continue; }
+				size_t got = fread(data, 1, (size_t)size, f);
 				fclose(f);
 				storage_lfs_write(oid, data, got);
 				free(data);
