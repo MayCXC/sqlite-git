@@ -51,7 +51,21 @@ test: all git-local-sqlite
 	sqlite3 /tmp/git0-test.db -cmd ".load ./git0" <tests/test_basic.sql
 	@rm -f /tmp/git0-test.db
 
+# Sanitizer build: ASan + UBSan for memory safety and undefined behavior checks
+SAN_CFLAGS = -O0 -g -Wall -fPIC -fsanitize=address,undefined -fno-omit-frame-pointer
+SAN_LDFLAGS = -fsanitize=address,undefined
+
+test-asan: clean
+	$(MAKE) 'CFLAGS=$(SAN_CFLAGS) -I$(PREFIX)/include' 'LDFLAGS=-lgit2 -L$(PREFIX)/lib -Wl,-rpath,$(PREFIX)/lib $(SAN_LDFLAGS)'
+	$(MAKE) git-local-sqlite
+	ASAN_OPTIONS=detect_leaks=0 bash tests/test_helper.sh
+	@rm -f /tmp/git0-asan.db
+	ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD=$$($(CC) -print-file-name=libasan.so) \
+		sqlite3 /tmp/git0-asan.db -cmd ".load ./git0" <tests/test_basic.sql
+	@rm -f /tmp/git0-asan.db
+	@echo "ASan + UBSan: all tests passed"
+
 clean:
 	rm -f git0.$(EXT) git-sqlite git-local-sqlite git-remote-sqlite git-lfs-sqlite-transfer *.o *.a
 
-.PHONY: all install test clean
+.PHONY: all install test test-asan clean

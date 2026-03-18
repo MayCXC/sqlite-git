@@ -108,28 +108,31 @@ The remote helper walks the object graph (commits, trees, blobs) and transfers o
 
 ## SQLite extension (git0)
 
-Query any git repo from SQL:
+Query any git repo from SQL, or work with a self-contained SQLite repo:
 
 ```sql
 .load ./git0
 
--- Read a file at a specific commit
+-- Query an existing .git repo
 SELECT git_blob('.', 'HEAD~1', 'README.md');
-
--- Walk commit history
-SELECT oid, author_name, substr(message, 1, 72)
-FROM git_log('.', 'main') LIMIT 20;
-
--- List changed files
+SELECT * FROM git_log('.', 'main') LIMIT 20;
 SELECT status, path FROM git_diff('.', 'v1.0', 'v2.0');
 
--- Browse a tree
-SELECT name, type, oid FROM git_tree('.', 'HEAD', 'src');
+-- Or create a self-contained repo in SQLite (no .git needed)
+SELECT git0_init();
+SELECT git0_add('hello.txt', 'hello world');
+SELECT git0_ref_create('refs/heads/main',
+  git0_mkcommit(
+    git0_mktree('100644 hello.txt ' || git0_add('hello.txt', 'hello world')),
+    git0_ref('HEAD'), 'initial commit'));
 
--- Blame
-SELECT line_start, line_count, author_name, substr(oid, 1, 8)
-FROM git_blame('.', 'main.c');
+-- Then use all libgit2 features via git0_repo()
+SELECT * FROM git_log(git0_repo());
+SELECT * FROM git_tree(git0_repo(), 'refs/heads/main');
+SELECT git_merge_base(git0_repo(), 'HEAD', 'refs/heads/main');
 ```
+
+`git0_repo()` returns a handle to the storage-backed libgit2 repository. All `git_*` functions (log, tree, diff, refs, ancestors, merge-base, blame, describe) work against it in `:memory:` with no filesystem access.
 
 ### Scalar functions
 
@@ -156,6 +159,36 @@ FROM git_blame('.', 'main.c');
 | `git_merge_base` | `(repo, oid1, oid2)` | common ancestor oid |
 | `git_config` | `(repo, key)` | config value |
 | `git_config_set` | `(repo, key, value)` | void |
+
+### Storage-native functions
+
+These operate directly on the SQLite storage layer (no `.git` repo needed). Use after `git0_init()`.
+
+| Function | Args | Returns |
+|----------|------|---------|
+| `git0_init()` | | initial commit oid |
+| `git0_add` | `(path, data)` | blob oid |
+| `git0_mktree` | `(entries)` | tree oid |
+| `git0_mkcommit` | `(tree, parent, msg, author?)` | commit oid |
+| `git0_repo()` | | `:storage:` handle for git_* functions |
+| `git0_type` | `(oid)` | object type |
+| `git0_size` | `(oid)` | object size |
+| `git0_exists` | `(oid)` | 1 or 0 |
+| `git0_cat` | `(oid)` | raw object content |
+| `git0_blob` | `(oid)` or `(rev, path)` | blob content |
+| `git0_ref` | `(name)` | resolved oid |
+| `git0_ref_create` | `(name, oid)` | void |
+| `git0_ref_delete` | `(name)` | void |
+| `git0_commit_tree` | `(rev)` | tree oid |
+| `git0_commit_message` | `(rev)` | full message |
+| `git0_commit_summary` | `(rev)` | first line |
+| `git0_commit_author` | `(rev)` | author line |
+| `git0_commit_parent` | `(rev, n)` | nth parent oid |
+| `git0_commit_parents` | `(rev)` | parent count |
+| `git0_lfs_store` | `(data)` | LFS pointer text |
+| `git0_lfs_fetch` | `(pointer)` | content |
+| `git0_lfs_pointer` | `(data)` | pointer text (no store) |
+| `git0_lfs_smudge` | `(oid_hex)` | content |
 
 ### Table-valued functions
 
@@ -189,11 +222,12 @@ lfs(oid BLOB PRIMARY KEY, size INT, data BLOB) WITHOUT ROWID
 ## Testing
 
 ```sh
-make test    # runs both test suites
+make test       # run both test suites
+make test-asan  # run with AddressSanitizer + UndefinedBehaviorSanitizer
 ```
 
-- `tests/test_helper.sh`: 34 tests covering the local helper protocol (18 commands), LFS transfer adapter, and argv[0] dispatch.
-- `tests/test_basic.sql`: SQL extension tests for scalar functions, table-valued functions, virtual tables, self-contained repo operations, and LFS round-trips.
+- `tests/test_helper.sh`: 37 tests covering all 18 protocol commands, LFS transfer adapter, and argv[0] dispatch.
+- `tests/test_basic.sql`: SQL extension tests for scalar functions, table-valued functions, virtual tables, storage-native functions, self-contained repo operations, and LFS round-trips.
 
 ## Git upstream patches
 
