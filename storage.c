@@ -85,10 +85,15 @@ static unsigned char *zdecompress(const void *src, unsigned long srclen,
 
 /* ---- Delta base selection ---- */
 
-static int find_delta_base(git_object_t type, git_oid *base_oid,
+static int find_delta_base(git_object_t type, size_t target_size,
+			   git_oid *base_oid,
 			   unsigned char **base_data, unsigned long *base_len) {
-	sqlite3_stmt *st = stmt_acquire(st_find_base, "SELECT oid, size, data, base FROM objects WHERE type = ? AND base IS NULL LIMIT 1");
+	sqlite3_stmt *st = stmt_acquire(st_find_base,
+		"SELECT oid, size, data, base FROM objects"
+		" WHERE type = ? AND base IS NULL"
+		" ORDER BY ABS(size - ?) LIMIT 1");
 	sqlite3_bind_int(st, 1, (int)type);
+	sqlite3_bind_int64(st, 2, (sqlite3_int64)target_size);
 	if (sqlite3_step(st) != SQLITE_ROW) { stmt_release(st_find_base, st); return -1; }
 
 	const void *oid_blob = sqlite3_column_blob(st, 0);
@@ -96,6 +101,10 @@ static int find_delta_base(git_object_t type, git_oid *base_oid,
 
 	memcpy(base_oid->id, oid_blob, GIT_OID_SHA1_SIZE);
 	size_t sz = (size_t)sqlite3_column_int64(st, 1);
+
+	/* Size filter from git-core: skip if target < base/32 */
+	if (target_size < sz / 32) { stmt_release(st_find_base, st); return -1; }
+
 	const void *comp = sqlite3_column_blob(st, 2);
 	int comp_len = sqlite3_column_bytes(st, 2);
 	if (!comp) { stmt_release(st_find_base, st); return -1; }
@@ -166,7 +175,7 @@ int storage_open_db(sqlite3 *db, int persistent) {
 		"  data BLOB NOT NULL"
 		") WITHOUT ROWID;"
 		"CREATE INDEX IF NOT EXISTS idx_objects_type_base"
-		"  ON objects(type) WHERE base IS NULL;",
+		"  ON objects(type, size) WHERE base IS NULL;",
 		0, 0, 0);
 	return 0;
 }
@@ -344,7 +353,7 @@ void storage_write_object(const git_oid *oid, git_object_t type,
 	char *delta_buf = NULL;
 	int delta_len = 0;
 
-	if (size > 64 && find_delta_base(type, &base_oid, &base_data, &base_len) == 0) {
+	if (size > 64 && find_delta_base(type, size, &base_oid, &base_data, &base_len) == 0) {
 		delta_buf = malloc(size + 60);
 		if (delta_buf) {
 			delta_len = delta_create((const char *)base_data, base_len,
