@@ -28,6 +28,10 @@
 static void fn_git0_init(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc; (void)argv;
 
+  /* Lazily initialize storage if not already open */
+  if (!storage_db())
+    storage_open_db(sqlite3_context_db_handle(ctx));
+
   /* Check if already initialized */
   git_oid head_oid;
   char symref[256];

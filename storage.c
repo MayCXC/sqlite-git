@@ -249,7 +249,8 @@ static int read_object_depth(const git_oid *oid, git_object_t *out_type,
 	int target_size = delta_output_size(delta, delta_len);
 	if (target_size < 0) { free(base_data); free(delta); return -1; }
 
-	*out_data = malloc(target_size ? target_size : 1);
+	/* delta_apply writes a NUL terminator past the output data */
+	*out_data = malloc(target_size + 1);
 	if (!*out_data) { free(base_data); free(delta); return -1; }
 	if (delta_apply((const char *)base_data, base_size,
 			delta, delta_len, (char *)*out_data) < 0) {

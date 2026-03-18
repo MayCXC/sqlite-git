@@ -308,9 +308,14 @@ static git_refdb_backend *create_storage_refdb(void) {
 static git_repository *s_repo;
 static git_odb *s_odb;
 static git_refdb *s_refdb;
+static sqlite3 *s_ext_db; /* extension db handle for lazy storage init */
 
 static void ensure_repo(void) {
   if (s_repo) return;
+
+  /* Lazily initialize storage on first use */
+  if (!storage_db() && s_ext_db)
+    storage_open_db(s_ext_db);
   if (!storage_db()) return;
 
   git_odb_backend *odb_be = create_storage_backend();
@@ -361,12 +366,14 @@ void git0_backend_cleanup(void) {
   if (s_repo) { git_repository_free(s_repo); s_repo = NULL; }
   if (s_refdb) { git_refdb_free(s_refdb); s_refdb = NULL; }
   if (s_odb) { git_odb_free(s_odb); s_odb = NULL; }
+  s_ext_db = NULL;
   storage_close();
 }
 
 /* ---- Registration ---- */
 
 int git0_register_backend(sqlite3 *db) {
+  s_ext_db = db;
   sqlite3_create_function(db, "git0_repo", 0, SQLITE_UTF8, 0, fn_git0_repo, 0, 0);
   return SQLITE_OK;
 }
