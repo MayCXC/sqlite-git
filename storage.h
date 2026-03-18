@@ -10,7 +10,15 @@
  */
 int storage_open(const char *path_arg);
 void storage_close(void);
+void storage_destroy(void);
 sqlite3 *storage_db(void);
+
+/* Transaction control */
+void storage_begin(void);
+void storage_commit(void);
+void storage_savepoint(const char *name);
+void storage_release(const char *name);
+void storage_rollback_to(const char *name);
 
 /*
  * Object operations. OIDs are git_oid (binary 20 bytes).

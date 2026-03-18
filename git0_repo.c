@@ -21,26 +21,12 @@
 #include <string.h>
 #include <time.h>
 
-/* ---- Helper: query single text result ---- */
 
-static const char *query_text(sqlite3 *db, const char *sql) {
-  sqlite3_stmt *st;
-  const char *result = NULL;
-  if (sqlite3_prepare_v2(db, sql, -1, &st, 0) == SQLITE_OK) {
-    if (sqlite3_step(st) == SQLITE_ROW) {
-      const char *val = (const char *)sqlite3_column_text(st, 0);
-      if (val) result = sqlite3_mprintf("%s", val);
-    }
-    sqlite3_finalize(st);
-  }
-  return result;
-}
 
 /* ---- git0_init() ---- */
 
 static void fn_git0_init(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc; (void)argv;
-  sqlite3 *db = sqlite3_context_db_handle(ctx);
 
   /* Check if already initialized */
   git_oid head_oid;

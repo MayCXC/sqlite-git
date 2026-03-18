@@ -10,7 +10,7 @@
 #include <git2.h>
 #include "storage.h"
 
-#define HEXSZ GIT_OID_SHA1_HEXSIZE
+
 
 static void cmd_capabilities(void) {
 	printf("get\ninfo\nput\nhave\nlist-objects\nodb-transaction\n"
@@ -49,7 +49,7 @@ static void cmd_get(const char *hex) {
 }
 
 static void cmd_put(const char *args) {
-	char hex[HEXSZ + 1], type_str[32];
+	char hex[GIT_OID_SHA1_HEXSIZE + 1], type_str[32];
 	unsigned long size;
 	if (sscanf(args, "%40s %31s %lu", hex, type_str, &size) != 3) return;
 	git_oid oid;
@@ -75,7 +75,7 @@ static void cmd_have(const char *hex) {
 
 static int print_obj(const git_oid *oid, git_object_t type, size_t size, void *data) {
 	(void)data;
-	char hex[HEXSZ + 1];
+	char hex[GIT_OID_SHA1_HEXSIZE + 1];
 	git_oid_tostr(hex, sizeof(hex), oid);
 	printf("%s %s %zu\n", hex, git_object_type2string(type), size);
 	return 0;
@@ -87,12 +87,12 @@ static void cmd_list_objects(void) {
 }
 
 static void cmd_odb_transaction_begin(void) {
-	sqlite3_exec(storage_db(), "BEGIN", 0, 0, 0);
+	storage_begin();
 	printf("ok\n"); fflush(stdout);
 }
 
 static void cmd_odb_transaction_commit(void) {
-	sqlite3_exec(storage_db(), "COMMIT", 0, 0, 0);
+	storage_commit();
 	printf("ok\n"); fflush(stdout);
 }
 
@@ -105,7 +105,7 @@ static void cmd_read(const char *refname) {
 	} else if (symref[0]) {
 		printf("symref %s\n", symref);
 	} else {
-		char hex[HEXSZ + 1];
+		char hex[GIT_OID_SHA1_HEXSIZE + 1];
 		git_oid_tostr(hex, sizeof(hex), &oid);
 		printf("%s\n", hex);
 	}
@@ -117,7 +117,7 @@ static int print_ref(const char *name, const git_oid *oid, const char *sym, void
 	if (sym && *sym)
 		printf("%s symref %s\n", name, sym);
 	else if (oid) {
-		char hex[HEXSZ + 1];
+		char hex[GIT_OID_SHA1_HEXSIZE + 1];
 		git_oid_tostr(hex, sizeof(hex), oid);
 		printf("%s %s\n", name, hex);
 	}
@@ -132,10 +132,7 @@ static void cmd_list(const char *prefix) {
 static void cmd_create(void) { printf("ok\n"); fflush(stdout); }
 
 static void cmd_remove(void) {
-	sqlite3_exec(storage_db(),
-		"DROP TABLE IF EXISTS objects;"
-		"DROP TABLE IF EXISTS refs;"
-		"DROP TABLE IF EXISTS reflog;", 0, 0, 0);
+	storage_destroy();
 	printf("ok\n"); fflush(stdout);
 }
 
@@ -144,12 +141,12 @@ static void cmd_remove(void) {
 static int in_txn;
 
 static void cmd_txn_begin(void) {
-	if (!in_txn) { sqlite3_exec(storage_db(), "SAVEPOINT ref_txn", 0, 0, 0); in_txn = 1; }
+	if (!in_txn) { storage_savepoint("ref_txn"); in_txn = 1; }
 	printf("ok\n"); fflush(stdout);
 }
 
 static void cmd_txn_update(const char *args) {
-	char refname[4096], hex[HEXSZ + 1];
+	char refname[4096], hex[GIT_OID_SHA1_HEXSIZE + 1];
 	if (sscanf(args, "%4095s %40s", refname, hex) < 2) {
 		printf("error bad arguments\n"); fflush(stdout); return;
 	}
@@ -180,12 +177,12 @@ static void cmd_txn_create_symref(const char *args) {
 static void cmd_txn_prepare(void) { printf("ok\n"); fflush(stdout); }
 
 static void cmd_txn_finish(void) {
-	if (in_txn) { sqlite3_exec(storage_db(), "RELEASE ref_txn", 0, 0, 0); in_txn = 0; }
+	if (in_txn) { storage_release("ref_txn"); in_txn = 0; }
 	printf("ok\n"); fflush(stdout);
 }
 
 static void cmd_txn_abort(void) {
-	if (in_txn) { sqlite3_exec(storage_db(), "ROLLBACK TO ref_txn; RELEASE ref_txn", 0, 0, 0); in_txn = 0; }
+	if (in_txn) { storage_rollback_to("ref_txn"); in_txn = 0; }
 	printf("ok\n"); fflush(stdout);
 }
 
@@ -195,7 +192,7 @@ static int print_reflog(const git_oid *old_oid, const git_oid *new_oid,
 			const char *committer, long long ts, int tz,
 			const char *msg, void *data) {
 	(void)data;
-	char old_hex[HEXSZ + 1], new_hex[HEXSZ + 1];
+	char old_hex[GIT_OID_SHA1_HEXSIZE + 1], new_hex[GIT_OID_SHA1_HEXSIZE + 1];
 	git_oid_tostr(old_hex, sizeof(old_hex), old_oid);
 	git_oid_tostr(new_hex, sizeof(new_hex), new_oid);
 	printf("%s %s %s %lld %+05d\t%s\n", old_hex, new_hex, committer, ts, tz, msg ? msg : "");
@@ -208,7 +205,7 @@ static void cmd_reflog_read(const char *refname) {
 }
 
 static void cmd_reflog_append(const char *args) {
-	char refname[4096], old_hex[HEXSZ + 1], new_hex[HEXSZ + 1];
+	char refname[4096], old_hex[GIT_OID_SHA1_HEXSIZE + 1], new_hex[GIT_OID_SHA1_HEXSIZE + 1];
 	const char *p = args, *sp;
 
 	sp = strchr(p, ' '); if (!sp) { printf("error bad args\n"); fflush(stdout); return; }

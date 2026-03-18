@@ -16,7 +16,6 @@
 #include "vendor/delta.h"
 #include "vendor/sha256.h"
 
-#define RAW 20 /* GIT_OID_SHA1_SIZE */
 
 static sqlite3 *sdb;
 
@@ -62,7 +61,7 @@ static int find_delta_base(git_object_t type, git_oid *base_oid,
 	if (sqlite3_step(st_find_base) != SQLITE_ROW)
 		return -1;
 
-	memcpy(base_oid->id, sqlite3_column_blob(st_find_base, 0), RAW);
+	memcpy(base_oid->id, sqlite3_column_blob(st_find_base, 0), GIT_OID_SHA1_SIZE);
 	int sz = sqlite3_column_int(st_find_base, 1);
 	const void *comp = sqlite3_column_blob(st_find_base, 2);
 	int comp_len = sqlite3_column_bytes(st_find_base, 2);
@@ -154,12 +153,40 @@ void storage_close(void) {
 
 sqlite3 *storage_db(void) { return sdb; }
 
+void storage_destroy(void) {
+	sqlite3_exec(sdb, "DROP TABLE IF EXISTS objects;"
+		     "DROP TABLE IF EXISTS refs;"
+		     "DROP TABLE IF EXISTS reflog;"
+		     "DROP TABLE IF EXISTS lfs;", 0, 0, 0);
+}
+
+void storage_begin(void) { sqlite3_exec(sdb, "BEGIN", 0, 0, 0); }
+void storage_commit(void) { sqlite3_exec(sdb, "COMMIT", 0, 0, 0); }
+
+void storage_savepoint(const char *name) {
+	char sql[256];
+	snprintf(sql, sizeof(sql), "SAVEPOINT \"%s\"", name);
+	sqlite3_exec(sdb, sql, 0, 0, 0);
+}
+
+void storage_release(const char *name) {
+	char sql[256];
+	snprintf(sql, sizeof(sql), "RELEASE \"%s\"", name);
+	sqlite3_exec(sdb, sql, 0, 0, 0);
+}
+
+void storage_rollback_to(const char *name) {
+	char sql[512];
+	snprintf(sql, sizeof(sql), "ROLLBACK TO \"%s\"; RELEASE \"%s\"", name, name);
+	sqlite3_exec(sdb, sql, 0, 0, 0);
+}
+
 /* ---- Object read (resolves delta chains) ---- */
 
 int storage_read_object(const git_oid *oid, git_object_t *out_type,
 			size_t *out_size, unsigned char **out_data) {
 	sqlite3_reset(st_obj_read);
-	sqlite3_bind_blob(st_obj_read, 1, oid->id, RAW, SQLITE_STATIC);
+	sqlite3_bind_blob(st_obj_read, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	if (sqlite3_step(st_obj_read) != SQLITE_ROW)
 		return -1;
 
@@ -176,7 +203,7 @@ int storage_read_object(const git_oid *oid, git_object_t *out_type,
 
 	/* Delta: copy before recursive call (SQLite buffer invalidation) */
 	git_oid base_oid;
-	memcpy(base_oid.id, base_blob, RAW);
+	memcpy(base_oid.id, base_blob, GIT_OID_SHA1_SIZE);
 	int delta_len = comp_len;
 	char *delta = malloc(delta_len);
 	memcpy(delta, comp, delta_len);
@@ -208,7 +235,7 @@ int storage_read_object(const git_oid *oid, git_object_t *out_type,
 void storage_write_object(const git_oid *oid, git_object_t type,
 			  const void *data, size_t size) {
 	sqlite3_reset(st_obj_exists);
-	sqlite3_bind_blob(st_obj_exists, 1, oid->id, RAW, SQLITE_STATIC);
+	sqlite3_bind_blob(st_obj_exists, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	if (sqlite3_step(st_obj_exists) == SQLITE_ROW)
 		return;
 
@@ -232,13 +259,13 @@ void storage_write_object(const git_oid *oid, git_object_t type,
 	}
 
 	sqlite3_reset(st_obj_write);
-	sqlite3_bind_blob(st_obj_write, 1, oid->id, RAW, SQLITE_STATIC);
+	sqlite3_bind_blob(st_obj_write, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	sqlite3_bind_int(st_obj_write, 2, (int)type);
 	sqlite3_bind_int64(st_obj_write, 3, (sqlite3_int64)size);
 
 	if (use_delta) {
 		sqlite3_bind_blob(st_obj_write, 4, delta_buf, delta_len, SQLITE_STATIC);
-		sqlite3_bind_blob(st_obj_write, 5, base_oid.id, RAW, SQLITE_STATIC);
+		sqlite3_bind_blob(st_obj_write, 5, base_oid.id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 		sqlite3_step(st_obj_write);
 		free(delta_buf);
 	} else {
@@ -254,7 +281,7 @@ void storage_write_object(const git_oid *oid, git_object_t type,
 
 int storage_object_exists(const git_oid *oid) {
 	sqlite3_reset(st_obj_exists);
-	sqlite3_bind_blob(st_obj_exists, 1, oid->id, RAW, SQLITE_STATIC);
+	sqlite3_bind_blob(st_obj_exists, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	return sqlite3_step(st_obj_exists) == SQLITE_ROW;
 }
 
@@ -264,7 +291,7 @@ int storage_obj_list(storage_obj_cb cb, void *data) {
 	sqlite3_reset(st_obj_list);
 	while (sqlite3_step(st_obj_list) == SQLITE_ROW) {
 		git_oid oid;
-		memcpy(oid.id, sqlite3_column_blob(st_obj_list, 0), RAW);
+		memcpy(oid.id, sqlite3_column_blob(st_obj_list, 0), GIT_OID_SHA1_SIZE);
 		git_object_t type = (git_object_t)sqlite3_column_int(st_obj_list, 1);
 		size_t size = sqlite3_column_int(st_obj_list, 2);
 		if (cb(&oid, type, size, data)) return 1;
@@ -281,7 +308,7 @@ int storage_ref_read(const char *refname, git_oid *oid, char *symref, size_t sym
 		return -1;
 	const void *blob = sqlite3_column_blob(st_ref_read, 0);
 	const char *sym = (const char *)sqlite3_column_text(st_ref_read, 1);
-	if (blob && oid) memcpy(oid->id, blob, RAW);
+	if (blob && oid) memcpy(oid->id, blob, GIT_OID_SHA1_SIZE);
 	if (sym && symref) snprintf(symref, symref_len, "%s", sym);
 	else if (symref) symref[0] = '\0';
 	return 0;
@@ -290,7 +317,7 @@ int storage_ref_read(const char *refname, git_oid *oid, char *symref, size_t sym
 void storage_ref_write(const char *refname, const git_oid *oid, const char *symref) {
 	sqlite3_reset(st_ref_write);
 	sqlite3_bind_text(st_ref_write, 1, refname, -1, SQLITE_STATIC);
-	if (oid) sqlite3_bind_blob(st_ref_write, 2, oid->id, RAW, SQLITE_STATIC);
+	if (oid) sqlite3_bind_blob(st_ref_write, 2, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	else sqlite3_bind_null(st_ref_write, 2);
 	if (symref) sqlite3_bind_text(st_ref_write, 3, symref, -1, SQLITE_STATIC);
 	else sqlite3_bind_null(st_ref_write, 3);
@@ -316,7 +343,7 @@ int storage_ref_list(const char *prefix, storage_ref_cb cb, void *data) {
 			const char *name = (const char *)sqlite3_column_text(st, 0);
 			git_oid oid = {{0}};
 			const void *blob = sqlite3_column_blob(st, 1);
-			if (blob) memcpy(oid.id, blob, RAW);
+			if (blob) memcpy(oid.id, blob, GIT_OID_SHA1_SIZE);
 			const char *sym = (const char *)sqlite3_column_text(st, 2);
 			if (cb(name, blob ? &oid : NULL, sym, data)) break;
 		}
@@ -327,7 +354,7 @@ int storage_ref_list(const char *prefix, storage_ref_cb cb, void *data) {
 			const char *name = (const char *)sqlite3_column_text(st_ref_list, 0);
 			git_oid oid = {{0}};
 			const void *blob = sqlite3_column_blob(st_ref_list, 1);
-			if (blob) memcpy(oid.id, blob, RAW);
+			if (blob) memcpy(oid.id, blob, GIT_OID_SHA1_SIZE);
 			const char *sym = (const char *)sqlite3_column_text(st_ref_list, 2);
 			if (cb(name, blob ? &oid : NULL, sym, data)) break;
 		}
@@ -354,8 +381,8 @@ int storage_reflog_read(const char *refname, storage_reflog_cb cb, void *data) {
 	sqlite3_bind_text(st_reflog_read, 1, refname, -1, SQLITE_STATIC);
 	while (sqlite3_step(st_reflog_read) == SQLITE_ROW) {
 		git_oid old_oid, new_oid;
-		memcpy(old_oid.id, sqlite3_column_blob(st_reflog_read, 0), RAW);
-		memcpy(new_oid.id, sqlite3_column_blob(st_reflog_read, 1), RAW);
+		memcpy(old_oid.id, sqlite3_column_blob(st_reflog_read, 0), GIT_OID_SHA1_SIZE);
+		memcpy(new_oid.id, sqlite3_column_blob(st_reflog_read, 1), GIT_OID_SHA1_SIZE);
 		const char *committer = (const char *)sqlite3_column_text(st_reflog_read, 2);
 		long long ts = sqlite3_column_int64(st_reflog_read, 3);
 		int tz = sqlite3_column_int(st_reflog_read, 4);
@@ -371,8 +398,8 @@ void storage_reflog_append(const char *refname, const git_oid *old_oid,
 	sqlite3_reset(st_reflog_append);
 	sqlite3_bind_text(st_reflog_append, 1, refname, -1, SQLITE_STATIC);
 	sqlite3_bind_text(st_reflog_append, 2, refname, -1, SQLITE_STATIC);
-	sqlite3_bind_blob(st_reflog_append, 3, old_oid->id, RAW, SQLITE_STATIC);
-	sqlite3_bind_blob(st_reflog_append, 4, new_oid->id, RAW, SQLITE_STATIC);
+	sqlite3_bind_blob(st_reflog_append, 3, old_oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	sqlite3_bind_blob(st_reflog_append, 4, new_oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	sqlite3_bind_text(st_reflog_append, 5, committer, -1, SQLITE_STATIC);
 	sqlite3_bind_int64(st_reflog_append, 6, timestamp);
 	sqlite3_bind_int(st_reflog_append, 7, tz);

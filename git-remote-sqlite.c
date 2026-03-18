@@ -129,8 +129,7 @@ static void cmd_fetch(const char *sha, const char *ref) {
 /* ---- Push: copy objects from local git repo to SQLite ---- */
 
 static void cmd_push(const char *refspec) {
-	int force = 0;
-	if (refspec[0] == '+') { force = 1; refspec++; }
+	if (refspec[0] == '+') refspec++;
 
 	/* Parse src:dst */
 	char src[256] = "", dst[256] = "";
