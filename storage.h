@@ -9,7 +9,15 @@
  * If path ends with /objects, strips it to find the gitdir root.
  */
 int storage_open(const char *path_arg);
-int storage_open_db(sqlite3 *db);
+
+/*
+ * Use an existing database connection for storage.
+ * If persistent is true, prepared statements are cached for the
+ * lifetime of the connection (caller must call storage_close or
+ * use sqlite3_close_v2). If false, statements are prepared and
+ * finalized per call (safe with sqlite3_close v1).
+ */
+int storage_open_db(sqlite3 *db, int persistent);
 void storage_close(void);
 void storage_destroy(void);
 sqlite3 *storage_db(void);

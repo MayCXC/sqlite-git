@@ -130,12 +130,17 @@ int storage_open(const char *path_arg) {
 	return storage_init_db(sdb);
 }
 
-int storage_open_db(sqlite3 *db) {
+int storage_open_db(sqlite3 *db, int persistent) {
 	if (sdb) return 0;
 	sdb = db;
-	/* Only create schema, skip prepared statements.
-	 * Borrowed connections prepare/finalize per call to avoid
-	 * keeping statements alive that prevent sqlite3_close(v1). */
+	if (persistent) {
+		/* Caller manages cleanup (e.g. calls storage_close or uses
+		 * sqlite3_close_v2). Cache statements for performance. */
+		sdb_owned = 0;
+		return storage_init_db(sdb);
+	}
+	/* Non-persistent: create schema only, statements prepared per call.
+	 * Safe with sqlite3_close (v1) since no statements survive calls. */
 	sqlite3_exec(db,
 		"CREATE TABLE IF NOT EXISTS objects("
 		"  oid BLOB PRIMARY KEY, type INTEGER NOT NULL,"

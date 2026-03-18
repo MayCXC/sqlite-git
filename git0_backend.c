@@ -315,7 +315,7 @@ static void ensure_repo(void) {
 
   /* Lazily initialize storage on first use */
   if (!storage_db() && s_ext_db)
-    storage_open_db(s_ext_db);
+    storage_open_db(s_ext_db, 0);
   if (!storage_db()) return;
 
   git_odb_backend *odb_be = create_storage_backend();
