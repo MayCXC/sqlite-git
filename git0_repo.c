@@ -96,44 +96,114 @@ static void fn_git0_add(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 }
 
 /* ---- git0_mktree(entries_text) ---- */
-/* entries: "mode name oid\n" per line (sorted by name) */
+/* entries: "mode path oid\n" per line
+ * Paths with '/' create nested subtrees automatically. */
+
+/* Build a flat tree from entries that have no '/' in their name */
+static void build_flat_tree(const char *entries, int nentries,
+                            char (*modes)[16], char (*names)[256],
+                            git_oid *oids, git_oid *out) {
+  unsigned char tree_buf[65536];
+  int pos = 0;
+  (void)entries;
+
+  for (int i = 0; i < nentries; i++) {
+    int mode_len = strlen(modes[i]);
+    int name_len = strlen(names[i]);
+    int need = mode_len + 1 + name_len + 1 + GIT_OID_SHA1_SIZE;
+    if (pos + need > (int)sizeof(tree_buf)) break;
+
+    memcpy(tree_buf + pos, modes[i], mode_len); pos += mode_len;
+    tree_buf[pos++] = ' ';
+    memcpy(tree_buf + pos, names[i], name_len); pos += name_len;
+    tree_buf[pos++] = '\0';
+    memcpy(tree_buf + pos, oids[i].id, GIT_OID_SHA1_SIZE); pos += GIT_OID_SHA1_SIZE;
+  }
+
+  git_odb_hash(out, tree_buf, pos, GIT_OBJECT_TREE);
+  storage_write_object(out, GIT_OBJECT_TREE, tree_buf, pos);
+}
+
+/* Parse entries, group by top-level directory, recurse for subdirs */
+static void mktree_recursive(const char *text, git_oid *out) {
+  /* Parse all entries */
+  char modes[1024][16], paths[1024][256], oid_hexes[1024][GIT_OID_SHA1_HEXSIZE + 1];
+  int count = 0;
+  const char *p = text;
+
+  while (*p && count < 1024) {
+    if (sscanf(p, "%15s %255s %40s", modes[count], paths[count], oid_hexes[count]) != 3) break;
+    count++;
+    while (*p && *p != '\n') p++;
+    if (*p == '\n') p++;
+  }
+
+  /* Separate into direct entries (no /) and grouped subdirs */
+  char direct_modes[1024][16], direct_names[1024][256];
+  git_oid direct_oids[1024];
+  int direct_count = 0;
+
+  /* Collect unique top-level directories */
+  char dirs[256][256];
+  int dir_count = 0;
+
+  for (int i = 0; i < count; i++) {
+    char *slash = strchr(paths[i], '/');
+    if (!slash) {
+      /* Direct entry */
+      strcpy(direct_modes[direct_count], modes[i]);
+      strcpy(direct_names[direct_count], paths[i]);
+      if (git_oid_fromstr(&direct_oids[direct_count], oid_hexes[i]) < 0) continue;
+      direct_count++;
+    } else {
+      /* Extract top-level dir */
+      int dlen = (int)(slash - paths[i]);
+      char dir[256];
+      snprintf(dir, sizeof(dir), "%.*s", dlen, paths[i]);
+
+      /* Check if already seen */
+      int found = 0;
+      for (int j = 0; j < dir_count; j++) {
+        if (!strcmp(dirs[j], dir)) { found = 1; break; }
+      }
+      if (!found && dir_count < 256) {
+        strcpy(dirs[dir_count++], dir);
+      }
+    }
+  }
+
+  /* For each directory, collect its entries (with dir prefix stripped) and recurse */
+  for (int d = 0; d < dir_count; d++) {
+    char sub_text[65536];
+    int sub_pos = 0;
+    int dlen = strlen(dirs[d]);
+
+    for (int i = 0; i < count; i++) {
+      if (strncmp(paths[i], dirs[d], dlen) != 0 || paths[i][dlen] != '/') continue;
+      sub_pos += snprintf(sub_text + sub_pos, sizeof(sub_text) - sub_pos,
+                          "%s %s %s\n", modes[i], paths[i] + dlen + 1, oid_hexes[i]);
+    }
+
+    git_oid subtree_oid;
+    mktree_recursive(sub_text, &subtree_oid);
+
+    /* Add subtree as a "40000 dirname" entry */
+    strcpy(direct_modes[direct_count], "40000");
+    strcpy(direct_names[direct_count], dirs[d]);
+    direct_oids[direct_count] = subtree_oid;
+    direct_count++;
+  }
+
+  build_flat_tree(NULL, direct_count, direct_modes, direct_names, direct_oids, out);
+}
 
 static void fn_git0_mktree(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
   const char *entries = (const char *)sqlite3_value_text(argv[0]);
   if (!entries) { sqlite3_result_null(ctx); return; }
 
-  /* Build binary tree format: "mode name\0<20-byte-oid>" per entry */
-  unsigned char tree_buf[65536];
-  int pos = 0;
-  const char *p = entries;
-
-  while (*p) {
-    char mode[16], name[256], oid_hex[GIT_OID_SHA1_HEXSIZE + 1];
-    if (sscanf(p, "%15s %255s %40s", mode, name, oid_hex) != 3) break;
-
-    int mode_len = strlen(mode);
-    int name_len = strlen(name);
-    int need = mode_len + 1 + name_len + 1 + GIT_OID_SHA1_SIZE;
-    if (pos + need > (int)sizeof(tree_buf)) break;
-
-    memcpy(tree_buf + pos, mode, mode_len); pos += mode_len;
-    tree_buf[pos++] = ' ';
-    memcpy(tree_buf + pos, name, name_len); pos += name_len;
-    tree_buf[pos++] = '\0';
-
-    git_oid entry_oid;
-    if (git_oid_fromstr(&entry_oid, oid_hex) < 0) break;
-    memcpy(tree_buf + pos, entry_oid.id, GIT_OID_SHA1_SIZE); pos += GIT_OID_SHA1_SIZE;
-
-    /* Advance to next line */
-    while (*p && *p != '\n') p++;
-    if (*p == '\n') p++;
-  }
-
   git_oid tree_oid;
-  git_odb_hash(&tree_oid, tree_buf, pos, GIT_OBJECT_TREE);
-  storage_write_object(&tree_oid, GIT_OBJECT_TREE, tree_buf, pos);
+  mktree_recursive(entries, &tree_oid);
 
   char hex[GIT_OID_SHA1_HEXSIZE + 1];
   git_oid_tostr(hex, sizeof(hex), &tree_oid);
