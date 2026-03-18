@@ -186,7 +186,10 @@ void storage_rollback_to(const char *name) {
 
 /* ---- Object read (resolves delta chains) ---- */
 
-#define MAX_DELTA_DEPTH 50
+/* Guard against circular delta chains in corrupt databases.
+ * Git enforces no depth limit on read; this is our safety net.
+ * 4095 matches pack-objects.h structural max (12-bit depth field). */
+#define MAX_DELTA_DEPTH 4095
 
 static int read_object_depth(const git_oid *oid, git_object_t *out_type,
 			     size_t *out_size, unsigned char **out_data, int depth) {
