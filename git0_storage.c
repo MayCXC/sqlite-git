@@ -76,6 +76,7 @@ static git_commit *resolve_commit(git_repository *repo, sqlite3_context *ctx,
 
 static void fn_s_exists(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
+  if (!get_repo(ctx)) return;
   git_oid oid;
   if (get_oid(ctx, argv[0], &oid)) return;
   sqlite3_result_int(ctx, storage_object_exists(&oid));
@@ -85,6 +86,7 @@ static void fn_s_exists(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 
 static void fn_s_cat(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
+  if (!get_repo(ctx)) return;
   git_oid oid;
   if (get_oid(ctx, argv[0], &oid)) return;
   git_object_t type; size_t size; unsigned char *data;
