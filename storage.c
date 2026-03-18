@@ -203,7 +203,13 @@ int storage_open_db(sqlite3 *db, int persistent) {
 		"  data BLOB NOT NULL"
 		") WITHOUT ROWID;"
 		"CREATE INDEX IF NOT EXISTS idx_objects_type_base"
-		"  ON objects(type, size) WHERE base IS NULL;",
+		"  ON objects(type, size) WHERE base IS NULL;"
+		"CREATE INDEX IF NOT EXISTS idx_objects_type"
+		"  ON objects(type);"
+		"CREATE INDEX IF NOT EXISTS idx_objects_path"
+		"  ON objects(path) WHERE path IS NOT NULL;"
+		"CREATE INDEX IF NOT EXISTS idx_reflog_ts"
+		"  ON reflog(timestamp);",
 		0, 0, 0);
 	return 0;
 }
