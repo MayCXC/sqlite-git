@@ -44,6 +44,9 @@ int storage_read_object(const git_oid *oid,
 
 void storage_write_object(const git_oid *oid, git_object_t type,
 			  const void *data, size_t size);
+void storage_write_object_named(const git_oid *oid, git_object_t type,
+				const void *data, size_t size,
+				const char *path);
 
 int storage_object_exists(const git_oid *oid);
 

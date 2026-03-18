@@ -26,7 +26,7 @@ static sqlite3 *sdb;
 static int sdb_owned; /* 1 if we opened the db, 0 if borrowed */
 
 static sqlite3_stmt *st_obj_read, *st_obj_write, *st_obj_exists, *st_obj_list;
-static sqlite3_stmt *st_find_base;
+static sqlite3_stmt *st_find_base, *st_find_base_named;
 static sqlite3_stmt *st_ref_read, *st_ref_write, *st_ref_delete, *st_ref_list;
 static sqlite3_stmt *st_reflog_read, *st_reflog_read_rev, *st_reflog_append;
 static sqlite3_stmt *st_reflog_exists, *st_reflog_delete, *st_reflog_list;
@@ -86,35 +86,62 @@ static unsigned char *zdecompress(const void *src, unsigned long srclen,
 /* ---- Delta base selection ---- */
 
 static int find_delta_base(git_object_t type, size_t target_size,
+			   const char *path_hint,
 			   git_oid *base_oid,
 			   unsigned char **base_data, unsigned long *base_len) {
-	sqlite3_stmt *st = stmt_acquire(st_find_base,
-		"SELECT oid, size, data, base FROM objects"
-		" WHERE type = ? AND base IS NULL"
-		" ORDER BY ABS(size - ?) LIMIT 1");
-	sqlite3_bind_int(st, 1, (int)type);
-	sqlite3_bind_int64(st, 2, (sqlite3_int64)target_size);
-	if (sqlite3_step(st) != SQLITE_ROW) { stmt_release(st_find_base, st); return -1; }
+	/*
+	 * Name-aware delta base selection (matching git and fossil heuristics).
+	 * If a path hint is provided, prefer a same-name object first.
+	 * Fall back to closest size if no same-name match exists.
+	 */
+	sqlite3_stmt *st;
+	sqlite3_stmt *cached;
+	if (path_hint && *path_hint) {
+		cached = st_find_base_named;
+		st = stmt_acquire(st_find_base_named,
+			"SELECT oid, size, data, base FROM objects"
+			" WHERE type = ? AND base IS NULL AND path = ?"
+			" ORDER BY ABS(size - ?) LIMIT 1");
+		sqlite3_bind_int(st, 1, (int)type);
+		sqlite3_bind_text(st, 2, path_hint, -1, SQLITE_STATIC);
+		sqlite3_bind_int64(st, 3, (sqlite3_int64)target_size);
+		if (sqlite3_step(st) != SQLITE_ROW) {
+			/* No same-name match, fall back to size-only */
+			stmt_release(cached, st);
+			path_hint = NULL; /* fall through to size-only below */
+		}
+	}
+
+	if (!path_hint || !*path_hint) {
+		cached = st_find_base;
+		st = stmt_acquire(st_find_base,
+			"SELECT oid, size, data, base FROM objects"
+			" WHERE type = ? AND base IS NULL"
+			" ORDER BY ABS(size - ?) LIMIT 1");
+		sqlite3_bind_int(st, 1, (int)type);
+		sqlite3_bind_int64(st, 2, (sqlite3_int64)target_size);
+		if (sqlite3_step(st) != SQLITE_ROW) { stmt_release(cached, st); return -1; }
+	}
 
 	const void *oid_blob = sqlite3_column_blob(st, 0);
-	if (!oid_blob) { stmt_release(st_find_base, st); return -1; }
+	if (!oid_blob) { stmt_release(cached, st); return -1; }
 
 	memcpy(base_oid->id, oid_blob, GIT_OID_SHA1_SIZE);
 	size_t sz = (size_t)sqlite3_column_int64(st, 1);
 
 	/* Size filter from git-core: skip if target < base/32 */
-	if (target_size < sz / 32) { stmt_release(st_find_base, st); return -1; }
+	if (target_size < sz / 32) { stmt_release(cached, st); return -1; }
 
 	const void *comp = sqlite3_column_blob(st, 2);
 	int comp_len = sqlite3_column_bytes(st, 2);
-	if (!comp) { stmt_release(st_find_base, st); return -1; }
+	if (!comp) { stmt_release(cached, st); return -1; }
 
-	if (sqlite3_column_blob(st, 3) != NULL) { stmt_release(st_find_base, st); return -1; }
+	if (sqlite3_column_blob(st, 3) != NULL) { stmt_release(cached, st); return -1; }
 
 	*base_data = zdecompress(comp, comp_len, sz);
-	if (!*base_data) { stmt_release(st_find_base, st); return -1; }
+	if (!*base_data) { stmt_release(cached, st); return -1; }
 	*base_len = sz;
-	stmt_release(st_find_base, st);
+	stmt_release(cached, st);
 	return 0;
 }
 
@@ -158,7 +185,8 @@ int storage_open_db(sqlite3 *db, int persistent) {
 	sqlite3_exec(db,
 		"CREATE TABLE IF NOT EXISTS objects("
 		"  oid BLOB PRIMARY KEY, type INTEGER NOT NULL,"
-		"  size INTEGER NOT NULL, data BLOB NOT NULL, base BLOB"
+		"  size INTEGER NOT NULL, data BLOB NOT NULL,"
+		"  base BLOB, path TEXT"
 		") WITHOUT ROWID;"
 		"CREATE TABLE IF NOT EXISTS refs("
 		"  refname TEXT PRIMARY KEY, oid BLOB, symref TEXT"
@@ -188,7 +216,8 @@ static int storage_init_db(sqlite3 *db) {
 		"PRAGMA page_size = 8192;"
 		"CREATE TABLE IF NOT EXISTS objects("
 		"  oid BLOB PRIMARY KEY, type INTEGER NOT NULL,"
-		"  size INTEGER NOT NULL, data BLOB NOT NULL, base BLOB"
+		"  size INTEGER NOT NULL, data BLOB NOT NULL,"
+		"  base BLOB, path TEXT"
 		") WITHOUT ROWID;"
 		"CREATE TABLE IF NOT EXISTS refs("
 		"  refname TEXT PRIMARY KEY, oid BLOB, symref TEXT"
@@ -208,10 +237,11 @@ static int storage_init_db(sqlite3 *db) {
 		0, 0, 0);
 
 	sqlite3_prepare_v3(db, "SELECT type, size, data, base FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_read, 0);
-	sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO objects(oid, type, size, data, base) VALUES(?,?,?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_write, 0);
+	sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO objects(oid, type, size, data, base, path) VALUES(?,?,?,?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_write, 0);
 	sqlite3_prepare_v3(db, "SELECT 1 FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_exists, 0);
 	sqlite3_prepare_v3(db, "SELECT oid, type, size FROM objects",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_list, 0);
-	sqlite3_prepare_v3(db, "SELECT oid, size, data, base FROM objects WHERE type = ? AND base IS NULL LIMIT 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_find_base, 0);
+	sqlite3_prepare_v3(db, "SELECT oid, size, data, base FROM objects WHERE type = ? AND base IS NULL ORDER BY ABS(size - ?) LIMIT 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_find_base, 0);
+	sqlite3_prepare_v3(db, "SELECT oid, size, data, base FROM objects WHERE type = ? AND base IS NULL AND path = ? ORDER BY ABS(size - ?) LIMIT 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_find_base_named, 0);
 	sqlite3_prepare_v3(db, "SELECT oid, symref FROM refs WHERE refname = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_ref_read, 0);
 	sqlite3_prepare_v3(db, "INSERT OR REPLACE INTO refs(refname, oid, symref) VALUES(?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_ref_write, 0);
 	sqlite3_prepare_v3(db, "DELETE FROM refs WHERE refname = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_ref_delete, 0);
@@ -232,7 +262,7 @@ static int storage_init_db(sqlite3 *db) {
 void storage_close(void) {
 	sqlite3_finalize(st_obj_read); sqlite3_finalize(st_obj_write);
 	sqlite3_finalize(st_obj_exists); sqlite3_finalize(st_obj_list);
-	sqlite3_finalize(st_find_base);
+	sqlite3_finalize(st_find_base); sqlite3_finalize(st_find_base_named);
 	sqlite3_finalize(st_ref_read); sqlite3_finalize(st_ref_write);
 	sqlite3_finalize(st_ref_delete); sqlite3_finalize(st_ref_list);
 	sqlite3_finalize(st_reflog_read); sqlite3_finalize(st_reflog_read_rev);
@@ -338,8 +368,9 @@ int storage_read_object(const git_oid *oid, git_object_t *out_type,
 
 /* ---- Object write (zlib + delta) ---- */
 
-void storage_write_object(const git_oid *oid, git_object_t type,
-			  const void *data, size_t size) {
+void storage_write_object_named(const git_oid *oid, git_object_t type,
+				const void *data, size_t size,
+				const char *path) {
 	sqlite3_stmt *st = stmt_acquire(st_obj_exists, "SELECT 1 FROM objects WHERE oid = ?");
 	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	int exists = (sqlite3_step(st) == SQLITE_ROW);
@@ -353,22 +384,26 @@ void storage_write_object(const git_oid *oid, git_object_t type,
 	char *delta_buf = NULL;
 	int delta_len = 0;
 
-	if (size > 64 && find_delta_base(type, size, &base_oid, &base_data, &base_len) == 0) {
+	if (size > 64 && find_delta_base(type, size, path, &base_oid, &base_data, &base_len) == 0) {
 		delta_buf = malloc(size + 60);
 		if (delta_buf) {
 			delta_len = delta_create((const char *)base_data, base_len,
 						 (const char *)data, size, delta_buf);
 			if (delta_len > 0 && (size_t)delta_len < size * 9 / 10)
-				use_delta = 1;
-			else { free(delta_buf); delta_buf = NULL; }
+					use_delta = 1;
+				else { free(delta_buf); delta_buf = NULL; }
 		}
 		free(base_data);
 	}
 
-	st = stmt_acquire(st_obj_write, "INSERT OR IGNORE INTO objects(oid, type, size, data, base) VALUES(?,?,?,?,?)");
+	st = stmt_acquire(st_obj_write, "INSERT OR IGNORE INTO objects(oid, type, size, data, base, path) VALUES(?,?,?,?,?,?)");
 	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	sqlite3_bind_int(st, 2, (int)type);
 	sqlite3_bind_int64(st, 3, (sqlite3_int64)size);
+	if (path && *path)
+		sqlite3_bind_text(st, 6, path, -1, SQLITE_STATIC);
+	else
+		sqlite3_bind_null(st, 6);
 
 	if (use_delta) {
 		sqlite3_bind_blob(st, 4, delta_buf, delta_len, SQLITE_STATIC);
@@ -385,6 +420,11 @@ void storage_write_object(const git_oid *oid, git_object_t type,
 		free(comp); free(delta_buf);
 	}
 	stmt_release(st_obj_write, st);
+}
+
+void storage_write_object(const git_oid *oid, git_object_t type,
+			  const void *data, size_t size) {
+	storage_write_object_named(oid, type, data, size, NULL);
 }
 
 int storage_object_exists(const git_oid *oid) {

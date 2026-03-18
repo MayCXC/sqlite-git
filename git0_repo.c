@@ -87,9 +87,11 @@ static void fn_git0_add(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     if (type == GIT_OBJECT_INVALID) type = GIT_OBJECT_BLOB;
   }
 
+  const char *path = (const char *)sqlite3_value_text(argv[0]);
+
   git_oid oid;
   git_odb_hash(&oid, data, data_len, type);
-  storage_write_object(&oid, type, data, data_len);
+  storage_write_object_named(&oid, type, data, data_len, path);
 
   char hex[GIT_OID_SHA1_HEXSIZE + 1];
   git_oid_tostr(hex, sizeof(hex), &oid);
