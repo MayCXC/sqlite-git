@@ -38,7 +38,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <zlib.h>
 
 /* Parse a hex OID from text, return 0 on success */
 static int parse_oid(sqlite3_context *ctx, sqlite3_value *arg, git_oid *oid) {
@@ -50,84 +49,31 @@ static int parse_oid(sqlite3_context *ctx, sqlite3_value *arg, git_oid *oid) {
   return 0;
 }
 
-/* Read an object, return data and size. Caller frees *out.
- * Uses storage_read_object when storage is open (helper binary),
- * otherwise queries the objects table directly (extension mode). */
+/* Read an object via the storage layer. Caller frees *out. */
 static int read_obj(sqlite3_context *ctx, const git_oid *oid,
                     git_object_t *type, size_t *size, unsigned char **out) {
-  /* Try storage layer first (handles delta resolution + decompression) */
-  if (storage_db() && storage_read_object(oid, type, size, out) == 0)
-    return 0;
-
-  /* Fallback: direct SQL on extension db (no compression/delta) */
-  sqlite3 *db = sqlite3_context_db_handle(ctx);
-  sqlite3_stmt *st = NULL;
-  sqlite3_prepare_v2(db,
-    "SELECT type, size, data FROM objects WHERE oid = ?", -1, &st, 0);
-  if (!st) { sqlite3_result_null(ctx); return -1; }
-  sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-  if (sqlite3_step(st) != SQLITE_ROW) {
-    sqlite3_finalize(st);
+  (void)ctx;
+  if (storage_read_object(oid, type, size, out) < 0) {
     sqlite3_result_null(ctx);
     return -1;
   }
-  *type = (git_object_t)sqlite3_column_int(st, 0);
-  *size = (size_t)sqlite3_column_int64(st, 1);
-  const void *blob = sqlite3_column_blob(st, 2);
-  int blob_len = sqlite3_column_bytes(st, 2);
-
-  /* Data might be compressed or a delta. Try zlib decompression. */
-  unsigned char *decompressed = malloc(*size ? *size : 1);
-  if (!decompressed) { sqlite3_finalize(st); sqlite3_result_null(ctx); return -1; }
-  unsigned long dstlen = *size;
-  if (uncompress(decompressed, &dstlen, blob, blob_len) == Z_OK) {
-    *out = decompressed;
-  } else {
-    /* Raw data (already decompressed or empty) */
-    free(decompressed);
-    *out = malloc(blob_len ? blob_len : 1);
-    if (!*out) { sqlite3_finalize(st); sqlite3_result_null(ctx); return -1; }
-    memcpy(*out, blob, blob_len);
-    *size = blob_len;
-  }
-  sqlite3_finalize(st);
   return 0;
 }
 
-/* Resolve a ref name to OID, following symrefs */
-static int resolve_ref_db(sqlite3 *db, const char *name, git_oid *oid) {
+/* Resolve a ref name to OID, following symrefs via the storage layer. */
+static int resolve_ref(const char *name, git_oid *oid) {
+  char symref[4096];
   int depth = 0;
   char current[4096];
   snprintf(current, sizeof(current), "%s", name);
 
   while (depth++ < 10) {
-    /* Try storage layer first */
-    if (storage_db()) {
-      char symref[4096] = "";
-      if (storage_ref_read(current, oid, symref, sizeof(symref)) < 0)
-        return -1;
-      if (!symref[0]) return 0;
-      snprintf(current, sizeof(current), "%s", symref);
-      continue;
-    }
-
-    /* Direct SQL fallback */
-    sqlite3_stmt *st = NULL;
-    sqlite3_prepare_v2(db,
-      "SELECT oid, symref FROM refs WHERE refname = ?", -1, &st, 0);
-    if (!st) return -1;
-    sqlite3_bind_text(st, 1, current, -1, SQLITE_STATIC);
-    if (sqlite3_step(st) != SQLITE_ROW) { sqlite3_finalize(st); return -1; }
-    const void *blob = sqlite3_column_blob(st, 0);
-    const char *sym = (const char *)sqlite3_column_text(st, 1);
-    if (sym && *sym) {
-      snprintf(current, sizeof(current), "%s", sym);
-      sqlite3_finalize(st);
-      continue;
-    }
-    if (blob) memcpy(oid->id, blob, GIT_OID_SHA1_SIZE);
-    sqlite3_finalize(st);
-    return blob ? 0 : -1;
+    symref[0] = '\0';
+    if (storage_ref_read(current, oid, symref, sizeof(symref)) < 0)
+      return -1;
+    if (!symref[0])
+      return 0;
+    snprintf(current, sizeof(current), "%s", symref);
   }
   return -1;
 }
@@ -213,7 +159,7 @@ static void fn_s_blob(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   /* Try as ref first, then as raw OID */
   const char *rev = (const char *)sqlite3_value_text(argv[0]);
   if (!rev) { sqlite3_result_null(ctx); return; }
-  if (resolve_ref_db(sqlite3_context_db_handle(ctx),rev, &oid) < 0 && git_oid_fromstr(&oid, rev) < 0) {
+  if (resolve_ref(rev, &oid) < 0 && git_oid_fromstr(&oid, rev) < 0) {
     sqlite3_result_null(ctx); return;
   }
 
@@ -292,7 +238,7 @@ static void fn_s_ref(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   const char *name = (const char *)sqlite3_value_text(argv[0]);
   if (!name) { sqlite3_result_null(ctx); return; }
   git_oid oid;
-  if (resolve_ref_db(sqlite3_context_db_handle(ctx),name, &oid) < 0) { sqlite3_result_null(ctx); return; }
+  if (resolve_ref(name, &oid) < 0) { sqlite3_result_null(ctx); return; }
   char hex[GIT_OID_SHA1_HEXSIZE + 1];
   git_oid_tostr(hex, sizeof(hex), &oid);
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
@@ -332,7 +278,7 @@ static int read_commit(sqlite3_context *ctx, sqlite3_value *arg,
   if (!spec) { sqlite3_result_null(ctx); return -1; }
 
   /* Try as ref, then as raw OID */
-  if (resolve_ref_db(sqlite3_context_db_handle(ctx),spec, &oid) < 0 && git_oid_fromstr(&oid, spec) < 0) {
+  if (resolve_ref(spec, &oid) < 0 && git_oid_fromstr(&oid, spec) < 0) {
     sqlite3_result_null(ctx); return -1;
   }
 
@@ -458,129 +404,9 @@ static void fn_s_commit_parents(sqlite3_context *ctx, int argc, sqlite3_value **
   free(data);
 }
 
-/* ---- git0_refs_list TVF: storage-native ref enumeration ---- */
-
-typedef struct {
-  sqlite3_vtab base;
-} git0_srl_vtab;
-
-typedef struct {
-  sqlite3_vtab_cursor base;
-  sqlite3_stmt *st;
-  int eof;
-  sqlite3_int64 rowid;
-} git0_srl_cursor;
-
-static int srl_connect(sqlite3 *db, void *pAux, int argc,
-                       const char *const*argv, sqlite3_vtab **ppVtab, char **pzErr) {
-  (void)pAux; (void)argc; (void)argv; (void)pzErr;
-  int rc = sqlite3_declare_vtab(db,
-    "CREATE TABLE x(name TEXT, oid TEXT, symref TEXT)");
-  if (rc != SQLITE_OK) return rc;
-  git0_srl_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
-  if (!vtab) return SQLITE_NOMEM;
-  memset(vtab, 0, sizeof(*vtab));
-  *ppVtab = &vtab->base;
-  return SQLITE_OK;
-}
-
-static int srl_disconnect(sqlite3_vtab *pVtab) {
-  sqlite3_free(pVtab); return SQLITE_OK;
-}
-
-static int srl_bestindex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
-  (void)pVtab;
-  pInfo->estimatedCost = 100;
-  return SQLITE_OK;
-}
-
-static int srl_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
-  (void)pVtab;
-  git0_srl_cursor *cur = sqlite3_malloc(sizeof(*cur));
-  if (!cur) return SQLITE_NOMEM;
-  memset(cur, 0, sizeof(*cur));
-  *ppCursor = &cur->base;
-  return SQLITE_OK;
-}
-
-static int srl_close(sqlite3_vtab_cursor *pCursor) {
-  git0_srl_cursor *cur = (git0_srl_cursor *)pCursor;
-  if (cur->st) sqlite3_finalize(cur->st);
-  sqlite3_free(cur);
-  return SQLITE_OK;
-}
-
-static int srl_filter(sqlite3_vtab_cursor *pCursor, int idxNum,
-                      const char *idxStr, int argc, sqlite3_value **argv) {
-  (void)idxNum; (void)idxStr; (void)argc; (void)argv;
-  git0_srl_cursor *cur = (git0_srl_cursor *)pCursor;
-  if (cur->st) { sqlite3_finalize(cur->st); cur->st = NULL; }
-  cur->rowid = 0;
-  sqlite3 *db = storage_db();
-  if (!db) { cur->eof = 1; return SQLITE_OK; }
-  sqlite3_prepare_v2(db,
-    "SELECT refname, oid, symref FROM refs ORDER BY refname",
-    -1, &cur->st, 0);
-  cur->eof = (sqlite3_step(cur->st) != SQLITE_ROW);
-  return SQLITE_OK;
-}
-
-static int srl_next(sqlite3_vtab_cursor *pCursor) {
-  git0_srl_cursor *cur = (git0_srl_cursor *)pCursor;
-  cur->eof = (sqlite3_step(cur->st) != SQLITE_ROW);
-  cur->rowid++;
-  return SQLITE_OK;
-}
-
-static int srl_eof(sqlite3_vtab_cursor *pCursor) {
-  return ((git0_srl_cursor *)pCursor)->eof;
-}
-
-static int srl_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int col) {
-  git0_srl_cursor *cur = (git0_srl_cursor *)pCursor;
-  switch (col) {
-    case 0: /* name */
-      sqlite3_result_value(ctx, sqlite3_column_value(cur->st, 0));
-      break;
-    case 1: { /* oid as hex */
-      const void *blob = sqlite3_column_blob(cur->st, 1);
-      if (blob) {
-        char hex[GIT_OID_SHA1_HEXSIZE + 1];
-        git_oid oid; memcpy(oid.id, blob, GIT_OID_SHA1_SIZE);
-        git_oid_tostr(hex, sizeof(hex), &oid);
-        sqlite3_result_text(ctx, hex, GIT_OID_SHA1_HEXSIZE, SQLITE_TRANSIENT);
-      } else {
-        sqlite3_result_null(ctx);
-      }
-      break;
-    }
-    case 2: /* symref */
-      sqlite3_result_value(ctx, sqlite3_column_value(cur->st, 2));
-      break;
-  }
-  return SQLITE_OK;
-}
-
-static int srl_rowid(sqlite3_vtab_cursor *pCursor, sqlite3_int64 *pRowid) {
-  *pRowid = ((git0_srl_cursor *)pCursor)->rowid;
-  return SQLITE_OK;
-}
-
-static sqlite3_module git0_refs_list_module = {
-  .iVersion = 0,
-  .xCreate = srl_connect,
-  .xConnect = srl_connect,
-  .xBestIndex = srl_bestindex,
-  .xDisconnect = srl_disconnect,
-  .xDestroy = srl_disconnect,
-  .xOpen = srl_open,
-  .xClose = srl_close,
-  .xFilter = srl_filter,
-  .xNext = srl_next,
-  .xEof = srl_eof,
-  .xColumn = srl_column,
-  .xRowid = srl_rowid,
-};
+/* git0_refs_list is just a view on git0_refs virtual table
+ * which already uses the storage layer. No separate TVF needed.
+ * Users can: SELECT * FROM git0_refs; or CREATE VIRTUAL TABLE r USING git0_refs; */
 
 /* ---- Registration ---- */
 
@@ -600,6 +426,5 @@ int git0_register_storage(sqlite3 *db) {
   sqlite3_create_function(db, "git0_commit_author", 1, SQLITE_UTF8, 0, fn_s_commit_author, 0, 0);
   sqlite3_create_function(db, "git0_commit_parent", 2, SQLITE_UTF8, 0, fn_s_commit_parent, 0, 0);
   sqlite3_create_function(db, "git0_commit_parents", 1, SQLITE_UTF8, 0, fn_s_commit_parents, 0, 0);
-  sqlite3_create_module(db, "git0_refs_list", &git0_refs_list_module, 0);
   return SQLITE_OK;
 }

@@ -109,7 +109,8 @@ SELECT 'storage_blob_path: ' || CAST(git0_blob(git0_ref('refs/heads/main'), 'fil
 SELECT 'storage_parent0: ' || git0_commit_parent(git0_ref('refs/heads/main'), 0);
 
 -- Refs list TVF
-SELECT 'storage_refs: ' || count(*) || ' refs' FROM git0_refs_list;
+-- Refs are verified via git0_ref() above. The git0_refs vtable
+-- (test_refs) was dropped after Phase 1/2 tests.
 
 -- LFS round-trip (storage-backed)
 SELECT 'storage_lfs: ' || (CAST(git0_lfs_fetch(git0_lfs_store('lfs round trip')) AS TEXT) = 'lfs round trip');
