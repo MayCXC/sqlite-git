@@ -2,58 +2,59 @@
 #define STORAGE_H
 
 #include <sqlite3.h>
-
-#define OID_RAWSZ 20
-#define OID_HEXSZ 40
-
-/* Hex/binary OID conversion */
-int hex2bin(const char *hex, unsigned char *bin, int binlen);
-void bin2hex(const unsigned char *bin, int binlen, char *hex);
-
-/* Type name conversion */
-const char *type_name(int t);
-int type_from_name(const char *s);
+#include <git2.h>
 
 /*
  * Open (or create) the sqlite.db in the given directory.
  * If path ends with /objects, strips it to find the gitdir root.
- * Creates objects, refs, and reflog tables if they don't exist.
  */
 int storage_open(const char *path_arg);
-
-/* Close the database. */
 void storage_close(void);
-
-/* Get the database handle (for direct queries). */
 sqlite3 *storage_db(void);
 
 /*
- * Read an object, resolving delta chains.
- * Caller must free *out_data.
+ * Object operations. OIDs are git_oid (binary 20 bytes).
+ * Read resolves delta chains. Write handles compression + delta.
+ * Caller must free *out_data from read.
  */
-int storage_read_object(const unsigned char *oid_bin,
-			int *out_type, unsigned long *out_size,
+int storage_read_object(const git_oid *oid,
+			git_object_t *out_type, size_t *out_size,
 			unsigned char **out_data);
 
+void storage_write_object(const git_oid *oid, git_object_t type,
+			  const void *data, size_t size);
+
+int storage_object_exists(const git_oid *oid);
+
 /*
- * Write an object with zlib + delta compression.
- * The object is deduplicated (no-op if already stored).
+ * Ref operations. OIDs stored as BLOB(20) internally.
  */
-void storage_write_object(const unsigned char *oid_bin, int type,
-			  const unsigned char *data, unsigned long size);
+int storage_ref_read(const char *refname, git_oid *oid, char *symref, size_t symref_len);
+void storage_ref_write(const char *refname, const git_oid *oid, const char *symref);
+void storage_ref_delete(const char *refname);
 
-/* Check if an object exists. */
-int storage_object_exists(const unsigned char *oid_bin);
+/* Callback for ref iteration. Return non-zero to stop. */
+typedef int (*storage_ref_cb)(const char *refname, const git_oid *oid,
+			      const char *symref, void *data);
+int storage_ref_list(const char *prefix, storage_ref_cb cb, void *data);
 
-/* Prepared statement accessors for ref/reflog operations. */
-sqlite3_stmt *storage_ref_read_stmt(void);
-sqlite3_stmt *storage_ref_write_stmt(void);
-sqlite3_stmt *storage_ref_delete_stmt(void);
-sqlite3_stmt *storage_ref_list_stmt(void);
-sqlite3_stmt *storage_obj_list_stmt(void);
-sqlite3_stmt *storage_reflog_read_stmt(void);
-sqlite3_stmt *storage_reflog_append_stmt(void);
-sqlite3_stmt *storage_reflog_exists_stmt(void);
-sqlite3_stmt *storage_reflog_delete_stmt(void);
+/* Object listing callback. */
+typedef int (*storage_obj_cb)(const git_oid *oid, git_object_t type,
+			      size_t size, void *data);
+int storage_obj_list(storage_obj_cb cb, void *data);
+
+/* Reflog operations */
+int storage_reflog_exists(const char *refname);
+void storage_reflog_delete(const char *refname);
+
+/* Reflog read callback */
+typedef int (*storage_reflog_cb)(const git_oid *old_oid, const git_oid *new_oid,
+				 const char *committer, long long timestamp,
+				 int tz, const char *msg, void *data);
+int storage_reflog_read(const char *refname, storage_reflog_cb cb, void *data);
+
+void storage_reflog_append(const char *refname, const git_oid *old_oid,
+			   const git_oid *new_oid, const char *committer,
+			   long long timestamp, int tz, const char *msg);
 
 #endif

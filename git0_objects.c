@@ -153,15 +153,15 @@ static int obj_filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   if (idxNum == 1 && argc >= 1) {
     /* OID lookup */
     const char *hex = (const char *)sqlite3_value_text(argv[0]);
-    unsigned char oid_bin[OID_RAWSZ];
-    if (!hex || hex2bin(hex, oid_bin, OID_RAWSZ) < 0) {
+    git_oid oid_val;
+    if (!hex || git_oid_fromstr(&oid_val, hex) < 0) {
       cur->eof = 1;
       return SQLITE_OK;
     }
     sqlite3_prepare_v2(vtab->db,
       "SELECT oid, type, size, data, base FROM objects WHERE oid = ?",
       -1, &cur->st, 0);
-    sqlite3_bind_blob(cur->st, 1, oid_bin, OID_RAWSZ, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(cur->st, 1, oid_val.id, GIT_OID_SHA1_SIZE, SQLITE_TRANSIENT);
     cur->is_scan = 0;
   } else {
     /* Full scan */
@@ -193,26 +193,27 @@ static int obj_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int co
     case 0: { /* oid TEXT */
       const unsigned char *oid_bin = sqlite3_column_blob(cur->st, 0);
       if (oid_bin) {
-        char hex[OID_HEXSZ + 1];
-        bin2hex(oid_bin, OID_RAWSZ, hex);
-        sqlite3_result_text(ctx, hex, OID_HEXSZ, SQLITE_TRANSIENT);
+        char hex[GIT_OID_SHA1_HEXSIZE + 1];
+        git_oid oid_r; memcpy(oid_r.id, sqlite3_column_blob(cur->st, 0), GIT_OID_SHA1_SIZE); git_oid_tostr(hex, sizeof(hex), &oid_r);
+        sqlite3_result_text(ctx, hex, GIT_OID_SHA1_HEXSIZE, SQLITE_TRANSIENT);
       } else {
         sqlite3_result_null(ctx);
       }
       break;
     }
     case 1: /* type TEXT */
-      sqlite3_result_text(ctx, type_name(sqlite3_column_int(cur->st, 1)),
+      sqlite3_result_text(ctx, git_object_type2string((git_object_t)sqlite3_column_int(cur->st, 1)),
                           -1, SQLITE_STATIC);
       break;
     case 2: /* size */
       sqlite3_result_int(ctx, sqlite3_column_int(cur->st, 2));
       break;
     case 3: { /* data BLOB (decompressed, delta-resolved) */
-      const unsigned char *oid_bin = sqlite3_column_blob(cur->st, 0);
-      if (oid_bin) {
-        int type; unsigned long size; unsigned char *data;
-        if (storage_read_object(oid_bin, &type, &size, &data) == 0) {
+      const void *oid_blob = sqlite3_column_blob(cur->st, 0);
+      if (oid_blob) {
+        git_oid read_oid; memcpy(read_oid.id, oid_blob, GIT_OID_SHA1_SIZE);
+        git_object_t type; size_t size; unsigned char *data;
+        if (storage_read_object(&read_oid, &type, &size, &data) == 0) {
           sqlite3_result_blob(ctx, data, size, free);
         } else {
           sqlite3_result_null(ctx);
@@ -243,7 +244,7 @@ static int obj_update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
 
   if (!type_str || !data) return SQLITE_ERROR;
 
-  int type = type_from_name(type_str);
+  int type = git_object_string2type(type_str);
   if (!type) return SQLITE_ERROR;
 
   /* Compute OID using git's format: "<type> <size>\0<data>" */
@@ -251,7 +252,7 @@ static int obj_update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
   git_odb_hash(&oid, data, data_len, (git_object_t)type);
 
   /* Write via storage layer (handles compression + delta) */
-  storage_write_object(oid.id, type, data, data_len);
+  storage_write_object(&oid, (git_object_t)type, data, data_len);
 
   return SQLITE_OK;
 }

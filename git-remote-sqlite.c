@@ -20,21 +20,21 @@ static void cmd_capabilities(void) {
 
 /* ---- List refs from SQLite ---- */
 
-static void cmd_list(void) {
-	char hex[OID_HEXSZ + 1];
-	sqlite3_stmt *st = storage_ref_list_stmt();
-	sqlite3_reset(st);
-	while (sqlite3_step(st) == SQLITE_ROW) {
-		const char *name = (const char *)sqlite3_column_text(st, 0);
-		const void *oid_blob = sqlite3_column_blob(st, 1);
-		const char *symref = (const char *)sqlite3_column_text(st, 2);
-		if (symref && *symref)
-			printf("@%s %s\n", symref, name);
-		else if (oid_blob) {
-			bin2hex(oid_blob, OID_RAWSZ, hex);
-			printf("%s %s\n", hex, name);
-		}
+static int print_remote_ref(const char *name, const git_oid *oid,
+			    const char *symref, void *data) {
+	(void)data;
+	if (symref && *symref)
+		printf("@%s %s\n", symref, name);
+	else if (oid) {
+		char hex[GIT_OID_SHA1_HEXSIZE + 1];
+		git_oid_tostr(hex, sizeof(hex), oid);
+		printf("%s %s\n", hex, name);
 	}
+	return 0;
+}
+
+static void cmd_list(void) {
+	storage_ref_list(NULL, print_remote_ref, NULL);
 	printf("\n");
 	fflush(stdout);
 }
@@ -52,22 +52,20 @@ static void cmd_fetch(const char *sha, const char *ref) {
 	git_repository_odb(&odb, repo);
 
 	/* BFS: walk object graph from sha */
-	char (*queue)[OID_HEXSZ + 1] = malloc(65536 * (OID_HEXSZ + 1));
+	char (*queue)[GIT_OID_SHA1_HEXSIZE + 1] = malloc(65536 * (GIT_OID_SHA1_HEXSIZE + 1));
 	int head = 0, tail = 0;
-	strncpy(queue[tail++], sha, OID_HEXSZ + 1);
+	strncpy(queue[tail++], sha, GIT_OID_SHA1_HEXSIZE + 1);
 
 	while (head < tail && tail < 65536) {
-		unsigned char oid_bin[OID_RAWSZ];
-		if (hex2bin(queue[head], oid_bin, OID_RAWSZ) < 0) { head++; continue; }
+		git_oid cur_oid;
+		if (git_oid_fromstr(&cur_oid, queue[head]) < 0) { head++; continue; }
 
 		/* Skip if already in local repo */
-		git_oid git_oid_val;
-		git_oid_fromstr(&git_oid_val, queue[head]);
-		if (git_odb_exists(odb, &git_oid_val)) { head++; continue; }
+		if (git_odb_exists(odb, &cur_oid)) { head++; continue; }
 
 		/* Read from SQLite */
-		int type; unsigned long size; unsigned char *data;
-		if (storage_read_object(oid_bin, &type, &size, &data) < 0) { head++; continue; }
+		git_object_t type; size_t size; unsigned char *data;
+		if (storage_read_object(&cur_oid, &type, &size, &data) < 0) { head++; continue; }
 
 		/* Write to local git odb */
 		git_oid written;
@@ -103,7 +101,7 @@ static void cmd_fetch(const char *sha, const char *ref) {
 				p++;
 				if (p + 20 > end) break;
 				if (tail < 65536) {
-					bin2hex(p, OID_RAWSZ, queue[tail]);
+					git_oid entry_oid; memcpy(entry_oid.id, p, GIT_OID_SHA1_SIZE); git_oid_tostr(queue[tail], GIT_OID_SHA1_HEXSIZE + 1, &entry_oid);
 					tail++;
 				}
 				p += 20;
@@ -136,11 +134,7 @@ static void cmd_push(const char *refspec) {
 
 	/* Delete ref */
 	if (!*src) {
-		unsigned char zero[OID_RAWSZ] = {0};
-		sqlite3_stmt *st = storage_ref_delete_stmt();
-		sqlite3_reset(st);
-		sqlite3_bind_text(st, 1, dst, -1, SQLITE_STATIC);
-		sqlite3_step(st);
+		storage_ref_delete(dst);
 		printf("ok %s\n", dst);
 		fflush(stdout);
 		return;
@@ -168,23 +162,21 @@ static void cmd_push(const char *refspec) {
 	}
 
 	/* BFS: walk object graph and copy to SQLite */
-	char hex[OID_HEXSZ + 1];
+	char hex[GIT_OID_SHA1_HEXSIZE + 1];
 	git_oid_tostr(hex, sizeof(hex), &src_oid);
 
-	char (*queue)[OID_HEXSZ + 1] = malloc(65536 * (OID_HEXSZ + 1));
+	char (*queue)[GIT_OID_SHA1_HEXSIZE + 1] = malloc(65536 * (GIT_OID_SHA1_HEXSIZE + 1));
 	int head = 0, tail = 0;
-	strncpy(queue[tail++], hex, OID_HEXSZ + 1);
+	strncpy(queue[tail++], hex, GIT_OID_SHA1_HEXSIZE + 1);
 
 	while (head < tail && tail < 65536) {
-		unsigned char oid_bin[OID_RAWSZ];
-		hex2bin(queue[head], oid_bin, OID_RAWSZ);
-
-		/* Skip if already in SQLite */
-		if (storage_object_exists(oid_bin)) { head++; continue; }
-
-		/* Read from local git odb */
 		git_oid cur_oid;
 		git_oid_fromstr(&cur_oid, queue[head]);
+
+		/* Skip if already in SQLite */
+		if (storage_object_exists(&cur_oid)) { head++; continue; }
+
+		/* Read from local git odb */
 		git_odb_object *obj = NULL;
 		if (git_odb_read(&obj, odb, &cur_oid) != 0) { head++; continue; }
 
@@ -193,7 +185,7 @@ static void cmd_push(const char *refspec) {
 		size_t size = git_odb_object_size(obj);
 
 		/* Write to SQLite with compression + delta */
-		storage_write_object(oid_bin, type, data, size);
+		storage_write_object(&cur_oid, (git_object_t)type, data, size);
 
 		/* Parse to find referenced oids */
 		if (type == GIT_OBJECT_COMMIT) {
@@ -225,7 +217,7 @@ static void cmd_push(const char *refspec) {
 				p++;
 				if (p + 20 > end) break;
 				if (tail < 65536) {
-					bin2hex(p, OID_RAWSZ, queue[tail]);
+					git_oid entry_oid; memcpy(entry_oid.id, p, GIT_OID_SHA1_SIZE); git_oid_tostr(queue[tail], GIT_OID_SHA1_HEXSIZE + 1, &entry_oid);
 					tail++;
 				}
 				p += 20;
@@ -237,14 +229,7 @@ static void cmd_push(const char *refspec) {
 	}
 
 	/* Update the ref in SQLite */
-	unsigned char src_oid_bin[OID_RAWSZ];
-	hex2bin(hex, src_oid_bin, OID_RAWSZ);
-	sqlite3_stmt *st = storage_ref_write_stmt();
-	sqlite3_reset(st);
-	sqlite3_bind_text(st, 1, dst, -1, SQLITE_STATIC);
-	sqlite3_bind_blob(st, 2, src_oid_bin, OID_RAWSZ, SQLITE_STATIC);
-	sqlite3_bind_null(st, 3);
-	sqlite3_step(st);
+	storage_ref_write(dst, &src_oid, NULL);
 
 	free(queue);
 	git_odb_free(odb);
@@ -286,7 +271,7 @@ int remote_main(int argc, char **argv) {
 			cmd_list();
 		} else if (!strncmp(line, "fetch ", 6)) {
 			/* Collect all fetch lines, process last one */
-			char sha[OID_HEXSZ + 1], ref[256];
+			char sha[GIT_OID_SHA1_HEXSIZE + 1], ref[256];
 			sscanf(line + 6, "%40s %255s", sha, ref);
 			/* Read until blank line */
 			while (fgets(line, sizeof(line), stdin)) {

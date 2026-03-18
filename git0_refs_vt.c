@@ -196,9 +196,9 @@ static int refs_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int c
     case 2: { /* target TEXT (hex oid) */
       const void *oid_blob = sqlite3_column_blob(cur->st, 1);
       if (oid_blob) {
-        char hex[OID_HEXSZ + 1];
-        bin2hex(oid_blob, OID_RAWSZ, hex);
-        sqlite3_result_text(ctx, hex, OID_HEXSZ, SQLITE_TRANSIENT);
+        char hex[GIT_OID_SHA1_HEXSIZE + 1];
+        git_oid oid_r; memcpy(oid_r.id, oid_blob, GIT_OID_SHA1_SIZE); git_oid_tostr(hex, sizeof(hex), &oid_r);
+        sqlite3_result_text(ctx, hex, GIT_OID_SHA1_HEXSIZE, SQLITE_TRANSIENT);
       } else {
         sqlite3_result_null(ctx);
       }
@@ -240,9 +240,9 @@ static int refs_update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv, sqli
     sqlite3_bind_text(vtab->st_insert, 1, name, -1, SQLITE_TRANSIENT);
 
     if (target_hex && *target_hex) {
-      unsigned char oid_bin[OID_RAWSZ];
-      hex2bin(target_hex, oid_bin, OID_RAWSZ);
-      sqlite3_bind_blob(vtab->st_insert, 2, oid_bin, OID_RAWSZ, SQLITE_TRANSIENT);
+      git_oid oid_val;
+      git_oid_fromstr(&oid_val, target_hex);
+      sqlite3_bind_blob(vtab->st_insert, 2, oid_val.id, GIT_OID_SHA1_SIZE, SQLITE_TRANSIENT);
     } else {
       sqlite3_bind_null(vtab->st_insert, 2);
     }
@@ -259,9 +259,9 @@ static int refs_update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv, sqli
 
     sqlite3_reset(vtab->st_update);
     if (target_hex && *target_hex) {
-      unsigned char oid_bin[OID_RAWSZ];
-      hex2bin(target_hex, oid_bin, OID_RAWSZ);
-      sqlite3_bind_blob(vtab->st_update, 1, oid_bin, OID_RAWSZ, SQLITE_TRANSIENT);
+      git_oid oid_val;
+      git_oid_fromstr(&oid_val, target_hex);
+      sqlite3_bind_blob(vtab->st_update, 1, oid_val.id, GIT_OID_SHA1_SIZE, SQLITE_TRANSIENT);
     } else {
       sqlite3_bind_null(vtab->st_update, 1);
     }
