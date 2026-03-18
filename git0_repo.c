@@ -80,7 +80,7 @@ static void fn_git0_init(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   }
 
   /* Check if already initialized (HEAD exists) */
-  const char *head = query_text(db, "SELECT target FROM refs_data WHERE name = 'HEAD'");
+  const char *head = query_text(db, "SELECT oid FROM refs WHERE refname = 'HEAD'");
   if (head) {
     sqlite3_free((void *)head);
     sqlite3_result_text(ctx, "already initialized", -1, SQLITE_STATIC);
@@ -97,8 +97,8 @@ static void fn_git0_init(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   /* Insert empty tree object */
   sqlite3_stmt *st;
   sqlite3_prepare_v2(db,
-    "INSERT OR IGNORE INTO objects_loose(oid, type, size, data) VALUES(?, ?, 0, X'')", -1, &st, 0);
-  sqlite3_bind_text(st, 1, tree_hex, -1, SQLITE_TRANSIENT);
+    "INSERT OR IGNORE INTO objects(oid, type, size, data) VALUES(?, ?, 0, X'')", -1, &st, 0);
+  sqlite3_bind_blob(st, 1, empty_tree_oid.id, 20, SQLITE_TRANSIENT);
   sqlite3_bind_int(st, 2, GIT_OBJECT_TREE);
   sqlite3_step(st);
   sqlite3_finalize(st);
@@ -125,8 +125,8 @@ static void fn_git0_init(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 
   /* Insert commit object */
   sqlite3_prepare_v2(db,
-    "INSERT OR IGNORE INTO objects_loose(oid, type, size, data) VALUES(?, ?, ?, ?)", -1, &st, 0);
-  sqlite3_bind_text(st, 1, commit_hex, -1, SQLITE_TRANSIENT);
+    "INSERT OR IGNORE INTO objects(oid, type, size, data) VALUES(?, ?, ?, ?)", -1, &st, 0);
+  sqlite3_bind_blob(st, 1, commit_oid.id, 20, SQLITE_TRANSIENT);
   sqlite3_bind_int(st, 2, GIT_OBJECT_COMMIT);
   sqlite3_bind_int(st, 3, commit_len);
   sqlite3_bind_blob(st, 4, commit_buf, commit_len, SQLITE_TRANSIENT);
@@ -135,7 +135,7 @@ static void fn_git0_init(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 
   /* Set HEAD and main branch */
   sqlite3_prepare_v2(db,
-    "INSERT INTO refs_data(name, target) VALUES(?, ?)", -1, &st, 0);
+    "INSERT INTO refs(refname, oid) VALUES(?, ?)", -1, &st, 0);
 
   sqlite3_bind_text(st, 1, "refs/heads/main", -1, SQLITE_STATIC);
   sqlite3_bind_text(st, 2, commit_hex, -1, SQLITE_TRANSIENT);
@@ -175,8 +175,8 @@ static void fn_git0_add(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 
   sqlite3_stmt *st;
   sqlite3_prepare_v2(db,
-    "INSERT OR IGNORE INTO objects_loose(oid, type, size, data) VALUES(?, ?, ?, ?)", -1, &st, 0);
-  sqlite3_bind_text(st, 1, hex, -1, SQLITE_TRANSIENT);
+    "INSERT OR IGNORE INTO objects(oid, type, size, data) VALUES(?, ?, ?, ?)", -1, &st, 0);
+  sqlite3_bind_blob(st, 1, oid.id, 20, SQLITE_TRANSIENT);
   sqlite3_bind_int(st, 2, type);
   sqlite3_bind_int(st, 3, data_len);
   sqlite3_bind_blob(st, 4, data, data_len, SQLITE_TRANSIENT);
@@ -253,7 +253,7 @@ static void fn_git0_mktree(sqlite3_context *ctx, int argc, sqlite3_value **argv)
   /* Insert tree into objects */
   sqlite3_stmt *st_tree;
   sqlite3_prepare_v2(db,
-    "INSERT OR IGNORE INTO objects_loose(oid, type, size, data) VALUES(?, ?, ?, ?)", -1, &st_tree, 0);
+    "INSERT OR IGNORE INTO objects(oid, type, size, data) VALUES(?, ?, ?, ?)", -1, &st_tree, 0);
   sqlite3_bind_text(st_tree, 1, hex, -1, SQLITE_TRANSIENT);
   sqlite3_bind_int(st_tree, 2, GIT_OBJECT_TREE);
   sqlite3_bind_int(st_tree, 3, tree_len);
@@ -305,8 +305,8 @@ static void fn_git0_mkcommit(sqlite3_context *ctx, int argc, sqlite3_value **arg
 
   sqlite3_stmt *st;
   sqlite3_prepare_v2(db,
-    "INSERT OR IGNORE INTO objects_loose(oid, type, size, data) VALUES(?, ?, ?, ?)", -1, &st, 0);
-  sqlite3_bind_text(st, 1, hex, -1, SQLITE_TRANSIENT);
+    "INSERT OR IGNORE INTO objects(oid, type, size, data) VALUES(?, ?, ?, ?)", -1, &st, 0);
+  sqlite3_bind_blob(st, 1, oid.id, 20, SQLITE_TRANSIENT);
   sqlite3_bind_int(st, 2, GIT_OBJECT_COMMIT);
   sqlite3_bind_int(st, 3, len);
   sqlite3_bind_blob(st, 4, commit_buf, len, SQLITE_TRANSIENT);

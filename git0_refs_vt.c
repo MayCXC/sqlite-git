@@ -5,14 +5,12 @@
 **
 ** Columns: name TEXT, type TEXT, target TEXT, symref TEXT
 **
-** INSERT INTO refs(name, target) VALUES('refs/heads/main', 'abc123...');
-** UPDATE refs SET target = 'def456...' WHERE name = 'refs/heads/main';
-** DELETE FROM refs WHERE name = 'refs/heads/feature';
-**
-** Shadow table: {name}_data(name TEXT PRIMARY KEY, target TEXT, symref TEXT)
+** Uses the shared storage schema: refs(refname TEXT PK, oid BLOB, symref TEXT)
+** The 'target' column presents oid as hex text to SQL users.
 */
 
 #include "git0.h"
+#include "storage.h"
 
 #ifndef SQLITE_CORE
   SQLITE_EXTENSION_INIT3
@@ -25,7 +23,6 @@
 typedef struct {
   sqlite3_vtab base;
   sqlite3 *db;
-  char *table_name;
   sqlite3_stmt *st_insert;
   sqlite3_stmt *st_update;
   sqlite3_stmt *st_delete;
@@ -44,6 +41,8 @@ typedef struct {
 
 static int refs_create_or_connect(sqlite3 *db, void *pAux, int argc,
     const char *const*argv, sqlite3_vtab **ppVtab, char **pzErr, int is_create) {
+  (void)pAux; (void)argc; (void)argv;
+
   int rc = sqlite3_declare_vtab(db,
     "CREATE TABLE x(name TEXT, type TEXT, target TEXT, symref TEXT)");
   if (rc != SQLITE_OK) return rc;
@@ -52,42 +51,33 @@ static int refs_create_or_connect(sqlite3 *db, void *pAux, int argc,
   if (!vtab) return SQLITE_NOMEM;
   memset(vtab, 0, sizeof(*vtab));
   vtab->db = db;
-  vtab->table_name = sqlite3_mprintf("%s", argv[2]);
 
   if (is_create) {
-    char *sql = sqlite3_mprintf(
-      "CREATE TABLE IF NOT EXISTS \"%w_data\"("
-      "  name TEXT PRIMARY KEY,"
-      "  target TEXT NOT NULL,"
+    rc = sqlite3_exec(db,
+      "CREATE TABLE IF NOT EXISTS refs("
+      "  refname TEXT PRIMARY KEY,"
+      "  oid BLOB,"
       "  symref TEXT"
-      ")", argv[2]);
-    rc = sqlite3_exec(db, sql, 0, 0, pzErr);
-    sqlite3_free(sql);
-    if (rc != SQLITE_OK) { sqlite3_free(vtab->table_name); sqlite3_free(vtab); return rc; }
+      ") WITHOUT ROWID",
+      0, 0, pzErr);
+    if (rc != SQLITE_OK) { sqlite3_free(vtab); return rc; }
   }
 
-  char *sql;
-  const char *n = argv[2];
-
-  sql = sqlite3_mprintf("INSERT OR REPLACE INTO \"%w_data\"(name, target, symref) VALUES(?,?,?)", n);
-  sqlite3_prepare_v2(db, sql, -1, &vtab->st_insert, 0);
-  sqlite3_free(sql);
-
-  sql = sqlite3_mprintf("UPDATE \"%w_data\" SET target = ?, symref = ? WHERE name = ?", n);
-  sqlite3_prepare_v2(db, sql, -1, &vtab->st_update, 0);
-  sqlite3_free(sql);
-
-  sql = sqlite3_mprintf("DELETE FROM \"%w_data\" WHERE name = ?", n);
-  sqlite3_prepare_v2(db, sql, -1, &vtab->st_delete, 0);
-  sqlite3_free(sql);
-
-  sql = sqlite3_mprintf("SELECT name, target, symref FROM \"%w_data\" WHERE name = ?", n);
-  sqlite3_prepare_v2(db, sql, -1, &vtab->st_lookup, 0);
-  sqlite3_free(sql);
-
-  sql = sqlite3_mprintf("SELECT name, target, symref FROM \"%w_data\" ORDER BY name", n);
-  sqlite3_prepare_v2(db, sql, -1, &vtab->st_scan, 0);
-  sqlite3_free(sql);
+  sqlite3_prepare_v2(db,
+    "INSERT OR REPLACE INTO refs(refname, oid, symref) VALUES(?,?,?)",
+    -1, &vtab->st_insert, 0);
+  sqlite3_prepare_v2(db,
+    "UPDATE refs SET oid = ?, symref = ? WHERE refname = ?",
+    -1, &vtab->st_update, 0);
+  sqlite3_prepare_v2(db,
+    "DELETE FROM refs WHERE refname = ?",
+    -1, &vtab->st_delete, 0);
+  sqlite3_prepare_v2(db,
+    "SELECT refname, oid, symref FROM refs WHERE refname = ?",
+    -1, &vtab->st_lookup, 0);
+  sqlite3_prepare_v2(db,
+    "SELECT refname, oid, symref FROM refs ORDER BY refname",
+    -1, &vtab->st_scan, 0);
 
   *ppVtab = &vtab->base;
   return SQLITE_OK;
@@ -110,22 +100,20 @@ static int refs_disconnect(sqlite3_vtab *pVtab) {
   if (vtab->st_delete) sqlite3_finalize(vtab->st_delete);
   if (vtab->st_lookup) sqlite3_finalize(vtab->st_lookup);
   if (vtab->st_scan) sqlite3_finalize(vtab->st_scan);
-  sqlite3_free(vtab->table_name);
   sqlite3_free(vtab);
   return SQLITE_OK;
 }
 
 static int refs_destroy(sqlite3_vtab *pVtab) {
   git0_refs_vtab *vtab = (git0_refs_vtab *)pVtab;
-  char *sql = sqlite3_mprintf("DROP TABLE IF EXISTS \"%w_data\"", vtab->table_name);
-  sqlite3_exec(vtab->db, sql, 0, 0, 0);
-  sqlite3_free(sql);
+  sqlite3_exec(vtab->db, "DROP TABLE IF EXISTS refs", 0, 0, 0);
   return refs_disconnect(pVtab);
 }
 
 /* ---- Cursor ---- */
 
 static int refs_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
+  (void)pVtab;
   git0_refs_cursor *cur = sqlite3_malloc(sizeof(*cur));
   if (!cur) return SQLITE_NOMEM;
   memset(cur, 0, sizeof(*cur));
@@ -141,9 +129,10 @@ static int refs_close(sqlite3_vtab_cursor *pCursor) {
 }
 
 static int refs_bestindex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
+  (void)pVtab;
   for (int i = 0; i < pInfo->nConstraint; i++) {
     if (!pInfo->aConstraint[i].usable) continue;
-    if (pInfo->aConstraint[i].iColumn == 0 /* name */ &&
+    if (pInfo->aConstraint[i].iColumn == 0 &&
         pInfo->aConstraint[i].op == SQLITE_INDEX_CONSTRAINT_EQ) {
       pInfo->aConstraintUsage[i].argvIndex = 1;
       pInfo->aConstraintUsage[i].omit = 1;
@@ -159,6 +148,7 @@ static int refs_bestindex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
 
 static int refs_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
                        int argc, sqlite3_value **argv) {
+  (void)idxStr;
   git0_refs_cursor *cur = (git0_refs_cursor *)pCursor;
   git0_refs_vtab *vtab = (git0_refs_vtab *)pCursor->pVtab;
   cur->eof = 0; cur->rowid = 0;
@@ -166,7 +156,8 @@ static int refs_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idx
   if (idxNum == 1 && argc > 0) {
     cur->st = vtab->st_lookup;
     sqlite3_reset(cur->st);
-    sqlite3_bind_text(cur->st, 1, (const char *)sqlite3_value_text(argv[0]), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(cur->st, 1,
+      (const char *)sqlite3_value_text(argv[0]), -1, SQLITE_TRANSIENT);
   } else {
     cur->st = vtab->st_scan;
     sqlite3_reset(cur->st);
@@ -190,10 +181,10 @@ static int refs_eof(sqlite3_vtab_cursor *pCursor) {
 static int refs_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int col) {
   git0_refs_cursor *cur = (git0_refs_cursor *)pCursor;
   switch (col) {
-    case 0: /* name */
+    case 0: /* name TEXT */
       sqlite3_result_value(ctx, sqlite3_column_value(cur->st, 0));
       break;
-    case 1: { /* type */
+    case 1: { /* type TEXT (derived from name) */
       const char *name = (const char *)sqlite3_column_text(cur->st, 0);
       if (strncmp(name, "refs/heads/", 11) == 0) sqlite3_result_text(ctx, "branch", -1, SQLITE_STATIC);
       else if (strncmp(name, "refs/tags/", 10) == 0) sqlite3_result_text(ctx, "tag", -1, SQLITE_STATIC);
@@ -202,10 +193,18 @@ static int refs_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int c
       else sqlite3_result_text(ctx, "other", -1, SQLITE_STATIC);
       break;
     }
-    case 2: /* target */
-      sqlite3_result_value(ctx, sqlite3_column_value(cur->st, 1));
+    case 2: { /* target TEXT (hex oid) */
+      const void *oid_blob = sqlite3_column_blob(cur->st, 1);
+      if (oid_blob) {
+        char hex[OID_HEXSZ + 1];
+        bin2hex(oid_blob, OID_RAWSZ, hex);
+        sqlite3_result_text(ctx, hex, OID_HEXSZ, SQLITE_TRANSIENT);
+      } else {
+        sqlite3_result_null(ctx);
+      }
       break;
-    case 3: /* symref */
+    }
+    case 3: /* symref TEXT */
       sqlite3_result_value(ctx, sqlite3_column_value(cur->st, 2));
       break;
     default:
@@ -223,44 +222,53 @@ static int refs_rowid(sqlite3_vtab_cursor *pCursor, sqlite3_int64 *pRowid) {
 
 static int refs_update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv, sqlite3_int64 *pRowid) {
   git0_refs_vtab *vtab = (git0_refs_vtab *)pVtab;
+  (void)pRowid;
 
   if (argc == 1) {
-    /* DELETE: argv[0] is rowid, but we need name. Use a trick:
-     * For virtual tables, DELETE passes the rowid. We need the name.
-     * Unfortunately we can't easily get it from rowid alone.
-     * Instead, support DELETE WHERE name = X via xUpdate with argc > 1 and argv[0] != NULL.
-     */
+    /* DELETE by rowid (not well supported, skip) */
     return SQLITE_OK;
   }
 
   if (sqlite3_value_type(argv[0]) == SQLITE_NULL) {
     /* INSERT */
     const char *name = (const char *)sqlite3_value_text(argv[2]);
-    const char *target = (const char *)sqlite3_value_text(argv[4]);
+    const char *target_hex = (const char *)sqlite3_value_text(argv[4]);
     const char *symref = argc > 5 && sqlite3_value_type(argv[5]) != SQLITE_NULL
       ? (const char *)sqlite3_value_text(argv[5]) : NULL;
 
     sqlite3_reset(vtab->st_insert);
     sqlite3_bind_text(vtab->st_insert, 1, name, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(vtab->st_insert, 2, target, -1, SQLITE_TRANSIENT);
+
+    if (target_hex && *target_hex) {
+      unsigned char oid_bin[OID_RAWSZ];
+      hex2bin(target_hex, oid_bin, OID_RAWSZ);
+      sqlite3_bind_blob(vtab->st_insert, 2, oid_bin, OID_RAWSZ, SQLITE_TRANSIENT);
+    } else {
+      sqlite3_bind_null(vtab->st_insert, 2);
+    }
+
     if (symref) sqlite3_bind_text(vtab->st_insert, 3, symref, -1, SQLITE_TRANSIENT);
     else sqlite3_bind_null(vtab->st_insert, 3);
     sqlite3_step(vtab->st_insert);
-    sqlite3_reset(vtab->st_insert);
   } else {
-    /* UPDATE: argv[0] = old rowid, argv[1] = new rowid */
+    /* UPDATE */
+    const char *target_hex = (const char *)sqlite3_value_text(argv[4]);
     const char *name = (const char *)sqlite3_value_text(argv[2]);
-    const char *target = (const char *)sqlite3_value_text(argv[4]);
     const char *symref = argc > 5 && sqlite3_value_type(argv[5]) != SQLITE_NULL
       ? (const char *)sqlite3_value_text(argv[5]) : NULL;
 
     sqlite3_reset(vtab->st_update);
-    sqlite3_bind_text(vtab->st_update, 1, target, -1, SQLITE_TRANSIENT);
+    if (target_hex && *target_hex) {
+      unsigned char oid_bin[OID_RAWSZ];
+      hex2bin(target_hex, oid_bin, OID_RAWSZ);
+      sqlite3_bind_blob(vtab->st_update, 1, oid_bin, OID_RAWSZ, SQLITE_TRANSIENT);
+    } else {
+      sqlite3_bind_null(vtab->st_update, 1);
+    }
     if (symref) sqlite3_bind_text(vtab->st_update, 2, symref, -1, SQLITE_TRANSIENT);
     else sqlite3_bind_null(vtab->st_update, 2);
     sqlite3_bind_text(vtab->st_update, 3, name, -1, SQLITE_TRANSIENT);
     sqlite3_step(vtab->st_update);
-    sqlite3_reset(vtab->st_update);
   }
 
   return SQLITE_OK;
