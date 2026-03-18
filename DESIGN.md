@@ -163,11 +163,21 @@ The ref side already supports `git init --ref-format=reftable` via
 A future patch series would add `--object-storage=helper://sqlite`
 following the same pattern:
 
-1. Add `--object-storage` flag to `builtin/init-db.c`
-2. Parse URI format (helper://name) and set `odb_storage_format`
+Proposed flags:
+- `--storage helper://sqlite` sets both objectStorage and refStorage
+- `--object-storage helper://sqlite` sets objectStorage only
+- `--ref-storage helper://sqlite` sets refStorage only
+
+`--ref-format` already exists upstream for `files`/`reftable` but
+does not parse URIs. `--ref-storage` would be the URI-aware variant,
+parallel to `extensions.refStorage` in config.
+
+Implementation:
+1. Add flags to `builtin/init-db.c`
+2. Parse URI format (helper://name), set odb/ref storage format
 3. Call helper's `create` command during init (before first write)
-4. Write `extensions.objectStorage` to config
-5. Skip files-backend ODB directory creation when helper is configured
+4. Write extensions config
+5. Skip files-backend directory creation when helper is configured
 
 Until then, sqlite-git repos are initialized via `echobox init` or
 `git0_init()` in the SQLite extension.
