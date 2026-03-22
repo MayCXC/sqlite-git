@@ -154,7 +154,13 @@ static void cmd_txn_update(const char *args) {
 	}
 	git_oid oid;
 	if (git_oid_fromstr(&oid, hex) != 0) { printf("error bad oid\n"); fflush(stdout); return; }
-	storage_ref_write(refname, &oid, NULL);
+	/* If this ref is a symref, follow it and update the target. */
+	git_oid cur; char symref[4096] = "";
+	if (storage_ref_read(refname, &cur, symref, sizeof(symref)) == 0 && symref[0]) {
+		storage_ref_write(symref, &oid, NULL);
+	} else {
+		storage_ref_write(refname, &oid, NULL);
+	}
 	printf("ok\n"); fflush(stdout);
 }
 

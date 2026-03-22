@@ -542,6 +542,36 @@ static void fn_git_config_set(sqlite3_context *ctx, int argc, sqlite3_value **ar
   }
 }
 
+/* ---- git0_attr(repo, path, name) ---- */
+
+static void fn_git0_attr(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc;
+  git_repository *repo = git0_repo(ctx, (const char *)sqlite3_value_text(argv[0]));
+  if (!repo) return;
+  const char *path = (const char *)sqlite3_value_text(argv[1]);
+  const char *name = (const char *)sqlite3_value_text(argv[2]);
+  if (!path || !name) { sqlite3_result_null(ctx); return; }
+  const char *value = NULL;
+  uint32_t flags = GIT_ATTR_CHECK_INDEX_ONLY | GIT_ATTR_CHECK_INCLUDE_HEAD;
+  int rc = git_attr_get(&value, repo, flags, path, name);
+  if (rc != 0 || !value) { sqlite3_result_null(ctx); return; }
+  git_attr_value_t vtype = git_attr_value(value);
+  switch (vtype) {
+    case GIT_ATTR_VALUE_TRUE:
+      sqlite3_result_text(ctx, "true", -1, SQLITE_STATIC);
+      break;
+    case GIT_ATTR_VALUE_FALSE:
+      sqlite3_result_text(ctx, "false", -1, SQLITE_STATIC);
+      break;
+    case GIT_ATTR_VALUE_STRING:
+      sqlite3_result_text(ctx, value, -1, SQLITE_TRANSIENT);
+      break;
+    default:
+      sqlite3_result_null(ctx);
+      break;
+  }
+}
+
 /* ---- Extension entry point ---- */
 
 
@@ -580,6 +610,7 @@ GIT0_API int sqlite3_git_init(sqlite3 *db, char **pzErrMsg,
   F("git_merge_base",     3, fn_git_merge_base);
   F("git_config",         2, fn_git_config);
   F("git_config_set",     3, fn_git_config_set);
+  F("git0_attr",          3, fn_git0_attr);
 
 #undef F
 

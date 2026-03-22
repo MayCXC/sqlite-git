@@ -1352,6 +1352,184 @@ static sqlite3_module git_bl_module = {
 
 /*
 ** ========================================================
+** git_attr(repo, path) TVF
+** Returns all attributes for a given path via git_attr_foreach.
+** ========================================================
+*/
+
+typedef struct {
+  sqlite3_vtab base;
+} git_attr_vtab;
+
+typedef struct {
+  sqlite3_vtab_cursor base;
+  git_repository *repo;
+  int n;
+  int idx;
+  char **names;
+  char **values;
+  int eof;
+} git_attr_cursor;
+
+static int git_attr_connect(sqlite3 *db, void *pAux, int argc, const char *const*argv,
+                            sqlite3_vtab **ppVtab, char **pzErr) {
+  (void)pAux; (void)argc; (void)argv; (void)pzErr;
+  sqlite3_declare_vtab(db,
+    "CREATE TABLE x(name TEXT, value TEXT, "
+    "repo TEXT HIDDEN, path TEXT HIDDEN)");
+  git_attr_vtab *vt = sqlite3_malloc(sizeof(*vt));
+  if (!vt) return SQLITE_NOMEM;
+  memset(vt, 0, sizeof(*vt));
+  *ppVtab = &vt->base;
+  return SQLITE_OK;
+}
+
+static int git_attr_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
+  (void)pVtab;
+  git_attr_cursor *cur = sqlite3_malloc(sizeof(*cur));
+  if (!cur) return SQLITE_NOMEM;
+  memset(cur, 0, sizeof(*cur));
+  *ppCursor = &cur->base;
+  return SQLITE_OK;
+}
+
+static int git_attr_close(sqlite3_vtab_cursor *pCursor) {
+  git_attr_cursor *cur = (git_attr_cursor *)pCursor;
+  for (int i = 0; i < cur->n; i++) {
+    free(cur->names[i]);
+    free(cur->values[i]);
+  }
+  free(cur->names);
+  free(cur->values);
+  sqlite3_free(cur);
+  return SQLITE_OK;
+}
+
+struct attr_collect {
+  int n, cap;
+  char **names;
+  char **values;
+};
+
+static int attr_foreach_cb(const char *name, const char *value, void *payload) {
+  struct attr_collect *ac = (struct attr_collect *)payload;
+  git_attr_value_t vtype = git_attr_value(value);
+  if (vtype == GIT_ATTR_VALUE_UNSPECIFIED) return 0;
+  if (ac->n >= ac->cap) {
+    ac->cap = ac->cap ? ac->cap * 2 : 16;
+    ac->names = realloc(ac->names, ac->cap * sizeof(char *));
+    ac->values = realloc(ac->values, ac->cap * sizeof(char *));
+  }
+  ac->names[ac->n] = strdup(name);
+  if (vtype == GIT_ATTR_VALUE_TRUE)
+    ac->values[ac->n] = strdup("true");
+  else if (vtype == GIT_ATTR_VALUE_FALSE)
+    ac->values[ac->n] = strdup("false");
+  else
+    ac->values[ac->n] = strdup(value ? value : "");
+  ac->n++;
+  return 0;
+}
+
+static int git_attr_filter(sqlite3_vtab_cursor *pCursor, int idxNum,
+                           const char *idxStr, int argc, sqlite3_value **argv) {
+  (void)idxNum; (void)idxStr;
+  git_attr_cursor *cur = (git_attr_cursor *)pCursor;
+  /* Clean up previous iteration */
+  for (int i = 0; i < cur->n; i++) {
+    free(cur->names[i]);
+    free(cur->values[i]);
+  }
+  free(cur->names);
+  free(cur->values);
+  cur->names = NULL;
+  cur->values = NULL;
+  cur->n = 0;
+  cur->idx = 0;
+  cur->eof = 1;
+
+  if (argc < 2) return SQLITE_OK;
+  const char *repo_path = (const char *)sqlite3_value_text(argv[0]);
+  const char *path = (const char *)sqlite3_value_text(argv[1]);
+  if (!repo_path || !path) return SQLITE_OK;
+
+  char *err = NULL;
+  cur->repo = git0_repo_open(repo_path, &err);
+  if (!cur->repo) {
+    if (err) pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err);
+    return SQLITE_ERROR;
+  }
+
+  struct attr_collect ac = {0, 0, NULL, NULL};
+  uint32_t flags = GIT_ATTR_CHECK_INDEX_ONLY | GIT_ATTR_CHECK_INCLUDE_HEAD;
+  git_attr_foreach(cur->repo, flags, path, attr_foreach_cb, &ac);
+  cur->n = ac.n;
+  cur->names = ac.names;
+  cur->values = ac.values;
+  cur->eof = (ac.n == 0);
+  return SQLITE_OK;
+}
+
+static int git_attr_next(sqlite3_vtab_cursor *pCursor) {
+  git_attr_cursor *cur = (git_attr_cursor *)pCursor;
+  cur->idx++;
+  if (cur->idx >= cur->n) cur->eof = 1;
+  return SQLITE_OK;
+}
+
+static int git_attr_eof(sqlite3_vtab_cursor *pCursor) {
+  return ((git_attr_cursor *)pCursor)->eof;
+}
+
+static int git_attr_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int col) {
+  git_attr_cursor *cur = (git_attr_cursor *)pCursor;
+  switch (col) {
+    case 0: /* name */
+      sqlite3_result_text(ctx, cur->names[cur->idx], -1, SQLITE_TRANSIENT);
+      break;
+    case 1: /* value */
+      sqlite3_result_text(ctx, cur->values[cur->idx], -1, SQLITE_TRANSIENT);
+      break;
+  }
+  return SQLITE_OK;
+}
+
+static int git_attr_rowid(sqlite3_vtab_cursor *pCursor, sqlite3_int64 *pRowid) {
+  *pRowid = (sqlite3_int64)((git_attr_cursor *)pCursor)->idx;
+  return SQLITE_OK;
+}
+
+static int git_attr_bestindex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
+  (void)pVtab;
+  int argIdx = 0;
+  for (int i = 0; i < pInfo->nConstraint; i++) {
+    if (!pInfo->aConstraint[i].usable) continue;
+    if (pInfo->aConstraint[i].op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+    int col = pInfo->aConstraint[i].iColumn;
+    if (col == 2 || col == 3) { /* repo, path */
+      pInfo->aConstraintUsage[i].argvIndex = ++argIdx;
+      pInfo->aConstraintUsage[i].omit = 1;
+    }
+  }
+  pInfo->estimatedCost = 10;
+  return SQLITE_OK;
+}
+
+static sqlite3_module git_attr_module = {
+  .xConnect = git_attr_connect,
+  .xBestIndex = git_attr_bestindex,
+  .xDisconnect = git_log_disconnect,
+  .xOpen = git_attr_open,
+  .xClose = git_attr_close,
+  .xFilter = git_attr_filter,
+  .xNext = git_attr_next,
+  .xEof = git_attr_eof,
+  .xColumn = git_attr_column,
+  .xRowid = git_attr_rowid,
+};
+
+/*
+** ========================================================
 ** Register all TVFs
 ** ========================================================
 */
@@ -1365,5 +1543,6 @@ int git0_register_vtabs(sqlite3 *db) {
   sqlite3_create_module(db, "git_config_list", &git_cfgl_module, 0);
   sqlite3_create_module(db, "git_status", &git_stat_module, 0);
   sqlite3_create_module(db, "git_blame", &git_bl_module, 0);
+  sqlite3_create_module(db, "git_attr", &git_attr_module, 0);
   return SQLITE_OK;
 }
