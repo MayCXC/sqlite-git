@@ -820,9 +820,28 @@ int storage_repack(void) {
 			struct window_entry *we = &window[i];
 			if (!we->full_data) continue;
 
-			/* Check chain depth: if base is itself a delta, its depth
-			 * plus one must not exceed MAX_CHAIN_DEPTH */
+			/* Check chain depth */
 			if (we->chain_depth + 1 > MAX_CHAIN_DEPTH) continue;
+
+			/* Cycle check: verify the candidate base's chain
+			 * doesn't already depend on the current object */
+			{
+				int cycle = 0;
+				git_oid walk;
+				memcpy(&walk, &we->oid, sizeof(git_oid));
+				for (int d = 0; d < MAX_CHAIN_DEPTH; d++) {
+					if (memcmp(walk.id, oid.id, GIT_OID_SHA1_SIZE) == 0) { cycle = 1; break; }
+					sqlite3_stmt *cst = NULL;
+					sqlite3_prepare_v2(sdb, "SELECT base FROM objects WHERE oid = ?", -1, &cst, 0);
+					sqlite3_bind_blob(cst, 1, walk.id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+					if (sqlite3_step(cst) != SQLITE_ROW || !sqlite3_column_blob(cst, 0)) {
+						sqlite3_finalize(cst); break;
+					}
+					memcpy(walk.id, sqlite3_column_blob(cst, 0), GIT_OID_SHA1_SIZE);
+					sqlite3_finalize(cst);
+				}
+				if (cycle) continue;
+			}
 
 			/* Size filter: skip if target < base/32 */
 			if (full_size < we->full_size / 32) continue;
