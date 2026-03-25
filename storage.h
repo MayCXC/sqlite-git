@@ -97,6 +97,10 @@ int storage_write_packfile(FILE *in);
 /* Connectivity verification using libgit2 revwalk */
 int storage_check_connectivity(void);
 
+/* GC and repack */
+int storage_gc(void);
+int storage_repack(void);
+
 /* Reflog operations */
 int storage_reflog_exists(const char *refname);
 void storage_reflog_delete(const char *refname);

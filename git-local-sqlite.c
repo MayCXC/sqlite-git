@@ -18,7 +18,7 @@ static void cmd_capabilities(void) {
 	       "reflog-read\nreflog-read-reverse\nreflog-append\n"
 	       "reflog-exists\nreflog-delete\nreflog-list\n"
 	       "refresh\nkept\npromisor\nconnectivity-check\nconvert-oid\n"
-	       "write-packfile\n\n");
+	       "write-packfile\ngc\nrepack\n\n");
 	fflush(stdout);
 }
 
@@ -415,6 +415,18 @@ int local_main(int argc, char **argv) {
 			int n = storage_write_packfile(stdin);
 			if (n >= 0) { storage_release("write_packfile"); printf("ok %d\n", n); }
 			else { storage_rollback_to("write_packfile"); printf("error\n"); }
+			fflush(stdout);
+		}
+		else if (!strcmp(line, "gc")) {
+			int n = storage_gc();
+			if (n >= 0) printf("ok %d\n", n);
+			else printf("error\n");
+			fflush(stdout);
+		}
+		else if (!strcmp(line, "repack")) {
+			int n = storage_repack();
+			if (n >= 0) printf("ok %d\n", n);
+			else printf("error\n");
 			fflush(stdout);
 		}
 		else if (!strcmp(line, "close")) break;

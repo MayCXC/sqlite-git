@@ -22,6 +22,10 @@
 #include "vendor/delta.h"
 #include "vendor/sha256.h"
 
+/* Guard against circular delta chains in corrupt databases.
+ * Git enforces no depth limit on read; this is our safety net.
+ * 4095 matches pack-objects.h structural max (12-bit depth field). */
+#define MAX_DELTA_DEPTH 4095
 
 static sqlite3 *sdb;
 static int sdb_owned; /* 1 if we opened the db, 0 if borrowed */
@@ -474,6 +478,338 @@ int storage_check_connectivity(void) {
 	return ret;
 }
 
+/* ---- GC: mark-sweep unreachable objects ---- */
+
+static int mark_reachable_oid(const git_oid *oid, sqlite3_stmt *st_insert) {
+	sqlite3_bind_blob(st_insert, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	sqlite3_step(st_insert);
+	sqlite3_reset(st_insert);
+	return 0;
+}
+
+static int is_marked(const git_oid *oid, sqlite3_stmt *st_check) {
+	sqlite3_bind_blob(st_check, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	int found = (sqlite3_step(st_check) == SQLITE_ROW);
+	sqlite3_reset(st_check);
+	return found;
+}
+
+static void mark_tree_reachable(git_repository *repo, const git_oid *tree_oid,
+				sqlite3_stmt *st_insert, sqlite3_stmt *st_check) {
+	if (is_marked(tree_oid, st_check))
+		return;
+	mark_reachable_oid(tree_oid, st_insert);
+
+	git_tree *tree = NULL;
+	if (git_tree_lookup(&tree, repo, tree_oid) < 0)
+		return;
+
+	size_t count = git_tree_entrycount(tree);
+	for (size_t i = 0; i < count; i++) {
+		const git_tree_entry *entry = git_tree_entry_byindex(tree, i);
+		const git_oid *entry_oid = git_tree_entry_id(entry);
+		git_object_t entry_type = git_tree_entry_type(entry);
+		if (entry_type == GIT_OBJECT_TREE) {
+			mark_tree_reachable(repo, entry_oid, st_insert, st_check);
+		} else {
+			mark_reachable_oid(entry_oid, st_insert);
+		}
+	}
+	git_tree_free(tree);
+}
+
+struct gc_ref_ctx {
+	git_repository *repo;
+	git_revwalk *walk;
+	sqlite3_stmt *st_insert;
+	sqlite3_stmt *st_check;
+};
+
+static int gc_ref_cb(const char *refname, const git_oid *oid,
+		     const char *symref, void *data) {
+	(void)refname;
+	struct gc_ref_ctx *ctx = data;
+	git_oid resolved;
+
+	/* Resolve symrefs to their target OID */
+	if (symref && *symref) {
+		char sym2[4096];
+		if (storage_ref_read(symref, &resolved, sym2, sizeof(sym2)) < 0)
+			return 0;
+		oid = &resolved;
+	}
+	if (!oid) return 0;
+
+	/* Check if it's a tag; if so, peel to the target */
+	git_object_t type;
+	size_t size;
+	unsigned char *obj_data;
+	if (storage_read_object(oid, &type, &size, &obj_data) < 0)
+		return 0;
+	free(obj_data);
+
+	if (type == GIT_OBJECT_TAG) {
+		mark_reachable_oid(oid, ctx->st_insert);
+		git_tag *tag = NULL;
+		if (git_tag_lookup(&tag, ctx->repo, oid) == 0) {
+			const git_oid *target_oid = git_tag_target_id(tag);
+			git_object_t target_type = git_tag_target_type(tag);
+			if (target_type == GIT_OBJECT_COMMIT) {
+				git_revwalk_push(ctx->walk, target_oid);
+			} else if (target_type == GIT_OBJECT_TREE) {
+				mark_tree_reachable(ctx->repo, target_oid,
+						    ctx->st_insert, ctx->st_check);
+			} else {
+				mark_reachable_oid(target_oid, ctx->st_insert);
+			}
+			git_tag_free(tag);
+		}
+	} else if (type == GIT_OBJECT_COMMIT) {
+		git_revwalk_push(ctx->walk, oid);
+	} else if (type == GIT_OBJECT_TREE) {
+		mark_tree_reachable(ctx->repo, oid, ctx->st_insert, ctx->st_check);
+	} else {
+		mark_reachable_oid(oid, ctx->st_insert);
+	}
+
+	return 0;
+}
+
+int storage_gc(void) {
+	git_repository *repo = git0_storage_repo();
+	if (!repo) return -1;
+
+	/* Phase 1: Mark reachable objects */
+	sqlite3_exec(sdb, "CREATE TEMP TABLE reachable(oid BLOB PRIMARY KEY) WITHOUT ROWID", 0, 0, 0);
+
+	sqlite3_stmt *st_insert = NULL, *st_check = NULL;
+	sqlite3_prepare_v2(sdb, "INSERT OR IGNORE INTO temp.reachable(oid) VALUES(?)", -1, &st_insert, 0);
+	sqlite3_prepare_v2(sdb, "SELECT 1 FROM temp.reachable WHERE oid = ?", -1, &st_check, 0);
+
+	git_revwalk *walk = NULL;
+	if (git_revwalk_new(&walk, repo) < 0) {
+		sqlite3_finalize(st_insert);
+		sqlite3_finalize(st_check);
+		sqlite3_exec(sdb, "DROP TABLE IF EXISTS temp.reachable", 0, 0, 0);
+		return -1;
+	}
+
+	struct gc_ref_ctx ctx = { repo, walk, st_insert, st_check };
+	storage_ref_list(NULL, gc_ref_cb, &ctx);
+
+	/* Walk all reachable commits, marking each commit and its tree */
+	git_oid oid;
+	while (git_revwalk_next(&oid, walk) == 0) {
+		mark_reachable_oid(&oid, st_insert);
+		git_commit *commit = NULL;
+		if (git_commit_lookup(&commit, repo, &oid) == 0) {
+			const git_oid *tree_oid = git_commit_tree_id(commit);
+			mark_tree_reachable(repo, tree_oid, st_insert, st_check);
+			git_commit_free(commit);
+		}
+	}
+	git_revwalk_free(walk);
+	sqlite3_finalize(st_check);
+	sqlite3_finalize(st_insert);
+
+	/* Phase 2: Sweep unreachable objects (preserve kept and promisor) */
+	sqlite3_stmt *st_sweep = NULL;
+	sqlite3_prepare_v2(sdb,
+		"DELETE FROM objects WHERE oid NOT IN (SELECT oid FROM temp.reachable)"
+		" AND kept = 0 AND promisor = 0",
+		-1, &st_sweep, 0);
+	sqlite3_step(st_sweep);
+	int deleted = sqlite3_changes(sdb);
+	sqlite3_finalize(st_sweep);
+
+	sqlite3_exec(sdb, "DROP TABLE IF EXISTS temp.reachable", 0, 0, 0);
+
+	/* Phase 3: Repack surviving objects */
+	storage_repack();
+
+	return deleted;
+}
+
+/* ---- Repack: improve delta compression ---- */
+
+#define REPACK_WINDOW 10
+#define MAX_CHAIN_DEPTH 50
+
+static int delta_chain_depth(const git_oid *oid) {
+	int depth = 0;
+	git_oid cur;
+	memcpy(&cur, oid, sizeof(git_oid));
+
+	while (depth <= MAX_DELTA_DEPTH) {
+		sqlite3_stmt *st = NULL;
+		sqlite3_prepare_v2(sdb, "SELECT base FROM objects WHERE oid = ?", -1, &st, 0);
+		sqlite3_bind_blob(st, 1, cur.id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+		if (sqlite3_step(st) != SQLITE_ROW) {
+			sqlite3_finalize(st);
+			break;
+		}
+		const void *base_blob = sqlite3_column_blob(st, 0);
+		if (!base_blob) {
+			sqlite3_finalize(st);
+			break; /* not a delta, depth is 0 from here */
+		}
+		memcpy(cur.id, base_blob, GIT_OID_SHA1_SIZE);
+		sqlite3_finalize(st);
+		depth++;
+	}
+	return depth;
+}
+
+int storage_repack(void) {
+	sqlite3_stmt *st_scan = NULL, *st_update = NULL;
+	int repacked = 0;
+
+	sqlite3_prepare_v2(sdb,
+		"SELECT oid, type, size, data, base, path FROM objects"
+		" ORDER BY type, path, size",
+		-1, &st_scan, 0);
+	sqlite3_prepare_v2(sdb,
+		"UPDATE objects SET data = ?, base = ? WHERE oid = ?",
+		-1, &st_update, 0);
+
+	/* Sliding window of recent objects of the same type */
+	struct window_entry {
+		git_oid oid;
+		git_object_t type;
+		unsigned char *full_data;
+		size_t full_size;
+		int chain_depth; /* 0 = not a delta */
+	};
+	struct window_entry window[REPACK_WINDOW];
+	memset(window, 0, sizeof(window));
+	int win_count = 0;
+	int win_pos = 0; /* next slot to fill (circular) */
+	git_object_t prev_type = GIT_OBJECT_INVALID;
+
+	while (sqlite3_step(st_scan) == SQLITE_ROW) {
+		git_oid oid;
+		memcpy(oid.id, sqlite3_column_blob(st_scan, 0), GIT_OID_SHA1_SIZE);
+		git_object_t type = (git_object_t)sqlite3_column_int(st_scan, 1);
+		size_t orig_size = (size_t)sqlite3_column_int64(st_scan, 2);
+		const void *comp = sqlite3_column_blob(st_scan, 3);
+		int comp_len = sqlite3_column_bytes(st_scan, 3);
+		const void *base_blob = sqlite3_column_blob(st_scan, 4);
+
+		/* When type changes, flush the window */
+		if (type != prev_type) {
+			for (int i = 0; i < win_count; i++)
+				free(window[i].full_data);
+			memset(window, 0, sizeof(window));
+			win_count = 0;
+			win_pos = 0;
+			prev_type = type;
+		}
+
+		/* Resolve current object to full content */
+		unsigned char *full_data = NULL;
+		size_t full_size = 0;
+		if (!base_blob) {
+			/* Not a delta: decompress directly */
+			full_data = zdecompress(comp, comp_len, orig_size);
+			full_size = orig_size;
+		} else {
+			/* Is a delta: resolve through storage_read_object */
+			git_object_t rd_type;
+			if (storage_read_object(&oid, &rd_type, &full_size, &full_data) < 0) {
+				/* Skip if unreadable */
+				goto next_entry;
+			}
+		}
+		if (!full_data) goto next_entry;
+
+		/* Current compressed size (what we're trying to beat) */
+		size_t cur_stored_size = (size_t)comp_len;
+
+		/*
+		 * Try delta against each window entry.
+		 * Storage format: deltas are stored as raw fossil delta bytes
+		 * (not zlib-compressed), while non-delta objects are zlib-compressed.
+		 * Compare raw delta size against current stored blob size.
+		 */
+		int best_delta_len = 0;
+		char *best_delta = NULL;
+		int best_win_idx = -1;
+
+		for (int i = 0; i < win_count; i++) {
+			struct window_entry *we = &window[i];
+			if (!we->full_data) continue;
+
+			/* Check chain depth: if base is itself a delta, its depth
+			 * plus one must not exceed MAX_CHAIN_DEPTH */
+			if (we->chain_depth + 1 > MAX_CHAIN_DEPTH) continue;
+
+			/* Size filter: skip if target < base/32 */
+			if (full_size < we->full_size / 32) continue;
+
+			char *dbuf = malloc(full_size + 60);
+			if (!dbuf) continue;
+			int dlen = delta_create((const char *)we->full_data, we->full_size,
+						(const char *)full_data, full_size, dbuf);
+			if (dlen <= 0) { free(dbuf); continue; }
+
+			/* Raw delta must be smaller than current stored data blob
+			 * AND smaller than any previously found best delta */
+			if ((size_t)dlen < cur_stored_size &&
+			    (best_delta == NULL || dlen < best_delta_len)) {
+				free(best_delta);
+				best_delta = dbuf;
+				best_delta_len = dlen;
+				best_win_idx = i;
+			} else {
+				free(dbuf);
+			}
+		}
+
+		/* If we found a better delta, update the row */
+		if (best_delta && best_win_idx >= 0) {
+			sqlite3_bind_blob(st_update, 1, best_delta, best_delta_len, SQLITE_STATIC);
+			sqlite3_bind_blob(st_update, 2, window[best_win_idx].oid.id,
+					  GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+			sqlite3_bind_blob(st_update, 3, oid.id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+			sqlite3_step(st_update);
+			sqlite3_reset(st_update);
+			repacked++;
+		}
+		free(best_delta);
+
+		/* Add this object to the window */
+		{
+			int slot = win_pos % REPACK_WINDOW;
+			free(window[slot].full_data);
+			memcpy(&window[slot].oid, &oid, sizeof(git_oid));
+			window[slot].type = type;
+			window[slot].full_data = full_data;
+			window[slot].full_size = full_size;
+			/* Compute chain depth for this object as stored */
+			if (best_win_idx >= 0)
+				window[slot].chain_depth = window[best_win_idx].chain_depth + 1;
+			else if (base_blob)
+				window[slot].chain_depth = delta_chain_depth(&oid);
+			else
+				window[slot].chain_depth = 0;
+			full_data = NULL; /* ownership transferred to window */
+			win_pos++;
+			if (win_count < REPACK_WINDOW) win_count++;
+		}
+
+next_entry:
+		free(full_data);
+	}
+
+	/* Free window entries */
+	for (int i = 0; i < win_count; i++)
+		free(window[i].full_data);
+
+	sqlite3_finalize(st_scan);
+	sqlite3_finalize(st_update);
+	return repacked;
+}
+
 void storage_destroy(void) {
 	sqlite3_exec(sdb, "DROP TABLE IF EXISTS objects;"
 		     "DROP TABLE IF EXISTS refs;"
@@ -500,11 +836,6 @@ void storage_rollback_to(const char *name) {
 }
 
 /* ---- Object read (resolves delta chains) ---- */
-
-/* Guard against circular delta chains in corrupt databases.
- * Git enforces no depth limit on read; this is our safety net.
- * 4095 matches pack-objects.h structural max (12-bit depth field). */
-#define MAX_DELTA_DEPTH 4095
 
 static int read_object_depth(const git_oid *oid, git_object_t *out_type,
 			     size_t *out_size, unsigned char **out_data, int depth) {

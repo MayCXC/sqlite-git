@@ -62,8 +62,8 @@ check "capabilities: lists reflog-read-reverse" \
 check "capabilities: lists write-packfile" \
 	'echo "$CAP" | grep -q "^write-packfile$"'
 
-check "capabilities: 24 total" \
-	'test "$(echo "$CAP" | grep -c .)" -eq 24'
+check "capabilities: 26 total" \
+	'test "$(echo "$CAP" | grep -c .)" -eq 26'
 
 # ---- Object operations ----
 
