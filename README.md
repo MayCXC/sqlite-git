@@ -53,7 +53,7 @@ Everything lives in `<gitdir>/sqlite.db`:
 
 ```
 objects(oid BLOB PRIMARY KEY, type INT, size INT, data BLOB, base BLOB,
-        kept INT DEFAULT 0, promisor INT DEFAULT 0)
+        kept INT DEFAULT 0, promisor INT DEFAULT 0, reachable INT DEFAULT 0)
 refs(refname TEXT PRIMARY KEY, oid BLOB, symref TEXT)
 reflog(refname TEXT, idx INT, old_oid BLOB, new_oid BLOB, committer TEXT,
        timestamp INT, tz INT, msg TEXT, PRIMARY KEY(refname, idx))
@@ -85,6 +85,8 @@ All tables use `WITHOUT ROWID` for clustered primary key access.
 **Alternates**: Linked alternate databases for shared object storage. Objects not found locally are resolved from alternates, including delta chain resolution across database boundaries.
 
 **Transactions**: Every public write function wraps itself in a SQLite savepoint. Callers manage transactions externally; savepoints nest transparently. Error paths rollback, success paths release.
+
+**Statement lifecycle**: All statements use `sqlite3_prepare_v3` with `SQLITE_PREPARE_PERSISTENT`. In owned mode (helper binary), statements are prepared once at open and cached in globals. In borrowed mode (extension loaded via `sqlite3` CLI), statements are prepared and finalized per call to avoid unfinalized statements at `sqlite3_close` (v1).
 
 ### Protocol
 
