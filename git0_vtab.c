@@ -1530,6 +1530,423 @@ static sqlite3_module git_attr_module = {
 
 /*
 ** ========================================================
+** git_stash(repo) TVF
+** Iterates refs/stash reflog entries.
+** ========================================================
+*/
+
+typedef struct { sqlite3_vtab base; } git_stash_vtab;
+
+typedef struct {
+  sqlite3_vtab_cursor base;
+  int n;
+  int idx;
+  struct stash_entry {
+    int stash_idx;
+    char oid_hex[GIT_OID_SHA1_HEXSIZE + 1];
+    char *message;
+  } *entries;
+} git_stash_cursor;
+
+static int git_stash_connect(sqlite3 *db, void *pAux, int argc, const char *const*argv,
+                             sqlite3_vtab **ppVtab, char **pzErr) {
+  (void)pAux; (void)argc; (void)argv; (void)pzErr;
+  int rc = sqlite3_declare_vtab(db,
+    "CREATE TABLE x(idx INT, oid TEXT, message TEXT, repo TEXT HIDDEN)");
+  if (rc != SQLITE_OK) return rc;
+  git_stash_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
+  if (!vtab) return SQLITE_NOMEM;
+  memset(vtab, 0, sizeof(*vtab));
+  *ppVtab = &vtab->base;
+  return SQLITE_OK;
+}
+
+static int git_stash_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
+  (void)pVtab;
+  git_stash_cursor *cur = sqlite3_malloc(sizeof(*cur));
+  if (!cur) return SQLITE_NOMEM;
+  memset(cur, 0, sizeof(*cur));
+  *ppCursor = &cur->base;
+  return SQLITE_OK;
+}
+
+static int git_stash_close(sqlite3_vtab_cursor *pCursor) {
+  git_stash_cursor *cur = (git_stash_cursor *)pCursor;
+  for (int i = 0; i < cur->n; i++)
+    free(cur->entries[i].message);
+  free(cur->entries);
+  sqlite3_free(cur);
+  return SQLITE_OK;
+}
+
+struct stash_collect {
+  struct stash_entry *entries;
+  int n, cap;
+};
+
+static int stash_reflog_cb(const git_oid *old_oid, const git_oid *new_oid,
+                           const char *committer, long long ts, int tz,
+                           const char *msg, void *data) {
+  (void)old_oid; (void)committer; (void)ts; (void)tz;
+  struct stash_collect *sc = data;
+  if (sc->n >= sc->cap) {
+    sc->cap = sc->cap ? sc->cap * 2 : 16;
+    sc->entries = realloc(sc->entries, sc->cap * sizeof(struct stash_entry));
+  }
+  sc->entries[sc->n].stash_idx = sc->n;
+  git_oid_tostr(sc->entries[sc->n].oid_hex, GIT_OID_SHA1_HEXSIZE + 1, new_oid);
+  sc->entries[sc->n].message = strdup(msg ? msg : "");
+  sc->n++;
+  return 0;
+}
+
+static int git_stash_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
+                            int argc, sqlite3_value **argv) {
+  (void)idxNum; (void)idxStr;
+  git_stash_cursor *cur = (git_stash_cursor *)pCursor;
+  /* Clean up previous iteration */
+  for (int i = 0; i < cur->n; i++)
+    free(cur->entries[i].message);
+  free(cur->entries);
+  cur->entries = NULL;
+  cur->n = 0;
+  cur->idx = 0;
+
+  /* Read reflog for refs/stash via storage layer */
+  struct stash_collect sc = {NULL, 0, 0};
+
+  /* Use storage_reflog_read if we have it (for :storage: repos),
+   * otherwise try libgit2 reflog API. We import storage_reflog_read
+   * since it is declared in storage.h. */
+  extern int storage_reflog_read(const char *, int (*)(const git_oid *, const git_oid *,
+    const char *, long long, int, const char *, void *), void *);
+  storage_reflog_read("refs/stash", stash_reflog_cb, &sc);
+
+  cur->entries = sc.entries;
+  cur->n = sc.n;
+  return SQLITE_OK;
+}
+
+static int git_stash_next(sqlite3_vtab_cursor *pCursor) {
+  ((git_stash_cursor *)pCursor)->idx++;
+  return SQLITE_OK;
+}
+
+static int git_stash_eof(sqlite3_vtab_cursor *pCursor) {
+  git_stash_cursor *cur = (git_stash_cursor *)pCursor;
+  return cur->idx >= cur->n;
+}
+
+static int git_stash_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int col) {
+  git_stash_cursor *cur = (git_stash_cursor *)pCursor;
+  struct stash_entry *e = &cur->entries[cur->idx];
+  switch (col) {
+    case 0: sqlite3_result_int(ctx, e->stash_idx); break;
+    case 1: sqlite3_result_text(ctx, e->oid_hex, -1, SQLITE_TRANSIENT); break;
+    case 2: sqlite3_result_text(ctx, e->message, -1, SQLITE_TRANSIENT); break;
+    default: sqlite3_result_null(ctx);
+  }
+  return SQLITE_OK;
+}
+
+static int git_stash_rowid(sqlite3_vtab_cursor *pCursor, sqlite3_int64 *pRowid) {
+  *pRowid = (sqlite3_int64)((git_stash_cursor *)pCursor)->idx;
+  return SQLITE_OK;
+}
+
+static int git_stash_bestindex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
+  (void)pVtab;
+  int argIdx = 0;
+  for (int i = 0; i < pInfo->nConstraint; i++) {
+    if (!pInfo->aConstraint[i].usable) continue;
+    if (pInfo->aConstraint[i].op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+    if (pInfo->aConstraint[i].iColumn == 3) { /* repo */
+      pInfo->aConstraintUsage[i].argvIndex = ++argIdx;
+      pInfo->aConstraintUsage[i].omit = 1;
+    }
+  }
+  pInfo->estimatedCost = 100;
+  return SQLITE_OK;
+}
+
+static sqlite3_module git_stash_module = {
+  .xConnect = git_stash_connect,
+  .xBestIndex = git_stash_bestindex,
+  .xDisconnect = git_log_disconnect,
+  .xOpen = git_stash_open,
+  .xClose = git_stash_close,
+  .xFilter = git_stash_filter,
+  .xNext = git_stash_next,
+  .xEof = git_stash_eof,
+  .xColumn = git_stash_column,
+  .xRowid = git_stash_rowid,
+};
+
+/*
+** ========================================================
+** git_tag(repo, pattern?) TVF
+** Iterates tag refs and their tag objects.
+** ========================================================
+*/
+
+typedef struct { sqlite3_vtab base; } git_tag_vtab;
+
+struct tag_entry {
+  char *name;
+  char oid_hex[GIT_OID_SHA1_HEXSIZE + 1];
+  char target_oid_hex[GIT_OID_SHA1_HEXSIZE + 1];
+  char *target_type;
+  char *tagger;
+  char *message;
+};
+
+typedef struct {
+  sqlite3_vtab_cursor base;
+  int n;
+  int idx;
+  struct tag_entry *entries;
+} git_tag_cursor;
+
+static int git_tag_connect(sqlite3 *db, void *pAux, int argc, const char *const*argv,
+                           sqlite3_vtab **ppVtab, char **pzErr) {
+  (void)pAux; (void)argc; (void)argv; (void)pzErr;
+  int rc = sqlite3_declare_vtab(db,
+    "CREATE TABLE x(name TEXT, oid TEXT, target_oid TEXT, target_type TEXT, "
+    "tagger TEXT, message TEXT, repo TEXT HIDDEN, pattern TEXT HIDDEN)");
+  if (rc != SQLITE_OK) return rc;
+  git_tag_vtab *vtab = sqlite3_malloc(sizeof(*vtab));
+  if (!vtab) return SQLITE_NOMEM;
+  memset(vtab, 0, sizeof(*vtab));
+  *ppVtab = &vtab->base;
+  return SQLITE_OK;
+}
+
+static int git_tag_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
+  (void)pVtab;
+  git_tag_cursor *cur = sqlite3_malloc(sizeof(*cur));
+  if (!cur) return SQLITE_NOMEM;
+  memset(cur, 0, sizeof(*cur));
+  *ppCursor = &cur->base;
+  return SQLITE_OK;
+}
+
+static void free_tag_entries(struct tag_entry *entries, int n) {
+  for (int i = 0; i < n; i++) {
+    free(entries[i].name);
+    free(entries[i].target_type);
+    free(entries[i].tagger);
+    free(entries[i].message);
+  }
+  free(entries);
+}
+
+static int git_tag_close(sqlite3_vtab_cursor *pCursor) {
+  git_tag_cursor *cur = (git_tag_cursor *)pCursor;
+  free_tag_entries(cur->entries, cur->n);
+  sqlite3_free(cur);
+  return SQLITE_OK;
+}
+
+/* Parse a tag object's raw data to extract fields */
+static void parse_tag_object(const unsigned char *data, size_t size,
+                             struct tag_entry *e) {
+  const char *p = (const char *)data;
+  const char *end = p + size;
+  const char *body = NULL;
+
+  while (p < end) {
+    const char *nl = memchr(p, '\n', end - p);
+    if (!nl) break;
+    if (nl == p) { body = p + 1; break; } /* empty line = start of message */
+
+    size_t linelen = nl - p;
+    if (linelen > 7 && !strncmp(p, "object ", 7)) {
+      char hex[GIT_OID_SHA1_HEXSIZE + 1];
+      snprintf(hex, sizeof(hex), "%.*s", (int)(linelen - 7 < 40 ? linelen - 7 : 40), p + 7);
+      snprintf(e->target_oid_hex, sizeof(e->target_oid_hex), "%s", hex);
+    } else if (linelen > 5 && !strncmp(p, "type ", 5)) {
+      e->target_type = strndup(p + 5, linelen - 5);
+    } else if (linelen > 7 && !strncmp(p, "tagger ", 7)) {
+      e->tagger = strndup(p + 7, linelen - 7);
+    }
+    p = nl + 1;
+  }
+
+  if (body && body < end) {
+    e->message = strndup(body, end - body);
+  }
+}
+
+struct tag_collect {
+  struct tag_entry *entries;
+  int n, cap;
+};
+
+static int tag_ref_cb(const char *refname, const git_oid *oid,
+                      const char *symref, void *data) {
+  (void)symref;
+  struct tag_collect *tc = data;
+  if (!oid) return 0;
+
+  if (tc->n >= tc->cap) {
+    tc->cap = tc->cap ? tc->cap * 2 : 16;
+    tc->entries = realloc(tc->entries, tc->cap * sizeof(struct tag_entry));
+  }
+
+  struct tag_entry *e = &tc->entries[tc->n];
+  memset(e, 0, sizeof(*e));
+
+  /* Strip refs/tags/ prefix for name */
+  if (!strncmp(refname, "refs/tags/", 10))
+    e->name = strdup(refname + 10);
+  else
+    e->name = strdup(refname);
+
+  git_oid_tostr(e->oid_hex, sizeof(e->oid_hex), oid);
+
+  /* Try to read the object to see if it's an annotated tag */
+  extern int storage_read_object(const git_oid *oid, git_object_t *out_type,
+    size_t *out_size, unsigned char **out_data);
+  git_object_t type; size_t size; unsigned char *obj_data;
+  if (storage_read_object(oid, &type, &size, &obj_data) == 0) {
+    if (type == GIT_OBJECT_TAG) {
+      /* Annotated tag: parse the tag object */
+      parse_tag_object(obj_data, size, e);
+    } else {
+      /* Lightweight tag: points directly to a commit/tree/blob */
+      snprintf(e->target_oid_hex, sizeof(e->target_oid_hex), "%s", e->oid_hex);
+      e->target_type = strdup(git_object_type2string(type));
+    }
+    free(obj_data);
+  }
+
+  tc->n++;
+  return 0;
+}
+
+static int git_tag_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
+                          int argc, sqlite3_value **argv) {
+  (void)idxNum; (void)idxStr;
+  git_tag_cursor *cur = (git_tag_cursor *)pCursor;
+  free_tag_entries(cur->entries, cur->n);
+  cur->entries = NULL;
+  cur->n = 0;
+  cur->idx = 0;
+
+  extern int storage_ref_list(const char *prefix, int (*)(const char *, const git_oid *,
+    const char *, void *), void *);
+
+  struct tag_collect tc = {NULL, 0, 0};
+  storage_ref_list("refs/tags/", tag_ref_cb, &tc);
+
+  cur->entries = tc.entries;
+  cur->n = tc.n;
+  return SQLITE_OK;
+}
+
+static int git_tag_next(sqlite3_vtab_cursor *pCursor) {
+  ((git_tag_cursor *)pCursor)->idx++;
+  return SQLITE_OK;
+}
+
+static int git_tag_eof(sqlite3_vtab_cursor *pCursor) {
+  git_tag_cursor *cur = (git_tag_cursor *)pCursor;
+  return cur->idx >= cur->n;
+}
+
+static int git_tag_column(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx, int col) {
+  git_tag_cursor *cur = (git_tag_cursor *)pCursor;
+  struct tag_entry *e = &cur->entries[cur->idx];
+  switch (col) {
+    case 0: sqlite3_result_text(ctx, e->name, -1, SQLITE_TRANSIENT); break;
+    case 1: sqlite3_result_text(ctx, e->oid_hex, -1, SQLITE_TRANSIENT); break;
+    case 2:
+      if (e->target_oid_hex[0])
+        sqlite3_result_text(ctx, e->target_oid_hex, -1, SQLITE_TRANSIENT);
+      else
+        sqlite3_result_null(ctx);
+      break;
+    case 3:
+      if (e->target_type)
+        sqlite3_result_text(ctx, e->target_type, -1, SQLITE_TRANSIENT);
+      else
+        sqlite3_result_null(ctx);
+      break;
+    case 4:
+      if (e->tagger)
+        sqlite3_result_text(ctx, e->tagger, -1, SQLITE_TRANSIENT);
+      else
+        sqlite3_result_null(ctx);
+      break;
+    case 5:
+      if (e->message)
+        sqlite3_result_text(ctx, e->message, -1, SQLITE_TRANSIENT);
+      else
+        sqlite3_result_null(ctx);
+      break;
+    default: sqlite3_result_null(ctx);
+  }
+  return SQLITE_OK;
+}
+
+static int git_tag_rowid(sqlite3_vtab_cursor *pCursor, sqlite3_int64 *pRowid) {
+  *pRowid = (sqlite3_int64)((git_tag_cursor *)pCursor)->idx;
+  return SQLITE_OK;
+}
+
+static int git_tag_bestindex(sqlite3_vtab *pVtab, sqlite3_index_info *pInfo) {
+  (void)pVtab;
+  int argIdx = 0;
+  for (int i = 0; i < pInfo->nConstraint; i++) {
+    if (!pInfo->aConstraint[i].usable) continue;
+    if (pInfo->aConstraint[i].op != SQLITE_INDEX_CONSTRAINT_EQ) continue;
+    int col = pInfo->aConstraint[i].iColumn;
+    if (col == 6 || col == 7) { /* repo, pattern */
+      pInfo->aConstraintUsage[i].argvIndex = ++argIdx;
+      pInfo->aConstraintUsage[i].omit = 1;
+    }
+  }
+  pInfo->estimatedCost = 100;
+  return SQLITE_OK;
+}
+
+static sqlite3_module git_tag_module = {
+  .xConnect = git_tag_connect,
+  .xBestIndex = git_tag_bestindex,
+  .xDisconnect = git_log_disconnect,
+  .xOpen = git_tag_open,
+  .xClose = git_tag_close,
+  .xFilter = git_tag_filter,
+  .xNext = git_tag_next,
+  .xEof = git_tag_eof,
+  .xColumn = git_tag_column,
+  .xRowid = git_tag_rowid,
+};
+
+/*
+** ========================================================
+** git0_generation(oid) scalar function
+** Queries commit_graph for generation number.
+** ========================================================
+*/
+
+static void fn_git0_generation(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc;
+  const char *hex = (const char *)sqlite3_value_text(argv[0]);
+  if (!hex) { sqlite3_result_null(ctx); return; }
+  git_oid oid;
+  if (git_oid_fromstr(&oid, hex) < 0) { sqlite3_result_null(ctx); return; }
+
+  extern int storage_commit_generation(const git_oid *oid);
+  int gen = storage_commit_generation(&oid);
+  if (gen < 0)
+    sqlite3_result_null(ctx);
+  else
+    sqlite3_result_int(ctx, gen);
+}
+
+/*
+** ========================================================
 ** Register all TVFs
 ** ========================================================
 */
@@ -1544,5 +1961,9 @@ int git0_register_vtabs(sqlite3 *db) {
   sqlite3_create_module(db, "git_status", &git_stat_module, 0);
   sqlite3_create_module(db, "git_blame", &git_bl_module, 0);
   sqlite3_create_module(db, "git_attr", &git_attr_module, 0);
+  sqlite3_create_module(db, "git_stash", &git_stash_module, 0);
+  sqlite3_create_module(db, "git_tag", &git_tag_module, 0);
+  sqlite3_create_function(db, "git0_generation", 1, SQLITE_UTF8, 0,
+                          fn_git0_generation, 0, 0);
   return SQLITE_OK;
 }

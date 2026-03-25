@@ -18,7 +18,11 @@ static void cmd_capabilities(void) {
 	       "reflog-read\nreflog-read-reverse\nreflog-append\n"
 	       "reflog-exists\nreflog-delete\nreflog-list\n"
 	       "refresh\nkept\npromisor\nconnectivity-check\nconvert-oid\n"
-	       "write-packfile\ngc\nrepack\n\n");
+	       "write-packfile\ngc\nrepack\n"
+	       "promise\npromisor-remote-add\npromisor-remote-remove\nfetch-object\n"
+	       "build-commit-graph\n"
+	       "worktree-add\nworktree-remove\nworktree-list\n"
+	       "alternate-add\nalternate-remove\nalternate-list\n\n");
 	fflush(stdout);
 }
 
@@ -357,6 +361,125 @@ static void cmd_put_stream(const char *args) {
 	printf("%s\n", hex); fflush(stdout);
 }
 
+/* ---- Feature 3: Partial clone commands ---- */
+
+static void cmd_promise(const char *args) {
+	char hex[GIT_OID_SHA1_HEXSIZE + 1], remote[4096];
+	if (sscanf(args, "%40s %4095s", hex, remote) != 2) {
+		printf("error bad arguments\n"); fflush(stdout); return;
+	}
+	git_oid oid;
+	if (git_oid_fromstr(&oid, hex) != 0) {
+		printf("error bad oid\n"); fflush(stdout); return;
+	}
+	storage_promise_object(&oid, remote);
+	printf("ok\n"); fflush(stdout);
+}
+
+static void cmd_promisor_remote_add(const char *args) {
+	char name[4096], url[4096];
+	if (sscanf(args, "%4095s %4095s", name, url) != 2) {
+		printf("error bad arguments\n"); fflush(stdout); return;
+	}
+	storage_add_promisor_remote(name, url);
+	printf("ok\n"); fflush(stdout);
+}
+
+static void cmd_promisor_remote_remove(const char *args) {
+	char name[4096];
+	if (sscanf(args, "%4095s", name) != 1) {
+		printf("error bad arguments\n"); fflush(stdout); return;
+	}
+	storage_remove_promisor_remote(name);
+	printf("ok\n"); fflush(stdout);
+}
+
+static void cmd_fetch_object(const char *hex) {
+	git_oid oid;
+	if (git_oid_fromstr(&oid, hex) != 0) {
+		printf("error bad oid\n"); fflush(stdout); return;
+	}
+	if (storage_fetch_promised(&oid) == 0)
+		printf("ok\n");
+	else
+		printf("error\n");
+	fflush(stdout);
+}
+
+/* ---- Feature 4: Commit graph commands ---- */
+
+static void cmd_build_commit_graph(void) {
+	int count = storage_build_commit_graph();
+	if (count >= 0)
+		printf("ok %d\n", count);
+	else
+		printf("error\n");
+	fflush(stdout);
+}
+
+/* ---- Feature 6: Worktree commands ---- */
+
+static void cmd_worktree_add(const char *args) {
+	char name[4096], path[4096], branch[4096];
+	if (sscanf(args, "%4095s %4095s %4095s", name, path, branch) != 3) {
+		printf("error bad arguments\n"); fflush(stdout); return;
+	}
+	storage_worktree_add(name, path, branch);
+	printf("ok\n"); fflush(stdout);
+}
+
+static void cmd_worktree_remove(const char *args) {
+	char name[4096];
+	if (sscanf(args, "%4095s", name) != 1) {
+		printf("error bad arguments\n"); fflush(stdout); return;
+	}
+	storage_worktree_remove(name);
+	printf("ok\n"); fflush(stdout);
+}
+
+static int print_worktree(const char *name, const char *path,
+			  const char *head_ref, void *data) {
+	(void)data;
+	printf("%s %s %s\n", name, path, head_ref);
+	return 0;
+}
+
+static void cmd_worktree_list(void) {
+	storage_worktree_list(print_worktree, NULL);
+	printf("\n"); fflush(stdout);
+}
+
+/* ---- Feature 7: Alternate commands ---- */
+
+static void cmd_alternate_add(const char *args) {
+	char path[4096];
+	if (sscanf(args, "%4095s", path) != 1) {
+		printf("error bad arguments\n"); fflush(stdout); return;
+	}
+	storage_alternate_add(path);
+	printf("ok\n"); fflush(stdout);
+}
+
+static void cmd_alternate_remove(const char *args) {
+	char path[4096];
+	if (sscanf(args, "%4095s", path) != 1) {
+		printf("error bad arguments\n"); fflush(stdout); return;
+	}
+	storage_alternate_remove(path);
+	printf("ok\n"); fflush(stdout);
+}
+
+static int print_alternate(const char *path, void *data) {
+	(void)data;
+	printf("%s\n", path);
+	return 0;
+}
+
+static void cmd_alternate_list(void) {
+	storage_alternate_list(print_alternate, NULL);
+	printf("\n"); fflush(stdout);
+}
+
 /* ---- Main loop ---- */
 
 int local_main(int argc, char **argv) {
@@ -429,6 +552,21 @@ int local_main(int argc, char **argv) {
 			else printf("error\n");
 			fflush(stdout);
 		}
+		/* Feature 3: Partial clone */
+		else if (!strncmp(line, "promise ", 8)) cmd_promise(line + 8);
+		else if (!strncmp(line, "promisor-remote-add ", 20)) cmd_promisor_remote_add(line + 20);
+		else if (!strncmp(line, "promisor-remote-remove ", 23)) cmd_promisor_remote_remove(line + 23);
+		else if (!strncmp(line, "fetch-object ", 13)) cmd_fetch_object(line + 13);
+		/* Feature 4: Commit graph */
+		else if (!strcmp(line, "build-commit-graph")) cmd_build_commit_graph();
+		/* Feature 6: Worktrees */
+		else if (!strncmp(line, "worktree-add ", 13)) cmd_worktree_add(line + 13);
+		else if (!strncmp(line, "worktree-remove ", 16)) cmd_worktree_remove(line + 16);
+		else if (!strcmp(line, "worktree-list")) cmd_worktree_list();
+		/* Feature 7: Alternates */
+		else if (!strncmp(line, "alternate-add ", 14)) cmd_alternate_add(line + 14);
+		else if (!strncmp(line, "alternate-remove ", 17)) cmd_alternate_remove(line + 17);
+		else if (!strcmp(line, "alternate-list")) cmd_alternate_list();
 		else if (!strcmp(line, "close")) break;
 	}
 

@@ -121,6 +121,32 @@ void storage_reflog_append(const char *refname, const git_oid *old_oid,
 			   const git_oid *new_oid, const char *committer,
 			   long long timestamp, int tz, const char *msg);
 
+/* Partial clone: promised objects and promisor remotes */
+void storage_promise_object(const git_oid *oid, const char *remote);
+int storage_is_promised(const git_oid *oid);
+int storage_fetch_promised(const git_oid *oid);
+void storage_add_promisor_remote(const char *name, const char *url);
+void storage_remove_promisor_remote(const char *name);
+
+/* Commit graph: generation numbers and commit timestamps */
+int storage_build_commit_graph(void);
+int storage_commit_generation(const git_oid *oid);
+
+/* Worktree support */
+void storage_worktree_add(const char *name, const char *path, const char *branch);
+void storage_worktree_remove(const char *name);
+
+typedef int (*storage_worktree_cb)(const char *name, const char *path,
+				   const char *head_ref, void *data);
+int storage_worktree_list(storage_worktree_cb cb, void *data);
+
+/* Alternates: borrow objects from other sqlite.db files */
+void storage_alternate_add(const char *path);
+void storage_alternate_remove(const char *path);
+
+typedef int (*storage_alternate_cb)(const char *path, void *data);
+int storage_alternate_list(storage_alternate_cb cb, void *data);
+
 /*
  * LFS content storage. OID is SHA-256 (32 bytes) per git-lfs spec.
  * Data is zlib compressed.
