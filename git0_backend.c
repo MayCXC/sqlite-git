@@ -94,9 +94,7 @@ static int storage_backend_foreach(git_odb_backend *_backend,
                                    git_odb_foreach_cb cb,
                                    void *payload) {
   (void)_backend;
-  /* Not implemented; returning 0 is acceptable (optional callback) */
-  (void)cb; (void)payload;
-  return 0;
+  return storage_obj_oids(cb, payload);
 }
 
 static void storage_backend_free(git_odb_backend *_backend) {

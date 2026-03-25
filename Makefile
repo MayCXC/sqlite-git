@@ -25,7 +25,7 @@ all: git0.$(EXT) git-sqlite git-lfs-sqlite-transfer
 git0.$(EXT): $(EXT_SRCS) git0.h storage.h git0_internal.h
 	$(CC) -shared $(CFLAGS) -I. -o $@ $(EXT_SRCS) $(LDFLAGS) -lz
 
-git-sqlite: git-sqlite.c git-local-sqlite.c git-remote-sqlite.c $(STORAGE)
+git-sqlite: git-sqlite.c git-local-sqlite.c git-remote-sqlite.c git0_backend.c $(STORAGE)
 	$(CC) $(CFLAGS) -DSQLITE_CORE -I. -o $@ $^ $(LDFLAGS) -lsqlite3 -lz
 
 git-local-sqlite: git-sqlite
@@ -34,7 +34,7 @@ git-local-sqlite: git-sqlite
 git-remote-sqlite: git-sqlite
 	ln -sf $< $@
 
-git-lfs-sqlite-transfer: git-lfs-sqlite-transfer.c $(STORAGE)
+git-lfs-sqlite-transfer: git-lfs-sqlite-transfer.c git0_backend.c $(STORAGE)
 	$(CC) $(CFLAGS) -DSQLITE_CORE -I. -o $@ $^ $(LDFLAGS) -lsqlite3 -lz
 
 install: git0.$(EXT) git-sqlite git-lfs-sqlite-transfer

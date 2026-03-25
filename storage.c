@@ -18,6 +18,7 @@
 #endif
 #include <git2.h>
 #include "storage.h"
+#include "git0_internal.h"
 #include "vendor/delta.h"
 #include "vendor/sha256.h"
 
@@ -31,6 +32,11 @@ static sqlite3_stmt *st_ref_read, *st_ref_write, *st_ref_delete, *st_ref_list;
 static sqlite3_stmt *st_reflog_read, *st_reflog_read_rev, *st_reflog_append;
 static sqlite3_stmt *st_reflog_exists, *st_reflog_delete, *st_reflog_list;
 static sqlite3_stmt *st_lfs_read, *st_lfs_write, *st_lfs_exists;
+static sqlite3_stmt *st_mark_kept, *st_clear_kept, *st_have_kept;
+static sqlite3_stmt *st_mark_promisor;
+static sqlite3_stmt *st_obj_oids;
+static sqlite3_stmt *st_obj_list_promisor, *st_obj_list_skip_kept;
+static int batch_kept = 0, batch_promisor = 0;
 
 /*
  * Statement lifecycle: in owned mode (helper binary), statements are
@@ -186,7 +192,9 @@ int storage_open_db(sqlite3 *db, int persistent) {
 		"CREATE TABLE IF NOT EXISTS objects("
 		"  oid BLOB PRIMARY KEY, type INTEGER NOT NULL,"
 		"  size INTEGER NOT NULL, data BLOB NOT NULL,"
-		"  base BLOB, path TEXT"
+		"  base BLOB, path TEXT,"
+		"  kept INTEGER NOT NULL DEFAULT 0,"
+		"  promisor INTEGER NOT NULL DEFAULT 0"
 		") WITHOUT ROWID;"
 		"CREATE TABLE IF NOT EXISTS refs("
 		"  refname TEXT PRIMARY KEY, oid BLOB, symref TEXT"
@@ -201,6 +209,11 @@ int storage_open_db(sqlite3 *db, int persistent) {
 		"  oid BLOB PRIMARY KEY,"
 		"  size INTEGER NOT NULL,"
 		"  data BLOB NOT NULL"
+		") WITHOUT ROWID;"
+		"CREATE TABLE IF NOT EXISTS oid_map("
+		"  src BLOB NOT NULL, dest BLOB NOT NULL,"
+		"  algo TEXT NOT NULL,"
+		"  PRIMARY KEY(src, algo)"
 		") WITHOUT ROWID;"
 		"CREATE INDEX IF NOT EXISTS idx_objects_type_base"
 		"  ON objects(type, size) WHERE base IS NULL;"
@@ -223,7 +236,9 @@ static int storage_init_db(sqlite3 *db) {
 		"CREATE TABLE IF NOT EXISTS objects("
 		"  oid BLOB PRIMARY KEY, type INTEGER NOT NULL,"
 		"  size INTEGER NOT NULL, data BLOB NOT NULL,"
-		"  base BLOB, path TEXT"
+		"  base BLOB, path TEXT,"
+		"  kept INTEGER NOT NULL DEFAULT 0,"
+		"  promisor INTEGER NOT NULL DEFAULT 0"
 		") WITHOUT ROWID;"
 		"CREATE TABLE IF NOT EXISTS refs("
 		"  refname TEXT PRIMARY KEY, oid BLOB, symref TEXT"
@@ -239,11 +254,22 @@ static int storage_init_db(sqlite3 *db) {
 		"  oid BLOB PRIMARY KEY,"
 		"  size INTEGER NOT NULL,"
 		"  data BLOB NOT NULL"
+		") WITHOUT ROWID;"
+		"CREATE TABLE IF NOT EXISTS oid_map("
+		"  src BLOB NOT NULL, dest BLOB NOT NULL,"
+		"  algo TEXT NOT NULL,"
+		"  PRIMARY KEY(src, algo)"
 		") WITHOUT ROWID;",
 		0, 0, 0);
 
+	/* Migrate existing databases: add kept and promisor columns */
+	sqlite3_exec(db,
+		"ALTER TABLE objects ADD COLUMN kept INTEGER NOT NULL DEFAULT 0;"
+		"ALTER TABLE objects ADD COLUMN promisor INTEGER NOT NULL DEFAULT 0;",
+		0, 0, 0);
+
 	sqlite3_prepare_v3(db, "SELECT type, size, data, base FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_read, 0);
-	sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO objects(oid, type, size, data, base, path) VALUES(?,?,?,?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_write, 0);
+	sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO objects(oid, type, size, data, base, path, kept, promisor) VALUES(?,?,?,?,?,?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_write, 0);
 	sqlite3_prepare_v3(db, "SELECT 1 FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_exists, 0);
 	sqlite3_prepare_v3(db, "SELECT oid, type, size FROM objects",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_list, 0);
 	sqlite3_prepare_v3(db, "SELECT oid, size, data, base FROM objects WHERE type = ? AND base IS NULL ORDER BY ABS(size - ?) LIMIT 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_find_base, 0);
@@ -262,6 +288,14 @@ static int storage_init_db(sqlite3 *db) {
 	sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO lfs(oid, size, data) VALUES(?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_lfs_write, 0);
 	sqlite3_prepare_v3(db, "SELECT 1 FROM lfs WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_lfs_exists, 0);
 
+	sqlite3_prepare_v3(db, "UPDATE objects SET kept = 1 WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_mark_kept, 0);
+	sqlite3_prepare_v3(db, "UPDATE objects SET kept = 0 WHERE kept = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_clear_kept, 0);
+	sqlite3_prepare_v3(db, "SELECT 1 FROM objects WHERE oid = ? AND kept = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_have_kept, 0);
+	sqlite3_prepare_v3(db, "UPDATE objects SET promisor = 1 WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_mark_promisor, 0);
+	sqlite3_prepare_v3(db, "SELECT oid, type, size FROM objects WHERE promisor = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_list_promisor, 0);
+	sqlite3_prepare_v3(db, "SELECT oid, type, size FROM objects WHERE kept = 0",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_list_skip_kept, 0);
+	sqlite3_prepare_v3(db, "SELECT oid FROM objects",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_oids, 0);
+
 	return 0;
 }
 
@@ -276,11 +310,169 @@ void storage_close(void) {
 	sqlite3_finalize(st_reflog_exists); sqlite3_finalize(st_reflog_delete);
 	sqlite3_finalize(st_lfs_read); sqlite3_finalize(st_lfs_write);
 	sqlite3_finalize(st_lfs_exists);
+	sqlite3_finalize(st_mark_kept); sqlite3_finalize(st_clear_kept);
+	sqlite3_finalize(st_have_kept); sqlite3_finalize(st_mark_promisor);
+	sqlite3_finalize(st_obj_list_promisor); sqlite3_finalize(st_obj_list_skip_kept);
+	sqlite3_finalize(st_obj_oids);
+	batch_kept = 0; batch_promisor = 0;
 	if (sdb_owned) sqlite3_close(sdb);
 	sdb = NULL;
 }
 
 sqlite3 *storage_db(void) { return sdb; }
+
+void storage_refresh(void) {
+	if (sdb)
+		sqlite3_wal_checkpoint_v2(sdb, NULL,
+					  SQLITE_CHECKPOINT_PASSIVE,
+					  NULL, NULL);
+}
+
+void storage_mark_kept(const git_oid *oid) {
+	sqlite3_bind_blob(st_mark_kept, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	sqlite3_step(st_mark_kept);
+	sqlite3_reset(st_mark_kept);
+}
+
+void storage_mark_kept_recent(void) { batch_kept = 1; }
+void storage_end_kept_batch(void) { batch_kept = 0; }
+
+void storage_mark_promisor_recent(void) { batch_promisor = 1; }
+void storage_end_promisor_batch(void) { batch_promisor = 0; }
+
+void storage_clear_kept(void) {
+	sqlite3_step(st_clear_kept);
+	sqlite3_reset(st_clear_kept);
+	batch_kept = 0;
+}
+
+int storage_have_kept(const git_oid *oid) {
+	int found;
+	sqlite3_bind_blob(st_have_kept, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	found = (sqlite3_step(st_have_kept) == SQLITE_ROW);
+	sqlite3_reset(st_have_kept);
+	return found;
+}
+
+void storage_mark_promisor(const git_oid *oid) {
+	sqlite3_bind_blob(st_mark_promisor, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	sqlite3_step(st_mark_promisor);
+	sqlite3_reset(st_mark_promisor);
+}
+
+int storage_obj_oids(git_odb_foreach_cb cb, void *data) {
+	sqlite3_stmt *st = stmt_acquire(st_obj_oids, "SELECT oid FROM objects");
+	while (sqlite3_step(st) == SQLITE_ROW) {
+		git_oid oid;
+		memcpy(oid.id, sqlite3_column_blob(st, 0), GIT_OID_SHA1_SIZE);
+		if (cb(&oid, data)) { stmt_release(st_obj_oids, st); return -1; }
+	}
+	stmt_release(st_obj_oids, st);
+	return 0;
+}
+
+int storage_obj_list_filtered(int promisor_only, int skip_kept,
+			      storage_obj_cb cb, void *data) {
+	sqlite3_stmt *st = promisor_only ? st_obj_list_promisor :
+			   skip_kept ? st_obj_list_skip_kept :
+			   st_obj_list;
+	while (sqlite3_step(st) == SQLITE_ROW) {
+		git_oid oid;
+		memcpy(oid.id, sqlite3_column_blob(st, 0), GIT_OID_SHA1_SIZE);
+		git_object_t type = (git_object_t)sqlite3_column_int(st, 1);
+		size_t size = (size_t)sqlite3_column_int64(st, 2);
+		if (cb(&oid, type, size, data)) {
+			sqlite3_reset(st);
+			return -1;
+		}
+	}
+	sqlite3_reset(st);
+	return 0;
+}
+
+int storage_convert_oid(const git_oid *src, const char *algo,
+		       git_oid *dest) {
+	sqlite3_stmt *st;
+	int found = 0;
+	sqlite3_prepare_v2(sdb,
+		"SELECT dest FROM oid_map WHERE src = ? AND algo = ?",
+		-1, &st, 0);
+	sqlite3_bind_blob(st, 1, src->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	sqlite3_bind_text(st, 2, algo, -1, SQLITE_STATIC);
+	if (sqlite3_step(st) == SQLITE_ROW) {
+		memcpy(dest->id, sqlite3_column_blob(st, 0),
+		       GIT_OID_SHA1_SIZE);
+		found = 1;
+	}
+	sqlite3_finalize(st);
+	return found ? 0 : -1;
+}
+
+void storage_store_oid_map(const git_oid *src, const git_oid *dest,
+			   const char *algo) {
+	sqlite3_stmt *st;
+	sqlite3_prepare_v2(sdb,
+		"INSERT OR REPLACE INTO oid_map(src, dest, algo) VALUES(?,?,?)",
+		-1, &st, 0);
+	sqlite3_bind_blob(st, 1, src->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	sqlite3_bind_blob(st, 2, dest->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	sqlite3_bind_text(st, 3, algo, -1, SQLITE_STATIC);
+	sqlite3_step(st);
+	sqlite3_finalize(st);
+}
+
+/*
+ * Verify connectivity of kept objects using the storage-backed
+ * libgit2 repo (git0_backend.c). Walk each kept commit via
+ * git_revwalk; if any referenced object is missing, the walk
+ * or object lookup fails.
+ */
+int storage_check_connectivity(void) {
+	git_repository *repo = git0_storage_repo();
+	git_revwalk *walk = NULL;
+	sqlite3_stmt *st;
+	int ret = 0;
+
+	if (!repo)
+		return -1;
+
+	if (git_revwalk_new(&walk, repo) < 0)
+		return -1;
+
+	/* Push all kept commits */
+	sqlite3_prepare_v2(sdb,
+		"SELECT oid FROM objects WHERE kept = 1 AND type = 1",
+		-1, &st, 0);
+	while (sqlite3_step(st) == SQLITE_ROW) {
+		git_oid oid;
+		memcpy(oid.id, sqlite3_column_blob(st, 0), GIT_OID_SHA1_SIZE);
+		git_revwalk_push(walk, &oid);
+	}
+	sqlite3_finalize(st);
+
+	/* Walk the graph; each commit's tree and parents are resolved.
+	 * If any referenced object is missing, the lookup returns an error. */
+	{
+		git_oid oid;
+		while (git_revwalk_next(&oid, walk) == 0) {
+			git_commit *commit = NULL;
+			git_tree *tree = NULL;
+
+			if (git_commit_lookup(&commit, repo, &oid) < 0) {
+				ret = -1; break;
+			}
+			if (git_commit_tree(&tree, commit) < 0) {
+				git_commit_free(commit);
+				ret = -1; break;
+			}
+			git_tree_free(tree);
+			git_commit_free(commit);
+		}
+	}
+
+	git_revwalk_free(walk);
+	return ret;
+}
 
 void storage_destroy(void) {
 	sqlite3_exec(sdb, "DROP TABLE IF EXISTS objects;"
@@ -402,7 +594,7 @@ void storage_write_object_named(const git_oid *oid, git_object_t type,
 		free(base_data);
 	}
 
-	st = stmt_acquire(st_obj_write, "INSERT OR IGNORE INTO objects(oid, type, size, data, base, path) VALUES(?,?,?,?,?,?)");
+	st = stmt_acquire(st_obj_write, "INSERT OR IGNORE INTO objects(oid, type, size, data, base, path, kept, promisor) VALUES(?,?,?,?,?,?,?,?)");
 	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	sqlite3_bind_int(st, 2, (int)type);
 	sqlite3_bind_int64(st, 3, (sqlite3_int64)size);
@@ -410,6 +602,8 @@ void storage_write_object_named(const git_oid *oid, git_object_t type,
 		sqlite3_bind_text(st, 6, path, -1, SQLITE_STATIC);
 	else
 		sqlite3_bind_null(st, 6);
+	sqlite3_bind_int(st, 7, batch_kept);
+	sqlite3_bind_int(st, 8, batch_promisor);
 
 	if (use_delta) {
 		sqlite3_bind_blob(st, 4, delta_buf, delta_len, SQLITE_STATIC);
@@ -601,6 +795,380 @@ void storage_reflog_append(const char *refname, const git_oid *old_oid,
 	sqlite3_bind_text(st, 8, msg ? msg : "", -1, SQLITE_STATIC);
 	sqlite3_step(st);
 	stmt_release(st_reflog_append, st);
+}
+
+/* ---- Git delta apply ---- */
+
+/*
+ * Apply a git-format delta (as found in packfiles) to a base buffer.
+ * This is distinct from the Fossil delta format used for storage.
+ *
+ * Git delta format:
+ *   - Source size as varint
+ *   - Target size as varint
+ *   - Instructions until end of delta:
+ *     - 0x00 is reserved (invalid)
+ *     - High bit clear (1..127): insert N literal bytes that follow
+ *     - High bit set: copy from base. Bits 0-3 select offset bytes (LE),
+ *       bits 4-6 select size bytes (LE). Size=0 means 0x10000.
+ *
+ * Returns 0 on success, -1 on error. Caller must free *out.
+ */
+static int git_delta_apply(const unsigned char *base, size_t base_len,
+			   const unsigned char *delta, size_t delta_len,
+			   unsigned char **out, size_t *out_len)
+{
+	const unsigned char *dp = delta;
+	const unsigned char *dend = delta + delta_len;
+
+	/* Read source size varint */
+	size_t src_size = 0;
+	unsigned shift = 0;
+	while (dp < dend) {
+		unsigned char c = *dp++;
+		src_size |= (size_t)(c & 0x7f) << shift;
+		shift += 7;
+		if (!(c & 0x80)) break;
+	}
+	if (src_size != base_len) return -1;
+
+	/* Read target size varint */
+	size_t tgt_size = 0;
+	shift = 0;
+	while (dp < dend) {
+		unsigned char c = *dp++;
+		tgt_size |= (size_t)(c & 0x7f) << shift;
+		shift += 7;
+		if (!(c & 0x80)) break;
+	}
+
+	unsigned char *buf = malloc(tgt_size);
+	if (!buf) return -1;
+	size_t pos = 0;
+
+	while (dp < dend) {
+		unsigned char cmd = *dp++;
+		if (cmd & 0x80) {
+			/* Copy from base */
+			size_t cp_off = 0, cp_size = 0;
+			if (cmd & 0x01) { if (dp >= dend) goto fail; cp_off  = *dp++; }
+			if (cmd & 0x02) { if (dp >= dend) goto fail; cp_off |= (size_t)*dp++ << 8; }
+			if (cmd & 0x04) { if (dp >= dend) goto fail; cp_off |= (size_t)*dp++ << 16; }
+			if (cmd & 0x08) { if (dp >= dend) goto fail; cp_off |= (size_t)*dp++ << 24; }
+			if (cmd & 0x10) { if (dp >= dend) goto fail; cp_size  = *dp++; }
+			if (cmd & 0x20) { if (dp >= dend) goto fail; cp_size |= (size_t)*dp++ << 8; }
+			if (cmd & 0x40) { if (dp >= dend) goto fail; cp_size |= (size_t)*dp++ << 16; }
+			if (cp_size == 0) cp_size = 0x10000;
+			if (cp_off + cp_size > base_len) goto fail;
+			if (pos + cp_size > tgt_size) goto fail;
+			memcpy(buf + pos, base + cp_off, cp_size);
+			pos += cp_size;
+		} else if (cmd) {
+			/* Insert literal bytes */
+			size_t n = cmd;
+			if (dp + n > dend) goto fail;
+			if (pos + n > tgt_size) goto fail;
+			memcpy(buf + pos, dp, n);
+			dp += n;
+			pos += n;
+		} else {
+			/* cmd == 0 is reserved */
+			goto fail;
+		}
+	}
+
+	if (pos != tgt_size) goto fail;
+
+	*out = buf;
+	*out_len = tgt_size;
+	return 0;
+
+fail:
+	free(buf);
+	return -1;
+}
+
+/* ---- Packfile ingestion ---- */
+
+/*
+ * Inflate zlib-compressed data from a FILE stream.
+ * Returns the decompressed buffer (caller frees).
+ * *bytes_consumed is set to the number of compressed bytes read from in.
+ */
+static unsigned char *inflate_from_stream(FILE *in, size_t expected_size,
+					  size_t *bytes_consumed)
+{
+	z_stream zs;
+	memset(&zs, 0, sizeof(zs));
+	if (inflateInit(&zs) != Z_OK) return NULL;
+
+	unsigned char *out = malloc(expected_size ? expected_size : 1);
+	if (!out) { inflateEnd(&zs); return NULL; }
+
+	zs.next_out = out;
+	zs.avail_out = (uInt)expected_size;
+
+	unsigned char inbuf[8192];
+	size_t total_in = 0;
+	int ret = Z_OK;
+
+	while (ret != Z_STREAM_END) {
+		if (zs.avail_in == 0) {
+			size_t n = fread(inbuf, 1, sizeof(inbuf), in);
+			if (n == 0) { free(out); inflateEnd(&zs); return NULL; }
+			zs.next_in = inbuf;
+			zs.avail_in = (uInt)n;
+		}
+		ret = inflate(&zs, Z_NO_FLUSH);
+		if (ret != Z_OK && ret != Z_STREAM_END) {
+			free(out);
+			inflateEnd(&zs);
+			return NULL;
+		}
+	}
+
+	/*
+	 * zlib may have consumed more bytes from inbuf than it needed.
+	 * The leftover (avail_in) bytes must be pushed back so subsequent
+	 * reads from the FILE stream see them. Use ungetc in reverse order.
+	 */
+	if (zs.avail_in > 0) {
+		/* Push back unconsumed bytes in reverse order */
+		for (int i = (int)zs.avail_in - 1; i >= 0; i--)
+			ungetc(zs.next_in[i], in);
+	}
+
+	total_in = zs.total_in;
+	inflateEnd(&zs);
+
+	if (bytes_consumed) *bytes_consumed = total_in;
+	return out;
+}
+
+/*
+ * Read exactly n bytes from the pack stream via fread.
+ * Returns 0 on success, -1 on short read.
+ */
+static int pack_read_exact(FILE *in, void *buf, size_t n, size_t *offset)
+{
+	size_t got = fread(buf, 1, n, in);
+	if (got != n) return -1;
+	if (offset) *offset += n;
+	return 0;
+}
+
+/* Packfile object types */
+#define PACK_OBJ_COMMIT    1
+#define PACK_OBJ_TREE      2
+#define PACK_OBJ_BLOB      3
+#define PACK_OBJ_TAG       4
+#define PACK_OBJ_OFS_DELTA 6
+#define PACK_OBJ_REF_DELTA 7
+
+static git_object_t pack_type_to_git(int ptype) {
+	switch (ptype) {
+	case PACK_OBJ_COMMIT: return GIT_OBJECT_COMMIT;
+	case PACK_OBJ_TREE:   return GIT_OBJECT_TREE;
+	case PACK_OBJ_BLOB:   return GIT_OBJECT_BLOB;
+	case PACK_OBJ_TAG:    return GIT_OBJECT_TAG;
+	default:              return GIT_OBJECT_INVALID;
+	}
+}
+
+int storage_write_packfile(FILE *in)
+{
+	/* 1. Read 12-byte header */
+	unsigned char hdr[12];
+	size_t stream_offset = 0;
+	if (pack_read_exact(in, hdr, 12, NULL) < 0) return -1;
+
+	/* Verify PACK magic */
+	if (hdr[0] != 'P' || hdr[1] != 'A' || hdr[2] != 'C' || hdr[3] != 'K')
+		return -1;
+
+	/* Version (network byte order) */
+	uint32_t version = ((uint32_t)hdr[4] << 24) | ((uint32_t)hdr[5] << 16) |
+			   ((uint32_t)hdr[6] << 8)  | (uint32_t)hdr[7];
+	if (version != 2 && version != 3) return -1;
+
+	/* Object count (network byte order) */
+	uint32_t obj_count = ((uint32_t)hdr[8] << 24) | ((uint32_t)hdr[9] << 16) |
+			     ((uint32_t)hdr[10] << 8) | (uint32_t)hdr[11];
+
+	/* 2. Allocate offset-to-OID mapping */
+	typedef struct { size_t offset; git_oid oid; } ofs_entry;
+	size_t ofs_cap = obj_count ? obj_count : 1;
+	ofs_entry *ofs_map = calloc(ofs_cap, sizeof(ofs_entry));
+	if (!ofs_map) return -1;
+
+	int written = 0;
+
+	/* 3. Process each object */
+	for (uint32_t i = 0; i < obj_count; i++) {
+		size_t obj_offset = stream_offset;
+
+		/* Read type+size varint */
+		int c = fgetc(in);
+		if (c == EOF) goto err;
+		stream_offset++;
+
+		int ptype = (c >> 4) & 7;
+		size_t size = c & 0x0f;
+		unsigned shift = 4;
+		while (c & 0x80) {
+			c = fgetc(in);
+			if (c == EOF) goto err;
+			stream_offset++;
+			size |= (size_t)(c & 0x7f) << shift;
+			shift += 7;
+		}
+
+		if (ptype == PACK_OBJ_COMMIT || ptype == PACK_OBJ_TREE ||
+		    ptype == PACK_OBJ_BLOB   || ptype == PACK_OBJ_TAG) {
+			/* Non-delta object: inflate, hash, store */
+			size_t consumed = 0;
+			unsigned char *data = inflate_from_stream(in, size, &consumed);
+			if (!data) goto err;
+			stream_offset += consumed;
+
+			git_object_t gtype = pack_type_to_git(ptype);
+			git_oid oid;
+			git_odb_hash(&oid, data, size, gtype);
+			storage_write_object(&oid, gtype, data, size);
+			free(data);
+
+			ofs_map[i].offset = obj_offset;
+			memcpy(&ofs_map[i].oid, &oid, sizeof(git_oid));
+			written++;
+
+		} else if (ptype == PACK_OBJ_OFS_DELTA) {
+			/* OFS_DELTA: read negative offset, then delta */
+			c = fgetc(in);
+			if (c == EOF) goto err;
+			stream_offset++;
+			size_t base_offset = c & 127;
+			while (c & 128) {
+				base_offset += 1;
+				c = fgetc(in);
+				if (c == EOF) goto err;
+				stream_offset++;
+				base_offset = (base_offset << 7) + (c & 127);
+			}
+			size_t abs_base_offset = obj_offset - base_offset;
+
+			/* Find base OID in offset map */
+			git_oid base_oid;
+			int found = 0;
+			for (uint32_t j = 0; j < i; j++) {
+				if (ofs_map[j].offset == abs_base_offset) {
+					memcpy(&base_oid, &ofs_map[j].oid, sizeof(git_oid));
+					found = 1;
+					break;
+				}
+			}
+			if (!found) goto err;
+
+			/* Inflate delta */
+			size_t consumed = 0;
+			unsigned char *delta = inflate_from_stream(in, size, &consumed);
+			if (!delta) goto err;
+			stream_offset += consumed;
+
+			/* Read base object */
+			git_object_t base_type;
+			size_t base_size;
+			unsigned char *base_data;
+			if (storage_read_object(&base_oid, &base_type, &base_size, &base_data) < 0) {
+				free(delta);
+				goto err;
+			}
+
+			/* Apply git delta */
+			unsigned char *result;
+			size_t result_len;
+			if (git_delta_apply(base_data, base_size, delta, size,
+					    &result, &result_len) < 0) {
+				free(base_data);
+				free(delta);
+				goto err;
+			}
+
+			/* Hash and store */
+			git_oid oid;
+			git_odb_hash(&oid, result, result_len, base_type);
+			storage_write_object(&oid, base_type, result, result_len);
+
+			ofs_map[i].offset = obj_offset;
+			memcpy(&ofs_map[i].oid, &oid, sizeof(git_oid));
+			written++;
+
+			free(base_data);
+			free(delta);
+			free(result);
+
+		} else if (ptype == PACK_OBJ_REF_DELTA) {
+			/* REF_DELTA: read 20-byte base OID, then delta */
+			git_oid base_oid;
+			if (pack_read_exact(in, base_oid.id, GIT_OID_SHA1_SIZE, &stream_offset) < 0)
+				goto err;
+
+			/* Inflate delta */
+			size_t consumed = 0;
+			unsigned char *delta = inflate_from_stream(in, size, &consumed);
+			if (!delta) goto err;
+			stream_offset += consumed;
+
+			/* Read base object */
+			git_object_t base_type;
+			size_t base_size;
+			unsigned char *base_data;
+			if (storage_read_object(&base_oid, &base_type, &base_size, &base_data) < 0) {
+				free(delta);
+				goto err;
+			}
+
+			/* Apply git delta */
+			unsigned char *result;
+			size_t result_len;
+			if (git_delta_apply(base_data, base_size, delta, size,
+					    &result, &result_len) < 0) {
+				free(base_data);
+				free(delta);
+				goto err;
+			}
+
+			/* Hash and store */
+			git_oid oid;
+			git_odb_hash(&oid, result, result_len, base_type);
+			storage_write_object(&oid, base_type, result, result_len);
+
+			ofs_map[i].offset = obj_offset;
+			memcpy(&ofs_map[i].oid, &oid, sizeof(git_oid));
+			written++;
+
+			free(base_data);
+			free(delta);
+			free(result);
+
+		} else {
+			/* Unknown type */
+			goto err;
+		}
+	}
+
+	/* 4. Read trailing 20-byte pack checksum (skip verification) */
+	{
+		unsigned char checksum[20];
+		/* Best-effort read; do not fail if stream ends early */
+		fread(checksum, 1, 20, in);
+	}
+
+	free(ofs_map);
+	return written;
+
+err:
+	free(ofs_map);
+	return -1;
 }
 
 /* ---- LFS ---- */

@@ -16,7 +16,9 @@ static void cmd_capabilities(void) {
 	printf("get\ninfo\nput\nput-stream\nhave\nlist-objects\nodb-transaction\n"
 	       "read\nlist\ntransaction\ncreate\nremove\n"
 	       "reflog-read\nreflog-read-reverse\nreflog-append\n"
-	       "reflog-exists\nreflog-delete\nreflog-list\n\n");
+	       "reflog-exists\nreflog-delete\nreflog-list\n"
+	       "refresh\nkept\npromisor\nconnectivity-check\nconvert-oid\n"
+	       "write-packfile\n\n");
 	fflush(stdout);
 }
 
@@ -83,9 +85,55 @@ static int print_obj(const git_oid *oid, git_object_t type, size_t size, void *d
 	return 0;
 }
 
-static void cmd_list_objects(void) {
-	storage_obj_list(print_obj, NULL);
+static void cmd_list_objects(const char *flags) {
+	int promisor_only = flags && strstr(flags, "--promisor-only");
+	int skip_kept = flags && strstr(flags, "--skip-kept");
+	if (promisor_only || skip_kept)
+		storage_obj_list_filtered(promisor_only, skip_kept, print_obj, NULL);
+	else
+		storage_obj_list(print_obj, NULL);
 	printf("\n"); fflush(stdout);
+}
+
+static void cmd_mark_kept(const char *hex) {
+	git_oid oid;
+	if (git_oid_fromstr(&oid, hex) != 0) return;
+	storage_mark_kept(&oid);
+}
+
+static void cmd_clear_kept(void) {
+	storage_clear_kept();
+}
+
+static void cmd_have_kept(const char *hex) {
+	git_oid oid;
+	if (git_oid_fromstr(&oid, hex) != 0) { printf("false\n"); fflush(stdout); return; }
+	printf("%s\n", storage_have_kept(&oid) ? "true" : "false");
+	fflush(stdout);
+}
+
+static void cmd_convert_oid(const char *args) {
+	char hex[GIT_OID_SHA1_HEXSIZE + 1], algo[32];
+	git_oid src, dest;
+	if (sscanf(args, "%40s %31s", hex, algo) != 2 ||
+	    git_oid_fromstr(&src, hex) != 0) {
+		printf("missing\n"); fflush(stdout); return;
+	}
+	if (storage_convert_oid(&src, algo, &dest) == 0) {
+		char dest_hex[GIT_OID_SHA1_HEXSIZE + 1];
+		git_oid_fmt(dest_hex, &dest);
+		dest_hex[GIT_OID_SHA1_HEXSIZE] = 0;
+		printf("%s\n", dest_hex);
+	} else {
+		printf("missing\n");
+	}
+	fflush(stdout);
+}
+
+static void cmd_mark_promisor(const char *hex) {
+	git_oid oid;
+	if (git_oid_fromstr(&oid, hex) != 0) return;
+	storage_mark_promisor(&oid);
 }
 
 static void cmd_odb_transaction_begin(void) {
@@ -326,7 +374,8 @@ int local_main(int argc, char **argv) {
 		else if (!strncmp(line, "get ", 4)) cmd_get(line + 4);
 		else if (!strncmp(line, "put ", 4)) cmd_put(line + 4);
 		else if (!strncmp(line, "have ", 5)) cmd_have(line + 5);
-		else if (!strcmp(line, "list-objects")) cmd_list_objects();
+		else if (!strncmp(line, "list-objects", 12))
+			cmd_list_objects(line[12] == ' ' ? line + 13 : NULL);
 		else if (!strcmp(line, "odb-transaction-begin")) cmd_odb_transaction_begin();
 		else if (!strcmp(line, "odb-transaction-commit")) cmd_odb_transaction_commit();
 		else if (!strncmp(line, "read ", 5)) cmd_read(line + 5);
@@ -349,6 +398,26 @@ int local_main(int argc, char **argv) {
 		else if (!strncmp(line, "reflog-exists ", 14)) cmd_reflog_exists(line + 14);
 		else if (!strncmp(line, "reflog-delete ", 14)) cmd_reflog_delete(line + 14);
 		else if (!strcmp(line, "reflog-list")) cmd_reflog_list();
+		else if (!strcmp(line, "refresh")) { storage_clear_kept(); storage_refresh(); }
+		else if (!strncmp(line, "mark-kept ", 10)) cmd_mark_kept(line + 10);
+		else if (!strcmp(line, "mark-kept-recent")) storage_mark_kept_recent();
+		else if (!strcmp(line, "mark-promisor-recent")) storage_mark_promisor_recent();
+		else if (!strcmp(line, "clear-kept")) cmd_clear_kept();
+		else if (!strncmp(line, "have-kept ", 10)) cmd_have_kept(line + 10);
+		else if (!strncmp(line, "mark-promisor ", 14)) cmd_mark_promisor(line + 14);
+		else if (!strncmp(line, "convert-oid ", 12)) cmd_convert_oid(line + 12);
+		else if (!strcmp(line, "connectivity-check")) {
+			printf("%s\n", storage_check_connectivity() == 0 ? "ok" : "error");
+			fflush(stdout);
+		}
+		else if (!strcmp(line, "write-packfile")) {
+			storage_savepoint("write_packfile");
+			int n = storage_write_packfile(stdin);
+			if (n >= 0) { storage_release("write_packfile"); printf("ok %d\n", n); }
+			else { storage_rollback_to("write_packfile"); printf("error\n"); }
+			fflush(stdout);
+		}
+		else if (!strcmp(line, "close")) break;
 	}
 
 	storage_close();

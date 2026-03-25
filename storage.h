@@ -1,6 +1,8 @@
 #ifndef STORAGE_H
 #define STORAGE_H
 
+#include <stdio.h>
+
 #ifndef SQLITE_CORE
   #include "sqlite3ext.h"
 #else
@@ -23,6 +25,7 @@ int storage_open(const char *path_arg);
  */
 int storage_open_db(sqlite3 *db, int persistent);
 void storage_close(void);
+void storage_refresh(void);
 void storage_destroy(void);
 sqlite3 *storage_db(void);
 
@@ -66,6 +69,33 @@ int storage_ref_list(const char *prefix, storage_ref_cb cb, void *data);
 typedef int (*storage_obj_cb)(const git_oid *oid, git_object_t type,
 			      size_t size, void *data);
 int storage_obj_list(storage_obj_cb cb, void *data);
+
+/* OID-only iteration (no type/size overhead) */
+int storage_obj_oids(git_odb_foreach_cb cb, void *data);
+int storage_obj_list_filtered(int promisor_only, int skip_kept,
+			      storage_obj_cb cb, void *data);
+
+/* Kept/promisor object metadata */
+void storage_mark_kept(const git_oid *oid);
+void storage_mark_kept_recent(void);
+void storage_end_kept_batch(void);
+void storage_clear_kept(void);
+int storage_have_kept(const git_oid *oid);
+void storage_mark_promisor(const git_oid *oid);
+void storage_mark_promisor_recent(void);
+void storage_end_promisor_batch(void);
+
+/* OID mapping for hash algorithm migration */
+int storage_convert_oid(const git_oid *src, const char *algo,
+			git_oid *dest);
+void storage_store_oid_map(const git_oid *src, const git_oid *dest,
+			   const char *algo);
+
+/* Packfile ingestion: read a git packfile from stream, store all objects */
+int storage_write_packfile(FILE *in);
+
+/* Connectivity verification using libgit2 revwalk */
+int storage_check_connectivity(void);
 
 /* Reflog operations */
 int storage_reflog_exists(const char *refname);
