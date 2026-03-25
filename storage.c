@@ -27,6 +27,8 @@
  * 4095 matches pack-objects.h structural max (12-bit depth field). */
 #define MAX_DELTA_DEPTH 4095
 
+#include "vendor/name-hash.h"
+
 static sqlite3 *sdb;
 static int sdb_owned; /* 1 if we opened the db, 0 if borrowed */
 
@@ -147,6 +149,13 @@ static int safe_delta_apply(const char *src, size_t src_len,
 static int safe_delta_output_size(const char *delta, size_t delta_len) {
 	if (delta_len > INT_MAX) return -1;
 	return delta_output_size(delta, (int)delta_len);
+}
+
+/* SQL scalar function wrapping pack_name_hash from vendor/name-hash.h */
+static void sql_name_hash_fn(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+	(void)argc;
+	const char *name = (const char *)sqlite3_value_text(argv[0]);
+	sqlite3_result_int64(ctx, (sqlite3_int64)pack_name_hash(name));
 }
 
 /* ---- Delta base selection ---- */
@@ -394,6 +403,10 @@ static int storage_init_db(sqlite3 *db) {
 		"ALTER TABLE objects ADD COLUMN created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'));",
 		0, 0, 0);
 
+	/* Register git0_name_hash for repack sort order */
+	sqlite3_create_function(db, "git0_name_hash", 1, SQLITE_UTF8|SQLITE_DETERMINISTIC, 0,
+		sql_name_hash_fn, 0, 0);
+
 	sqlite3_prepare_v3(db, "SELECT type, size, data, base FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_read, 0);
 	sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO objects(oid, type, size, data, base, path, kept, promisor, reachable) VALUES(?,?,?,?,?,?,?,?,0)",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_write, 0);
 	sqlite3_prepare_v3(db, "SELECT 1 FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_exists, 0);
@@ -436,7 +449,7 @@ static int storage_init_db(sqlite3 *db) {
 	sqlite3_prepare_v3(db, "SELECT generation FROM commit_graph WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_commit_gen, 0);
 	sqlite3_prepare_v3(db, "SELECT path FROM alternates ORDER BY path",  -1, SQLITE_PREPARE_PERSISTENT, &st_alt_list, 0);
 	sqlite3_prepare_v3(db, "SELECT oid FROM objects WHERE kept = 1 AND type = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_connectivity_kept, 0);
-	sqlite3_prepare_v3(db, "SELECT oid, type, size, data, base, path FROM objects ORDER BY type, SUBSTR(path, LENGTH(path) - LENGTH(REPLACE(path, '/', '')) + 1), size",  -1, SQLITE_PREPARE_PERSISTENT, &st_repack_scan, 0);
+	sqlite3_prepare_v3(db, "SELECT oid, type, size, data, base, path FROM objects ORDER BY type, git0_name_hash(path), size",  -1, SQLITE_PREPARE_PERSISTENT, &st_repack_scan, 0);
 	sqlite3_prepare_v3(db, "UPDATE objects SET data = ?, base = ? WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_repack_update, 0);
 	sqlite3_prepare_v3(db, "SELECT 1 FROM promised WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_is_promised, 0);
 	sqlite3_prepare_v3(db, "SELECT p.remote, r.url FROM promised p JOIN promisor_remotes r ON p.remote = r.name WHERE p.oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_fetch_promised, 0);
@@ -445,7 +458,7 @@ static int storage_init_db(sqlite3 *db) {
 	sqlite3_prepare_v3(db, "UPDATE objects SET reachable = 1 WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_mark_reachable, 0);
 	sqlite3_prepare_v3(db, "SELECT 1 FROM objects WHERE oid = ? AND reachable = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_is_reachable, 0);
 	sqlite3_prepare_v3(db, "UPDATE objects SET reachable = 0 WHERE reachable = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_clear_reachable, 0);
-	sqlite3_prepare_v3(db, "DELETE FROM objects WHERE reachable = 0 AND kept = 0 AND promisor = 0 AND created_at < strftime('%s','now') - 1209600",  -1, SQLITE_PREPARE_PERSISTENT, &st_gc_sweep, 0);
+	sqlite3_prepare_v3(db, "DELETE FROM objects WHERE reachable = 0 AND kept = 0 AND promisor = 0 AND created_at < strftime('%s','now') - ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_gc_sweep, 0);
 
 	/* Load alternates from persisted table */
 	load_alternates();
@@ -792,11 +805,22 @@ int storage_gc(void) {
 	}
 	git_revwalk_free(walk);
 
-	/* Phase 2: Sweep unreachable objects (preserve kept and promisor) */
+	/* Phase 2: Sweep unreachable objects (preserve kept, promisor, and recent) */
 	{
+		/* Read gc.pruneExpire from config (seconds, default 1209600 = 2 weeks) */
+		int prune_expire = 1209600;
+		git_config *cfg = NULL;
+		if (git_repository_config(&cfg, repo) == 0) {
+			int val = 0;
+			if (git_config_get_int32(&val, cfg, "gc.pruneexpire") == 0 && val > 0)
+				prune_expire = val;
+			git_config_free(cfg);
+		}
+
 		sqlite3_stmt *st = stmt_acquire(st_gc_sweep,
 			"DELETE FROM objects WHERE reachable = 0 AND kept = 0 AND promisor = 0"
-			" AND created_at < strftime('%s','now') - 1209600");
+			" AND created_at < strftime('%s','now') - ?");
+		sqlite3_bind_int(st, 1, prune_expire);
 		sqlite3_step(st);
 		stmt_release(st_gc_sweep, st);
 	}
@@ -845,7 +869,7 @@ int storage_repack(void) {
 
 	sqlite3_stmt *st_scan = stmt_acquire(st_repack_scan,
 		"SELECT oid, type, size, data, base, path FROM objects"
-		" ORDER BY type, SUBSTR(path, LENGTH(path) - LENGTH(REPLACE(path, '/', '')) + 1), size");
+		" ORDER BY type, git0_name_hash(path), size");
 	sqlite3_stmt *st_update = stmt_acquire(st_repack_update,
 		"UPDATE objects SET data = ?, base = ? WHERE oid = ?");
 

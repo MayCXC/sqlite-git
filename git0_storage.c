@@ -262,6 +262,22 @@ static void fn_s_commit_parents(sqlite3_context *ctx, int argc, sqlite3_value **
   git_commit_free(c);
 }
 
+/* ---- Path utilities ---- */
+
+/*
+ * git0_name_hash(path): sortable hash from the path, weighted so trailing
+ * characters count most. Identical to git-core's pack_name_hash() from
+ * pack-objects.h. Files ending in ".c" sort together, same-name files
+ * across directories sort together.
+ */
+#include "vendor/name-hash.h"
+
+static void fn_s_name_hash(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc;
+  const char *name = (const char *)sqlite3_value_text(argv[0]);
+  sqlite3_result_int64(ctx, (sqlite3_int64)pack_name_hash(name));
+}
+
 /* ---- Registration ---- */
 
 int git0_register_storage(sqlite3 *db) {
@@ -280,5 +296,6 @@ int git0_register_storage(sqlite3 *db) {
   sqlite3_create_function(db, "git0_commit_author", 1, SQLITE_UTF8, 0, fn_s_commit_author, 0, 0);
   sqlite3_create_function(db, "git0_commit_parent", 2, SQLITE_UTF8, 0, fn_s_commit_parent, 0, 0);
   sqlite3_create_function(db, "git0_commit_parents", 1, SQLITE_UTF8, 0, fn_s_commit_parents, 0, 0);
+  sqlite3_create_function(db, "git0_name_hash", 1, SQLITE_UTF8|SQLITE_DETERMINISTIC, 0, fn_s_name_hash, 0, 0);
   return SQLITE_OK;
 }
