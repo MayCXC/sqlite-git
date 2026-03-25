@@ -52,6 +52,7 @@ static sqlite3_stmt *st_repack_scan, *st_repack_update;
 static sqlite3_stmt *st_is_promised, *st_fetch_promised;
 static sqlite3_stmt *st_worktree_list;
 static sqlite3_stmt *st_commit_graph_ins;
+static sqlite3_stmt *st_mark_reachable, *st_is_reachable, *st_clear_reachable, *st_gc_sweep;
 static int batch_kept = 0, batch_promisor = 0;
 
 /* Feature 7: Alternates linked list */
@@ -225,7 +226,8 @@ int storage_open_db(sqlite3 *db, int persistent) {
 		"  size INTEGER NOT NULL, data BLOB NOT NULL,"
 		"  base BLOB, path TEXT,"
 		"  kept INTEGER NOT NULL DEFAULT 0,"
-		"  promisor INTEGER NOT NULL DEFAULT 0"
+		"  promisor INTEGER NOT NULL DEFAULT 0,"
+		"  reachable INTEGER NOT NULL DEFAULT 0"
 		") WITHOUT ROWID;"
 		"CREATE TABLE IF NOT EXISTS refs("
 		"  refname TEXT PRIMARY KEY, oid BLOB, symref TEXT"
@@ -288,7 +290,8 @@ static int storage_init_db(sqlite3 *db) {
 		"  size INTEGER NOT NULL, data BLOB NOT NULL,"
 		"  base BLOB, path TEXT,"
 		"  kept INTEGER NOT NULL DEFAULT 0,"
-		"  promisor INTEGER NOT NULL DEFAULT 0"
+		"  promisor INTEGER NOT NULL DEFAULT 0,"
+		"  reachable INTEGER NOT NULL DEFAULT 0"
 		") WITHOUT ROWID;"
 		"CREATE TABLE IF NOT EXISTS refs("
 		"  refname TEXT PRIMARY KEY, oid BLOB, symref TEXT"
@@ -354,9 +357,12 @@ static int storage_init_db(sqlite3 *db) {
 	sqlite3_exec(db,
 		"ALTER TABLE objects ADD COLUMN promisor INTEGER NOT NULL DEFAULT 0;",
 		0, 0, 0);
+	sqlite3_exec(db,
+		"ALTER TABLE objects ADD COLUMN reachable INTEGER NOT NULL DEFAULT 0;",
+		0, 0, 0);
 
 	sqlite3_prepare_v3(db, "SELECT type, size, data, base FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_read, 0);
-	sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO objects(oid, type, size, data, base, path, kept, promisor) VALUES(?,?,?,?,?,?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_write, 0);
+	sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO objects(oid, type, size, data, base, path, kept, promisor, reachable) VALUES(?,?,?,?,?,?,?,?,0)",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_write, 0);
 	sqlite3_prepare_v3(db, "SELECT 1 FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_exists, 0);
 	sqlite3_prepare_v3(db, "SELECT oid, type, size FROM objects",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_list, 0);
 	sqlite3_prepare_v3(db, "SELECT oid, size, data, base FROM objects WHERE type = ? AND base IS NULL ORDER BY ABS(size - ?) LIMIT 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_find_base, 0);
@@ -403,6 +409,10 @@ static int storage_init_db(sqlite3 *db) {
 	sqlite3_prepare_v3(db, "SELECT p.remote, r.url FROM promised p JOIN promisor_remotes r ON p.remote = r.name WHERE p.oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_fetch_promised, 0);
 	sqlite3_prepare_v3(db, "SELECT name, path, head_ref FROM worktrees ORDER BY name",  -1, SQLITE_PREPARE_PERSISTENT, &st_worktree_list, 0);
 	sqlite3_prepare_v3(db, "INSERT OR REPLACE INTO commit_graph(oid, generation, commit_time) VALUES(?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_commit_graph_ins, 0);
+	sqlite3_prepare_v3(db, "UPDATE objects SET reachable = 1 WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_mark_reachable, 0);
+	sqlite3_prepare_v3(db, "SELECT 1 FROM objects WHERE oid = ? AND reachable = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_is_reachable, 0);
+	sqlite3_prepare_v3(db, "UPDATE objects SET reachable = 0 WHERE reachable = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_clear_reachable, 0);
+	sqlite3_prepare_v3(db, "DELETE FROM objects WHERE reachable = 0 AND kept = 0 AND promisor = 0",  -1, SQLITE_PREPARE_PERSISTENT, &st_gc_sweep, 0);
 
 	/* Load alternates from persisted table */
 	load_alternates();
@@ -438,6 +448,8 @@ void storage_close(void) {
 	sqlite3_finalize(st_is_promised); sqlite3_finalize(st_fetch_promised);
 	sqlite3_finalize(st_worktree_list);
 	sqlite3_finalize(st_commit_graph_ins);
+	sqlite3_finalize(st_mark_reachable); sqlite3_finalize(st_is_reachable);
+	sqlite3_finalize(st_clear_reachable); sqlite3_finalize(st_gc_sweep);
 	batch_kept = 0; batch_promisor = 0;
 	/* Close alternate connections */
 	while (alt_list) {
@@ -619,25 +631,27 @@ int storage_check_connectivity(void) {
 
 /* ---- GC: mark-sweep unreachable objects ---- */
 
-static int mark_reachable_oid(const git_oid *oid, sqlite3_stmt *st_insert) {
-	sqlite3_bind_blob(st_insert, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-	sqlite3_step(st_insert);
-	sqlite3_reset(st_insert);
-	return 0;
+static void mark_reachable(const git_oid *oid) {
+	sqlite3_stmt *st = stmt_acquire(st_mark_reachable,
+		"UPDATE objects SET reachable = 1 WHERE oid = ?");
+	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	sqlite3_step(st);
+	stmt_release(st_mark_reachable, st);
 }
 
-static int is_marked(const git_oid *oid, sqlite3_stmt *st_check) {
-	sqlite3_bind_blob(st_check, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-	int found = (sqlite3_step(st_check) == SQLITE_ROW);
-	sqlite3_reset(st_check);
+static int is_reachable(const git_oid *oid) {
+	sqlite3_stmt *st = stmt_acquire(st_is_reachable,
+		"SELECT 1 FROM objects WHERE oid = ? AND reachable = 1");
+	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	int found = (sqlite3_step(st) == SQLITE_ROW);
+	stmt_release(st_is_reachable, st);
 	return found;
 }
 
-static void mark_tree_reachable(git_repository *repo, const git_oid *tree_oid,
-				sqlite3_stmt *st_insert, sqlite3_stmt *st_check) {
-	if (is_marked(tree_oid, st_check))
+static void mark_tree_reachable(git_repository *repo, const git_oid *tree_oid) {
+	if (is_reachable(tree_oid))
 		return;
-	mark_reachable_oid(tree_oid, st_insert);
+	mark_reachable(tree_oid);
 
 	git_tree *tree = NULL;
 	if (git_tree_lookup(&tree, repo, tree_oid) < 0)
@@ -649,9 +663,9 @@ static void mark_tree_reachable(git_repository *repo, const git_oid *tree_oid,
 		const git_oid *entry_oid = git_tree_entry_id(entry);
 		git_object_t entry_type = git_tree_entry_type(entry);
 		if (entry_type == GIT_OBJECT_TREE) {
-			mark_tree_reachable(repo, entry_oid, st_insert, st_check);
+			mark_tree_reachable(repo, entry_oid);
 		} else {
-			mark_reachable_oid(entry_oid, st_insert);
+			mark_reachable(entry_oid);
 		}
 	}
 	git_tree_free(tree);
@@ -660,8 +674,6 @@ static void mark_tree_reachable(git_repository *repo, const git_oid *tree_oid,
 struct gc_ref_ctx {
 	git_repository *repo;
 	git_revwalk *walk;
-	sqlite3_stmt *st_insert;
-	sqlite3_stmt *st_check;
 };
 
 static int gc_ref_cb(const char *refname, const git_oid *oid,
@@ -670,7 +682,6 @@ static int gc_ref_cb(const char *refname, const git_oid *oid,
 	struct gc_ref_ctx *ctx = data;
 	git_oid resolved;
 
-	/* Resolve symrefs to their target OID */
 	if (symref && *symref) {
 		char sym2[4096];
 		if (storage_ref_read(symref, &resolved, sym2, sizeof(sym2)) < 0)
@@ -679,7 +690,6 @@ static int gc_ref_cb(const char *refname, const git_oid *oid,
 	}
 	if (!oid) return 0;
 
-	/* Check if it's a tag; if so, peel to the target */
 	git_object_t type;
 	size_t size;
 	unsigned char *obj_data;
@@ -688,7 +698,7 @@ static int gc_ref_cb(const char *refname, const git_oid *oid,
 	free(obj_data);
 
 	if (type == GIT_OBJECT_TAG) {
-		mark_reachable_oid(oid, ctx->st_insert);
+		mark_reachable(oid);
 		git_tag *tag = NULL;
 		if (git_tag_lookup(&tag, ctx->repo, oid) == 0) {
 			const git_oid *target_oid = git_tag_target_id(tag);
@@ -696,19 +706,18 @@ static int gc_ref_cb(const char *refname, const git_oid *oid,
 			if (target_type == GIT_OBJECT_COMMIT) {
 				git_revwalk_push(ctx->walk, target_oid);
 			} else if (target_type == GIT_OBJECT_TREE) {
-				mark_tree_reachable(ctx->repo, target_oid,
-						    ctx->st_insert, ctx->st_check);
+				mark_tree_reachable(ctx->repo, target_oid);
 			} else {
-				mark_reachable_oid(target_oid, ctx->st_insert);
+				mark_reachable(target_oid);
 			}
 			git_tag_free(tag);
 		}
 	} else if (type == GIT_OBJECT_COMMIT) {
 		git_revwalk_push(ctx->walk, oid);
 	} else if (type == GIT_OBJECT_TREE) {
-		mark_tree_reachable(ctx->repo, oid, ctx->st_insert, ctx->st_check);
+		mark_tree_reachable(ctx->repo, oid);
 	} else {
-		mark_reachable_oid(oid, ctx->st_insert);
+		mark_reachable(oid);
 	}
 
 	return 0;
@@ -720,50 +729,44 @@ int storage_gc(void) {
 
 	storage_savepoint("gc");
 
-	/* Phase 1: Mark reachable objects */
-	sqlite3_exec(sdb, "CREATE TEMP TABLE reachable(oid BLOB PRIMARY KEY) WITHOUT ROWID", 0, 0, 0);
-
-	sqlite3_stmt *st_insert = NULL, *st_check = NULL;
-	sqlite3_prepare_v3(sdb, "INSERT OR IGNORE INTO temp.reachable(oid) VALUES(?)", -1, SQLITE_PREPARE_PERSISTENT, &st_insert, 0);
-	sqlite3_prepare_v3(sdb, "SELECT 1 FROM temp.reachable WHERE oid = ?", -1, SQLITE_PREPARE_PERSISTENT, &st_check, 0);
+	/* Phase 1: Clear reachable marks and walk from refs */
+	{
+		sqlite3_stmt *st = stmt_acquire(st_clear_reachable,
+			"UPDATE objects SET reachable = 0 WHERE reachable = 1");
+		sqlite3_step(st);
+		stmt_release(st_clear_reachable, st);
+	}
 
 	git_revwalk *walk = NULL;
 	if (git_revwalk_new(&walk, repo) < 0) {
-		sqlite3_finalize(st_insert);
-		sqlite3_finalize(st_check);
-		sqlite3_exec(sdb, "DROP TABLE IF EXISTS temp.reachable", 0, 0, 0);
+		storage_rollback_to("gc");
 		return -1;
 	}
 
-	struct gc_ref_ctx ctx = { repo, walk, st_insert, st_check };
+	struct gc_ref_ctx ctx = { repo, walk };
 	storage_ref_list(NULL, gc_ref_cb, &ctx);
 
 	/* Walk all reachable commits, marking each commit and its tree */
 	git_oid oid;
 	while (git_revwalk_next(&oid, walk) == 0) {
-		mark_reachable_oid(&oid, st_insert);
+		mark_reachable(&oid);
 		git_commit *commit = NULL;
 		if (git_commit_lookup(&commit, repo, &oid) == 0) {
 			const git_oid *tree_oid = git_commit_tree_id(commit);
-			mark_tree_reachable(repo, tree_oid, st_insert, st_check);
+			mark_tree_reachable(repo, tree_oid);
 			git_commit_free(commit);
 		}
 	}
 	git_revwalk_free(walk);
-	sqlite3_finalize(st_check);
-	sqlite3_finalize(st_insert);
 
 	/* Phase 2: Sweep unreachable objects (preserve kept and promisor) */
-	sqlite3_stmt *st_sweep = NULL;
-	sqlite3_prepare_v2(sdb,
-		"DELETE FROM objects WHERE oid NOT IN (SELECT oid FROM temp.reachable)"
-		" AND kept = 0 AND promisor = 0",
-		-1, &st_sweep, 0);
-	sqlite3_step(st_sweep);
+	{
+		sqlite3_stmt *st = stmt_acquire(st_gc_sweep,
+			"DELETE FROM objects WHERE reachable = 0 AND kept = 0 AND promisor = 0");
+		sqlite3_step(st);
+		stmt_release(st_gc_sweep, st);
+	}
 	int deleted = sqlite3_changes(sdb);
-	sqlite3_finalize(st_sweep);
-
-	sqlite3_exec(sdb, "DROP TABLE IF EXISTS temp.reachable", 0, 0, 0);
 
 	/* Phase 3: Repack surviving objects */
 	storage_repack();
