@@ -40,6 +40,7 @@ static sqlite3_stmt *st_mark_kept, *st_clear_kept, *st_have_kept;
 static sqlite3_stmt *st_mark_promisor;
 static sqlite3_stmt *st_obj_oids;
 static sqlite3_stmt *st_obj_list_promisor, *st_obj_list_skip_kept;
+static sqlite3_stmt *st_cycle_check;
 static int batch_kept = 0, batch_promisor = 0;
 
 /* Feature 7: Alternates linked list */
@@ -823,22 +824,21 @@ int storage_repack(void) {
 			/* Check chain depth */
 			if (we->chain_depth + 1 > MAX_CHAIN_DEPTH) continue;
 
-			/* Cycle check: verify the candidate base's chain
-			 * doesn't already depend on the current object */
+			/* Cycle check: walk the candidate base's chain to
+			 * verify the current object is not in it. */
 			{
 				int cycle = 0;
 				git_oid walk;
 				memcpy(&walk, &we->oid, sizeof(git_oid));
-				for (int d = 0; d < MAX_CHAIN_DEPTH; d++) {
-					if (memcmp(walk.id, oid.id, GIT_OID_SHA1_SIZE) == 0) { cycle = 1; break; }
-					sqlite3_stmt *cst = NULL;
-					sqlite3_prepare_v2(sdb, "SELECT base FROM objects WHERE oid = ?", -1, &cst, 0);
+				for (int d = 0; d < MAX_CHAIN_DEPTH && !cycle; d++) {
+					if (!memcmp(walk.id, oid.id, GIT_OID_SHA1_SIZE)) { cycle = 1; break; }
+					sqlite3_stmt *cst = stmt_acquire(st_cycle_check,
+						"SELECT base FROM objects WHERE oid = ?");
 					sqlite3_bind_blob(cst, 1, walk.id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-					if (sqlite3_step(cst) != SQLITE_ROW || !sqlite3_column_blob(cst, 0)) {
-						sqlite3_finalize(cst); break;
-					}
-					memcpy(walk.id, sqlite3_column_blob(cst, 0), GIT_OID_SHA1_SIZE);
-					sqlite3_finalize(cst);
+					int has = (sqlite3_step(cst) == SQLITE_ROW && sqlite3_column_blob(cst, 0));
+					if (has) memcpy(walk.id, sqlite3_column_blob(cst, 0), GIT_OID_SHA1_SIZE);
+					stmt_release(st_cycle_check, cst);
+					if (!has) break;
 				}
 				if (cycle) continue;
 			}
@@ -1747,7 +1747,7 @@ static int parse_commit_parents(const unsigned char *data, size_t size,
 		const char *nl = memchr(p, '\n', end - p);
 		if (!nl) break;
 		if (nl == p) break; /* empty line = end of header */
-		if (nl - p > 47 && !strncmp(p, "parent ", 7)) {
+		if (nl - p >= 47 && !strncmp(p, "parent ", 7)) {
 			if (count < max_parents) {
 				git_oid_fromstrn(&parents[count], p + 7, 40);
 			}
@@ -1842,41 +1842,60 @@ int storage_build_commit_graph(void) {
 	sqlite3_finalize(st_ins_work);
 	sqlite3_finalize(st_ins_parent);
 
-	/* BFS: initialize roots (commits with no parents in cg_parents) to generation 1 */
+	/*
+	 * BFS generation computation:
+	 * 1. Find roots (commits not appearing as children in cg_parents), set gen=1
+	 * 2. Iterate: for each commit with generation set, find children whose
+	 *    parents all have generation > 0, set child gen = max(parent gen) + 1
+	 */
+	/* Roots: commits with no parents, OR commits whose parents are
+	   all missing from cg_work (orphans from deleted objects). */
 	sqlite3_exec(sdb,
 		"UPDATE temp.cg_work SET generation = 1"
-		" WHERE oid NOT IN (SELECT DISTINCT child FROM temp.cg_parents);",
+		" WHERE oid NOT IN (SELECT DISTINCT child FROM temp.cg_parents)"
+		"    OR oid NOT IN ("
+		"      SELECT cp.child FROM temp.cg_parents cp"
+		"      WHERE cp.parent IN (SELECT oid FROM temp.cg_work)"
+		"    );",
 		0, 0, 0);
 
-	/* Iterative relaxation: update children whose parents all have generation > 0
-	   and whose current generation is less than max(parent generation) + 1. */
+	/* Iterative BFS: keep updating until no more changes */
 	int changed = 1;
 	while (changed) {
 		changed = 0;
-		sqlite3_stmt *st_relax = NULL;
+		/* Find children where all parents have generation > 0
+		   and child's current generation needs updating */
+		sqlite3_stmt *st_find = NULL;
 		sqlite3_prepare_v2(sdb,
-			"UPDATE temp.cg_work SET generation = ("
-			"  SELECT MAX(pw.generation) + 1"
-			"  FROM temp.cg_parents cp"
-			"  JOIN temp.cg_work pw ON cp.parent = pw.oid"
-			"  WHERE cp.child = cg_work.oid"
-			")"
-			" WHERE oid IN ("
-			"  SELECT DISTINCT cp.child FROM temp.cg_parents cp"
-			"  JOIN temp.cg_work pw ON cp.parent = pw.oid"
-			"  GROUP BY cp.child"
-			"  HAVING MIN(pw.generation) > 0"
-			")"
-			" AND generation < ("
-			"  SELECT MAX(pw.generation) + 1"
-			"  FROM temp.cg_parents cp"
-			"  JOIN temp.cg_work pw ON cp.parent = pw.oid"
-			"  WHERE cp.child = cg_work.oid"
-			")",
-			-1, &st_relax, 0);
-		sqlite3_step(st_relax);
-		changed = sqlite3_changes(sdb);
-		sqlite3_finalize(st_relax);
+			"SELECT cp.child, MAX(pw.generation) + 1 AS new_gen"
+			" FROM temp.cg_parents cp"
+			" JOIN temp.cg_work pw ON cp.parent = pw.oid"
+			" WHERE pw.generation > 0"
+			" GROUP BY cp.child"
+			" HAVING COUNT(*) = ("
+			"   SELECT COUNT(*) FROM temp.cg_parents cp2"
+			"   JOIN temp.cg_work pw2 ON cp2.parent = pw2.oid"
+			"   WHERE cp2.child = cp.child"
+			" )",
+			-1, &st_find, 0);
+
+		sqlite3_stmt *st_set = NULL;
+		sqlite3_prepare_v2(sdb,
+			"UPDATE temp.cg_work SET generation = ? WHERE oid = ? AND generation < ?",
+			-1, &st_set, 0);
+
+		while (sqlite3_step(st_find) == SQLITE_ROW) {
+			const void *child_oid = sqlite3_column_blob(st_find, 0);
+			int new_gen = sqlite3_column_int(st_find, 1);
+			sqlite3_bind_int(st_set, 1, new_gen);
+			sqlite3_bind_blob(st_set, 2, child_oid, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+			sqlite3_bind_int(st_set, 3, new_gen);
+			sqlite3_step(st_set);
+			if (sqlite3_changes(sdb) > 0) changed = 1;
+			sqlite3_reset(st_set);
+		}
+		sqlite3_finalize(st_find);
+		sqlite3_finalize(st_set);
 	}
 
 	/* Write results to commit_graph */
