@@ -1742,15 +1742,17 @@ static int parse_commit_parents(const unsigned char *data, size_t size,
 	int count = 0;
 	const char *p = (const char *)data;
 	const char *end = p + size;
+	/* "parent " (7) + hex OID (GIT_OID_SHA1_HEXSIZE=40) = 47 */
+	const int parent_line_len = 7 + GIT_OID_SHA1_HEXSIZE;
 
 	while (p < end) {
 		const char *nl = memchr(p, '\n', end - p);
 		if (!nl) break;
 		if (nl == p) break; /* empty line = end of header */
-		if (nl - p >= 47 && !strncmp(p, "parent ", 7)) {
-			if (count < max_parents) {
-				git_oid_fromstrn(&parents[count], p + 7, 40);
-			}
+		if (nl - p >= parent_line_len
+		    && !memcmp(p, "parent ", 7)
+		    && git_oid_fromstrn(&parents[count < max_parents ? count : 0],
+					p + 7, GIT_OID_SHA1_HEXSIZE) == 0) {
 			count++;
 		}
 		p = nl + 1;
@@ -1848,54 +1850,45 @@ int storage_build_commit_graph(void) {
 	 * 2. Iterate: for each commit with generation set, find children whose
 	 *    parents all have generation > 0, set child gen = max(parent gen) + 1
 	 */
-	/* Roots: commits with no parents, OR commits whose parents are
-	   all missing from cg_work (orphans from deleted objects). */
+	/* Remove parent edges pointing to missing objects (deleted/orphaned).
+	   This ensures the relaxation doesn't wait forever for them. */
 	sqlite3_exec(sdb,
-		"UPDATE temp.cg_work SET generation = 1"
-		" WHERE oid NOT IN (SELECT DISTINCT child FROM temp.cg_parents)"
-		"    OR oid NOT IN ("
-		"      SELECT cp.child FROM temp.cg_parents cp"
-		"      WHERE cp.parent IN (SELECT oid FROM temp.cg_work)"
-		"    );",
+		"DELETE FROM temp.cg_parents"
+		" WHERE parent NOT IN (SELECT oid FROM temp.cg_work);",
 		0, 0, 0);
 
-	/* Iterative BFS: keep updating until no more changes */
+	/* Roots: commits with no parent edges (true roots + orphans). */
+	sqlite3_exec(sdb,
+		"UPDATE temp.cg_work SET generation = 1"
+		" WHERE oid NOT IN (SELECT DISTINCT child FROM temp.cg_parents);",
+		0, 0, 0);
+
+	/* Iterative SQL relaxation: each pass resolves one depth level.
+	   WHERE generation = 0 limits to unresolved commits.
+	   HAVING MIN(pw.generation) > 0 ensures all parents are resolved.
+	   Prepare+step+finalize per iteration for fresh reads. */
 	int changed = 1;
 	while (changed) {
-		changed = 0;
-		/* Find children where all parents have generation > 0
-		   and child's current generation needs updating */
-		sqlite3_stmt *st_find = NULL;
+		sqlite3_stmt *st_relax = NULL;
 		sqlite3_prepare_v2(sdb,
-			"SELECT cp.child, MAX(pw.generation) + 1 AS new_gen"
-			" FROM temp.cg_parents cp"
-			" JOIN temp.cg_work pw ON cp.parent = pw.oid"
-			" WHERE pw.generation > 0"
-			" GROUP BY cp.child"
-			" HAVING COUNT(*) = ("
-			"   SELECT COUNT(*) FROM temp.cg_parents cp2"
-			"   JOIN temp.cg_work pw2 ON cp2.parent = pw2.oid"
-			"   WHERE cp2.child = cp.child"
-			" )",
-			-1, &st_find, 0);
-
-		sqlite3_stmt *st_set = NULL;
-		sqlite3_prepare_v2(sdb,
-			"UPDATE temp.cg_work SET generation = ? WHERE oid = ? AND generation < ?",
-			-1, &st_set, 0);
-
-		while (sqlite3_step(st_find) == SQLITE_ROW) {
-			const void *child_oid = sqlite3_column_blob(st_find, 0);
-			int new_gen = sqlite3_column_int(st_find, 1);
-			sqlite3_bind_int(st_set, 1, new_gen);
-			sqlite3_bind_blob(st_set, 2, child_oid, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-			sqlite3_bind_int(st_set, 3, new_gen);
-			sqlite3_step(st_set);
-			if (sqlite3_changes(sdb) > 0) changed = 1;
-			sqlite3_reset(st_set);
-		}
-		sqlite3_finalize(st_find);
-		sqlite3_finalize(st_set);
+			"UPDATE temp.cg_work SET generation = ("
+			"  SELECT MAX(pw.generation) + 1"
+			"  FROM temp.cg_parents cp"
+			"  JOIN temp.cg_work pw ON cp.parent = pw.oid"
+			"  WHERE cp.child = cg_work.oid"
+			")"
+			" WHERE generation = 0"
+			" AND oid IN ("
+			"  SELECT cp.child FROM temp.cg_parents cp"
+			"  JOIN temp.cg_work pw ON cp.parent = pw.oid"
+			"  WHERE pw.generation > 0"
+			"  GROUP BY cp.child"
+			"  HAVING MIN(pw.generation) > 0"
+			")",
+			-1, &st_relax, 0);
+		sqlite3_step(st_relax);
+		changed = sqlite3_changes(sdb);
+		sqlite3_finalize(st_relax);
 	}
 
 	/* Write results to commit_graph */
