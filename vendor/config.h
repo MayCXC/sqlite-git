@@ -13,4 +13,6 @@ typedef uint64_t sqlite3_uint64;
 #define fossil_malloc(n) malloc(n)
 #define fossil_free(p) free(p)
 
+#define FOSSIL_ENABLE_DELTA_CKSUM_TEST 1
+
 #endif
