@@ -51,7 +51,7 @@ static sqlite3_stmt *st_connectivity_kept;
 static sqlite3_stmt *st_repack_scan, *st_repack_update;
 static sqlite3_stmt *st_is_promised, *st_fetch_promised;
 static sqlite3_stmt *st_worktree_list;
-static sqlite3_stmt *st_commits_scan;
+static sqlite3_stmt *st_commit_graph_ins;
 static int batch_kept = 0, batch_promisor = 0;
 
 /* Feature 7: Alternates linked list */
@@ -402,7 +402,7 @@ static int storage_init_db(sqlite3 *db) {
 	sqlite3_prepare_v3(db, "SELECT 1 FROM promised WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_is_promised, 0);
 	sqlite3_prepare_v3(db, "SELECT p.remote, r.url FROM promised p JOIN promisor_remotes r ON p.remote = r.name WHERE p.oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_fetch_promised, 0);
 	sqlite3_prepare_v3(db, "SELECT name, path, head_ref FROM worktrees ORDER BY name",  -1, SQLITE_PREPARE_PERSISTENT, &st_worktree_list, 0);
-	sqlite3_prepare_v3(db, "SELECT oid FROM objects WHERE type = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_commits_scan, 0);
+	sqlite3_prepare_v3(db, "INSERT OR REPLACE INTO commit_graph(oid, generation, commit_time) VALUES(?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_commit_graph_ins, 0);
 
 	/* Load alternates from persisted table */
 	load_alternates();
@@ -437,7 +437,7 @@ void storage_close(void) {
 	sqlite3_finalize(st_repack_scan); sqlite3_finalize(st_repack_update);
 	sqlite3_finalize(st_is_promised); sqlite3_finalize(st_fetch_promised);
 	sqlite3_finalize(st_worktree_list);
-	sqlite3_finalize(st_commits_scan);
+	sqlite3_finalize(st_commit_graph_ins);
 	batch_kept = 0; batch_promisor = 0;
 	/* Close alternate connections */
 	while (alt_list) {
@@ -1881,161 +1881,75 @@ void storage_remove_promisor_remote(const char *name) {
 
 /* ---- Feature 4: Commit Graph ---- */
 
-/* Parse parent OIDs from raw commit data. Returns count, fills parents array. */
-static int parse_commit_parents(const unsigned char *data, size_t size,
-				git_oid *parents, int max_parents) {
-	int count = 0;
-	const char *p = (const char *)data;
-	const char *end = p + size;
-	/* "parent " (7) + hex OID (GIT_OID_SHA1_HEXSIZE=40) = 47 */
-	const int parent_line_len = 7 + GIT_OID_SHA1_HEXSIZE;
-
-	while (p < end) {
-		const char *nl = memchr(p, '\n', end - p);
-		if (!nl) break;
-		if (nl == p) break; /* empty line = end of header */
-		if (nl - p >= parent_line_len
-		    && !memcmp(p, "parent ", 7)
-		    && git_oid_fromstrn(&parents[count < max_parents ? count : 0],
-					p + 7, GIT_OID_SHA1_HEXSIZE) == 0) {
-			count++;
-		}
-		p = nl + 1;
-	}
-	return count;
-}
-
-/* Parse committer timestamp from raw commit data */
-static long long parse_commit_time(const unsigned char *data, size_t size) {
-	const char *p = (const char *)data;
-	const char *end = p + size;
-
-	while (p < end) {
-		const char *nl = memchr(p, '\n', end - p);
-		if (!nl) break;
-		if (nl == p) break;
-		if ((size_t)(nl - p) > 10 && !strncmp(p, "committer ", 10)) {
-			/* Find the timestamp: last '>' then space then digits */
-			const char *gt = NULL;
-			for (const char *s = nl - 1; s > p; s--) {
-				if (*s == '>') { gt = s; break; }
-			}
-			if (gt && gt + 2 < nl) {
-				return strtoll(gt + 2, NULL, 10);
-			}
-		}
-		p = nl + 1;
-	}
-	return 0;
-}
-
 int storage_build_commit_graph(void) {
+	git_repository *repo = git0_storage_repo();
+	if (!repo) return -1;
+
 	storage_savepoint("commit_graph");
 
-	/* Collect all commits */
-	sqlite3_stmt *st_scan = stmt_acquire(st_commits_scan,
-		"SELECT oid FROM objects WHERE type = 1");
+	/* Clear existing graph */
+	sqlite3_exec(sdb, "DELETE FROM commit_graph", 0, 0, 0);
 
-	/* Use a temp table for BFS */
-	sqlite3_exec(sdb,
-		"CREATE TEMP TABLE IF NOT EXISTS cg_work("
-		"  oid BLOB PRIMARY KEY, generation INT NOT NULL DEFAULT 0,"
-		"  commit_time INT NOT NULL DEFAULT 0"
-		") WITHOUT ROWID;"
-		"DELETE FROM temp.cg_work;",
-		0, 0, 0);
-
-	/* Also store parent edges */
-	sqlite3_exec(sdb,
-		"CREATE TEMP TABLE IF NOT EXISTS cg_parents("
-		"  child BLOB NOT NULL, parent BLOB NOT NULL"
-		");"
-		"DELETE FROM temp.cg_parents;",
-		0, 0, 0);
-
-	sqlite3_stmt *st_ins_work = NULL, *st_ins_parent = NULL;
-	sqlite3_prepare_v2(sdb,
-		"INSERT OR IGNORE INTO temp.cg_work(oid, commit_time) VALUES(?,?)",
-		-1, &st_ins_work, 0);
-	sqlite3_prepare_v2(sdb,
-		"INSERT INTO temp.cg_parents(child, parent) VALUES(?,?)",
-		-1, &st_ins_parent, 0);
-
-	while (sqlite3_step(st_scan) == SQLITE_ROW) {
-		git_oid oid;
-		memcpy(oid.id, sqlite3_column_blob(st_scan, 0), GIT_OID_SHA1_SIZE);
-
-		git_object_t type; size_t size; unsigned char *data;
-		if (storage_read_object(&oid, &type, &size, &data) < 0) continue;
-		if (type != GIT_OBJECT_COMMIT) { free(data); continue; }
-
-		long long ctime = parse_commit_time(data, size);
-		git_oid parents[64];
-		int nparents = parse_commit_parents(data, size, parents, 64);
-		free(data);
-
-		sqlite3_bind_blob(st_ins_work, 1, oid.id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-		sqlite3_bind_int64(st_ins_work, 2, ctime);
-		sqlite3_step(st_ins_work);
-		sqlite3_reset(st_ins_work);
-
-		for (int i = 0; i < nparents; i++) {
-			sqlite3_bind_blob(st_ins_parent, 1, oid.id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-			sqlite3_bind_blob(st_ins_parent, 2, parents[i].id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-			sqlite3_step(st_ins_parent);
-			sqlite3_reset(st_ins_parent);
-		}
+	/* Walk all commits in topological order (parents before children).
+	 * Assign generation = max(parent generation) + 1. Roots get 1.
+	 * libgit2's revwalk handles orphan parents (missing objects) by
+	 * skipping them, which matches our previous orphan edge deletion. */
+	git_revwalk *walk = NULL;
+	if (git_revwalk_new(&walk, repo) < 0) {
+		storage_rollback_to("commit_graph");
+		return -1;
 	}
-	stmt_release(st_commits_scan, st_scan);
-	sqlite3_finalize(st_ins_work);
-	sqlite3_finalize(st_ins_parent);
+	git_revwalk_sorting(walk, GIT_SORT_TOPOLOGICAL | GIT_SORT_REVERSE);
+	git_revwalk_push_glob(walk, "refs/*");
 
-	/* Remove parent edges pointing to missing objects (deleted/orphaned).
-	   This ensures the generation computation doesn't stall on them. */
-	sqlite3_exec(sdb,
-		"DELETE FROM temp.cg_parents"
-		" WHERE parent NOT IN (SELECT oid FROM temp.cg_work);",
-		0, 0, 0);
+	/* Also push HEAD and any loose commits (kept objects) */
+	{
+		sqlite3_stmt *st = stmt_acquire(st_connectivity_kept,
+			"SELECT oid FROM objects WHERE kept = 1 AND type = 1");
+		while (sqlite3_step(st) == SQLITE_ROW) {
+			git_oid oid;
+			memcpy(oid.id, sqlite3_column_blob(st, 0), GIT_OID_SHA1_SIZE);
+			git_revwalk_push(walk, &oid);
+		}
+		stmt_release(st_connectivity_kept, st);
+	}
 
-	/*
-	 * Compute generations via WITH RECURSIVE over the parent edges.
-	 * Roots (no parent edges) get generation=1. Each child gets
-	 * max(parent generation) + 1, computed by the recursive CTE
-	 * propagating depth through the DAG one level at a time.
-	 * The final INSERT OR REPLACE writes directly to commit_graph.
-	 */
-	sqlite3_exec(sdb,
-		"WITH RECURSIVE"
-		"  roots(oid) AS ("
-		"    SELECT oid FROM temp.cg_work"
-		"    WHERE oid NOT IN (SELECT DISTINCT child FROM temp.cg_parents)"
-		"  ),"
-		"  gen(oid, generation) AS ("
-		"    SELECT oid, 1 FROM roots"
-		"    UNION ALL"
-		"    SELECT cp.child, g.generation + 1"
-		"    FROM temp.cg_parents cp"
-		"    JOIN gen g ON cp.parent = g.oid"
-		"  )"
-		" INSERT OR REPLACE INTO commit_graph(oid, generation, commit_time)"
-		" SELECT w.oid, MAX(g.generation), w.commit_time"
-		" FROM gen g"
-		" JOIN temp.cg_work w ON g.oid = w.oid"
-		" GROUP BY g.oid;",
-		0, 0, 0);
+	sqlite3_stmt *st_ins = stmt_acquire(st_commit_graph_ins,
+		"INSERT OR REPLACE INTO commit_graph(oid, generation, commit_time) VALUES(?,?,?)");
 
 	int count = 0;
-	sqlite3_stmt *st_count = NULL;
-	sqlite3_prepare_v2(sdb, "SELECT COUNT(*) FROM commit_graph", -1, &st_count, 0);
-	if (sqlite3_step(st_count) == SQLITE_ROW)
-		count = sqlite3_column_int(st_count, 0);
-	sqlite3_finalize(st_count);
+	git_oid oid;
+	while (git_revwalk_next(&oid, walk) == 0) {
+		git_commit *commit = NULL;
+		if (git_commit_lookup(&commit, repo, &oid) < 0)
+			continue;
 
-	/* Cleanup temp tables */
-	sqlite3_exec(sdb,
-		"DROP TABLE IF EXISTS temp.cg_parents;"
-		"DROP TABLE IF EXISTS temp.cg_work;",
-		0, 0, 0);
+		/* Generation = max(parent generation) + 1.
+		 * Parents are already in commit_graph because SORT_REVERSE
+		 * gives us roots first, children after all parents. */
+		int max_parent_gen = 0;
+		unsigned int nparents = git_commit_parentcount(commit);
+		for (unsigned int i = 0; i < nparents; i++) {
+			const git_oid *pid = git_commit_parent_id(commit, i);
+			int pgen = storage_commit_generation(pid);
+			if (pgen > max_parent_gen)
+				max_parent_gen = pgen;
+		}
+
+		int generation = max_parent_gen + 1;
+		git_time_t ctime = git_commit_time(commit);
+		git_commit_free(commit);
+
+		sqlite3_bind_blob(st_ins, 1, oid.id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+		sqlite3_bind_int(st_ins, 2, generation);
+		sqlite3_bind_int64(st_ins, 3, (sqlite3_int64)ctime);
+		sqlite3_step(st_ins);
+		sqlite3_reset(st_ins);
+		count++;
+	}
+
+	stmt_release(st_commit_graph_ins, st_ins);
+	git_revwalk_free(walk);
 
 	storage_release("commit_graph");
 	return count;
