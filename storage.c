@@ -1829,7 +1829,8 @@ int storage_build_commit_graph(void) {
 		" WHERE oid NOT IN (SELECT DISTINCT child FROM temp.cg_parents);",
 		0, 0, 0);
 
-	/* Iterative relaxation until stable */
+	/* Iterative relaxation: update children whose parents all have generation > 0
+	   and whose current generation is less than max(parent generation) + 1. */
 	int changed = 1;
 	while (changed) {
 		changed = 0;
@@ -1841,7 +1842,12 @@ int storage_build_commit_graph(void) {
 			"  JOIN temp.cg_work pw ON cp.parent = pw.oid"
 			"  WHERE cp.child = cg_work.oid"
 			")"
-			" WHERE oid IN (SELECT DISTINCT child FROM temp.cg_parents)"
+			" WHERE oid IN ("
+			"  SELECT DISTINCT cp.child FROM temp.cg_parents cp"
+			"  JOIN temp.cg_work pw ON cp.parent = pw.oid"
+			"  GROUP BY cp.child"
+			"  HAVING MIN(pw.generation) > 0"
+			")"
 			" AND generation < ("
 			"  SELECT MAX(pw.generation) + 1"
 			"  FROM temp.cg_parents cp"
