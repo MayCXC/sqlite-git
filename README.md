@@ -30,19 +30,25 @@ Stores git objects, refs, and reflogs in a single SQLite database. Git communica
 ### Setup
 
 ```sh
-git init myrepo && cd myrepo
-git config extensions.repositoryformatversion 1
-git config extensions.objectStorage helper://sqlite
-git config extensions.refStorage helper://sqlite
+git init --local-helper=sqlite myrepo
+cd myrepo
 ```
 
-With both extensions set, all git operations go through SQLite:
+This sets `extensions.objectStorage = helper`, `extensions.refStorage = helper`, and `extensions.localHelper = sqlite` in `.git/config`. All git operations go through SQLite:
 
 ```sh
 echo "hello" | git hash-object -w --stdin   # writes to .git/sqlite.db
 git update-ref refs/heads/main <oid>         # ref stored in SQLite
 git cat-file blob <oid>                      # reads from SQLite
 git for-each-ref                             # lists refs from SQLite
+```
+
+For LFS support, also configure the transfer adapter:
+
+```sh
+git config lfs.customtransfer.sqlite.path git-lfs-sqlite-transfer
+git config lfs.customtransfer.sqlite.args .git
+git config lfs.standalonetransferagent sqlite
 ```
 
 ### Storage
@@ -251,13 +257,7 @@ These operate directly on the SQLite storage layer (no `.git` repo needed). Use 
 
 ## LFS (git-lfs-sqlite-transfer)
 
-Large file content stored in the same SQLite database, compressed with zlib. Uses SHA-256 OIDs per the git-lfs spec.
-
-```sh
-git config lfs.customtransfer.sqlite.path git-lfs-sqlite-transfer
-git config lfs.customtransfer.sqlite.args .git
-git config lfs.standalonetransferagent sqlite
-```
+Large file content stored in the same SQLite database, compressed with zlib. Uses SHA-256 OIDs per the git-lfs spec. See [Setup](#setup) for configuration.
 
 The transfer adapter speaks the [git-lfs custom transfer protocol](https://github.com/git-lfs/git-lfs/blob/main/docs/custom-transfers.md) on stdin/stdout. Content is stored in:
 
