@@ -53,7 +53,8 @@ Everything lives in `<gitdir>/sqlite.db`:
 
 ```
 objects(oid BLOB PRIMARY KEY, type INT, size INT, data BLOB, base BLOB,
-        kept INT DEFAULT 0, promisor INT DEFAULT 0, reachable INT DEFAULT 0)
+        kept INT DEFAULT 0, promisor INT DEFAULT 0, reachable INT DEFAULT 0,
+        created_at INT DEFAULT (strftime('%s','now')))
 refs(refname TEXT PRIMARY KEY, oid BLOB, symref TEXT)
 reflog(refname TEXT, idx INT, old_oid BLOB, new_oid BLOB, committer TEXT,
        timestamp INT, tz INT, msg TEXT, PRIMARY KEY(refname, idx))
@@ -74,9 +75,9 @@ All tables use `WITHOUT ROWID` for clustered primary key access.
 
 **Fossil delta compression**: When a new object is similar to an existing same-type object, a [fossil delta](https://fossil-scm.org/home/doc/trunk/www/delta_format.wiki) is stored instead. Delta objects reference their base via the `base` column and are resolved recursively on read. The delta algorithm (BSD-2 licensed from fossil-scm.org) uses a 16-byte rolling hash with sliding window matching.
 
-**GC and repack**: `gc` marks reachable objects via revwalk, sweeps unreachable ones (preserving kept and promisor objects), then repacks surviving objects with sliding-window delta compression. `repack` runs independently to re-deltify objects with better bases. Both use cycle detection to prevent delta chain loops.
+**GC and repack**: `gc` marks reachable objects via libgit2 revwalk, sweeps unreachable ones (preserving kept, promisor, and recently-created objects), then repacks surviving objects with sliding-window delta compression. Grace period defaults to 2 weeks, configurable via `gc.pruneexpire` (seconds). `repack` sorts by `git0_name_hash(path)` (same as git-core's `pack_name_hash`) for optimal delta locality, with cycle detection to prevent delta chain loops.
 
-**Commit graph**: Precomputed generation numbers for all commits, stored in `commit_graph`. Built via a single recursive CTE over parent edges. Used for fast reachability queries.
+**Commit graph**: Precomputed generation numbers for all commits, stored in `commit_graph`. Built via libgit2 topological revwalk (parents before children). Used for fast reachability queries.
 
 **Partial clone**: Objects can be marked as promised (known to exist on a promisor remote but not yet fetched). `fetch-object` transparently resolves delta chains from the remote database.
 
@@ -241,6 +242,7 @@ These operate directly on the SQLite storage layer (no `.git` repo needed). Use 
 | `git0_commit_author` | `(rev)` | author line |
 | `git0_commit_parent` | `(rev, n)` | nth parent oid |
 | `git0_commit_parents` | `(rev)` | parent count |
+| `git0_name_hash` | `(path)` | sortable uint32 hash (same as git-core `pack_name_hash`) |
 | `git0_lfs_store` | `(data)` | LFS pointer text |
 | `git0_lfs_fetch` | `(pointer)` | content |
 | `git0_lfs_pointer` | `(data)` | pointer text (no store) |

@@ -55,6 +55,7 @@ static sqlite3_stmt *st_is_promised, *st_fetch_promised;
 static sqlite3_stmt *st_worktree_list;
 static sqlite3_stmt *st_commit_graph_ins;
 static sqlite3_stmt *st_mark_reachable, *st_is_reachable, *st_clear_reachable, *st_gc_sweep;
+static sqlite3_stmt *st_ref_list_glob;
 static int batch_kept = 0, batch_promisor = 0;
 
 /* Feature 7: Alternates linked list */
@@ -459,6 +460,7 @@ static int storage_init_db(sqlite3 *db) {
 	sqlite3_prepare_v3(db, "SELECT 1 FROM objects WHERE oid = ? AND reachable = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_is_reachable, 0);
 	sqlite3_prepare_v3(db, "UPDATE objects SET reachable = 0 WHERE reachable = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_clear_reachable, 0);
 	sqlite3_prepare_v3(db, "DELETE FROM objects WHERE reachable = 0 AND kept = 0 AND promisor = 0 AND created_at < strftime('%s','now') - ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_gc_sweep, 0);
+	sqlite3_prepare_v3(db, "SELECT refname, oid, symref FROM refs WHERE refname GLOB ? ORDER BY refname",  -1, SQLITE_PREPARE_PERSISTENT, &st_ref_list_glob, 0);
 
 	/* Load alternates from persisted table */
 	load_alternates();
@@ -496,6 +498,7 @@ void storage_close(void) {
 	sqlite3_finalize(st_commit_graph_ins);
 	sqlite3_finalize(st_mark_reachable); sqlite3_finalize(st_is_reachable);
 	sqlite3_finalize(st_clear_reachable); sqlite3_finalize(st_gc_sweep);
+	sqlite3_finalize(st_ref_list_glob);
 	batch_kept = 0; batch_promisor = 0;
 	/* Close alternate connections */
 	while (alt_list) {
@@ -1309,11 +1312,8 @@ int storage_ref_list(const char *prefix, storage_ref_cb cb, void *data) {
 	if (prefix && *prefix) {
 		char *pattern = sqlite3_mprintf("%s*", prefix);
 		if (!pattern) return -1;
-		sqlite3_stmt *st = NULL;
-		int rc = sqlite3_prepare_v3(sdb,
-			"SELECT refname, oid, symref FROM refs WHERE refname GLOB ? ORDER BY refname",
-			-1, 0, &st, 0);
-		if (rc != SQLITE_OK || !st) { sqlite3_free(pattern); return -1; }
+		sqlite3_stmt *st = stmt_acquire(st_ref_list_glob,
+			"SELECT refname, oid, symref FROM refs WHERE refname GLOB ? ORDER BY refname");
 		sqlite3_bind_text(st, 1, pattern, -1, sqlite3_free);
 		while (sqlite3_step(st) == SQLITE_ROW) {
 			const char *name = (const char *)sqlite3_column_text(st, 0);
@@ -1323,7 +1323,7 @@ int storage_ref_list(const char *prefix, storage_ref_cb cb, void *data) {
 			const char *sym = (const char *)sqlite3_column_text(st, 2);
 			if (cb(name, blob ? &oid : NULL, sym, data)) break;
 		}
-		sqlite3_finalize(st);
+		stmt_release(st_ref_list_glob, st);
 	} else {
 		sqlite3_stmt *st = stmt_acquire(st_ref_list, "SELECT refname, oid, symref FROM refs ORDER BY refname");
 		while (sqlite3_step(st) == SQLITE_ROW) {
