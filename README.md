@@ -52,10 +52,18 @@ git for-each-ref                             # lists refs from SQLite
 Everything lives in `<gitdir>/sqlite.db`:
 
 ```
-objects(oid BLOB PRIMARY KEY, type INT, size INT, data BLOB, base BLOB)
+objects(oid BLOB PRIMARY KEY, type INT, size INT, data BLOB, base BLOB,
+        kept INT DEFAULT 0, promisor INT DEFAULT 0)
 refs(refname TEXT PRIMARY KEY, oid BLOB, symref TEXT)
 reflog(refname TEXT, idx INT, old_oid BLOB, new_oid BLOB, committer TEXT,
        timestamp INT, tz INT, msg TEXT, PRIMARY KEY(refname, idx))
+lfs(oid BLOB PRIMARY KEY, size INT, data BLOB)
+commit_graph(oid BLOB PRIMARY KEY, generation INT, commit_time INT)
+oid_map(src BLOB, dest BLOB, algo TEXT, PRIMARY KEY(src, algo))
+promised(oid BLOB PRIMARY KEY, remote TEXT)
+promisor_remotes(name TEXT PRIMARY KEY, url TEXT)
+worktrees(name TEXT PRIMARY KEY, path TEXT, head_ref TEXT)
+alternates(path TEXT PRIMARY KEY)
 ```
 
 All tables use `WITHOUT ROWID` for clustered primary key access.
@@ -66,33 +74,79 @@ All tables use `WITHOUT ROWID` for clustered primary key access.
 
 **Fossil delta compression**: When a new object is similar to an existing same-type object, a [fossil delta](https://fossil-scm.org/home/doc/trunk/www/delta_format.wiki) is stored instead. Delta objects reference their base via the `base` column and are resolved recursively on read. The delta algorithm (BSD-2 licensed from fossil-scm.org) uses a 16-byte rolling hash with sliding window matching.
 
+**GC and repack**: `gc` marks reachable objects via revwalk, sweeps unreachable ones (preserving kept and promisor objects), then repacks surviving objects with sliding-window delta compression. `repack` runs independently to re-deltify objects with better bases. Both use cycle detection to prevent delta chain loops.
+
+**Commit graph**: Precomputed generation numbers for all commits, stored in `commit_graph`. Built via a single recursive CTE over parent edges. Used for fast reachability queries.
+
+**Partial clone**: Objects can be marked as promised (known to exist on a promisor remote but not yet fetched). `fetch-object` transparently resolves delta chains from the remote database.
+
+**Worktrees**: Named worktrees with separate HEAD refs, stored in the `worktrees` table.
+
+**Alternates**: Linked alternate databases for shared object storage. Objects not found locally are resolved from alternates, including delta chain resolution across database boundaries.
+
+**Transactions**: Every public write function wraps itself in a SQLite savepoint. Callers manage transactions externally; savepoints nest transparently. Error paths rollback, success paths release.
+
 ### Protocol
 
 The helper speaks the git local helper protocol. Commands use a flat namespace matching how remote helpers use `list`/`fetch`/`push`:
 
 | Command | Response |
 |---------|----------|
-| `capabilities` | list of supported commands, blank line terminates |
+| **Objects** | |
 | `info <oid>` | `<type> <size>` or `missing` |
 | `get <oid>` | `<type> <size>` + raw data, or `missing` |
 | `put <oid> <type> <size>` + data | `<oid>` |
+| `put-stream <type> <size>` + data | `<oid>` (helper computes OID) |
 | `have <oid>` | `true` or `false` |
 | `list-objects` | `<oid> <type> <size>` per line, blank end |
-| `odb-transaction-begin` | `ok` |
-| `odb-transaction-commit` | `ok` |
+| `write-packfile` + packfile on stdin | `<count>` objects written |
+| **Refs** | |
 | `read <refname>` | `<oid>`, `symref <target>`, or `missing` |
 | `list [<prefix>]` | `<refname> <oid\|symref target>` per line, blank end |
 | `transaction-begin/update/create/delete/create-symref` | `ok` |
 | `transaction-prepare/finish/abort` | `ok` or `error <msg>` |
-| `create` | `ok` |
-| `remove` | `ok` |
-| `put-stream <type> <size>` + data | `<oid>` (helper computes OID) |
+| **Reflog** | |
 | `reflog-read <refname>` | native reflog format lines, blank end |
 | `reflog-read-reverse <refname>` | entries newest-first, blank end |
 | `reflog-append <refname> ...` | `ok` |
 | `reflog-exists <refname>` | `true` or `false` |
 | `reflog-delete <refname>` | `ok` |
 | `reflog-list` | refnames with reflogs, one per line, blank end |
+| **Transactions** | |
+| `odb-transaction-begin` | `ok` |
+| `odb-transaction-commit` | `ok` |
+| `create` | `ok` |
+| `remove` | `ok` |
+| **GC and repack** | |
+| `gc` | `<deleted>` objects removed |
+| `repack` | `<repacked>` objects re-deltified |
+| `mark-kept <oid>` | `ok` |
+| `mark-kept-recent` | `ok` |
+| `clear-kept` | `ok` |
+| `have-kept <oid>` | `true` or `false` |
+| `mark-promisor <oid>` | `ok` |
+| `mark-promisor-recent` | `ok` |
+| `connectivity-check` | `ok` or `error <msg>` |
+| **Partial clone** | |
+| `promise <oid> <remote>` | `ok` |
+| `promisor-remote-add <name> <url>` | `ok` |
+| `promisor-remote-remove <name>` | `ok` |
+| `fetch-object <oid>` | `ok` or `error` |
+| **Commit graph** | |
+| `build-commit-graph` | `<count>` entries |
+| **Worktrees** | |
+| `worktree-add <name> <path> <branch>` | `ok` |
+| `worktree-remove <name>` | `ok` |
+| `worktree-list` | `<name> <path> <head_ref>` per line, blank end |
+| **Alternates** | |
+| `alternate-add <path>` | `ok` |
+| `alternate-remove <path>` | `ok` |
+| `alternate-list` | `<path>` per line, blank end |
+| **Misc** | |
+| `capabilities` | list of supported commands, blank line terminates |
+| `convert-oid <hex> <algo>` | converted oid or `missing` |
+| `refresh` | clears kept marks, reloads state |
+| `close` | exits |
 
 ## Remote helper (git-remote-sqlite)
 
@@ -202,6 +256,8 @@ These operate directly on the SQLite storage layer (no `.git` repo needed). Use 
 | `git_status` | `(repo)` | path, status |
 | `git_blame` | `(repo, path, rev?)` | line_start, line_count, oid, orig_path, author_name, author_email, author_when |
 | `git_config_list` | `(repo)` | key, value |
+| `git_stash` | `(repo)` | index, message, oid |
+| `git_tag` | `(repo, pattern?)` | name, oid, tagger_name, tagger_email, tagger_when, message, target_oid, target_type |
 
 ## LFS (git-lfs-sqlite-transfer)
 

@@ -41,6 +41,17 @@ static sqlite3_stmt *st_mark_promisor;
 static sqlite3_stmt *st_obj_oids;
 static sqlite3_stmt *st_obj_list_promisor, *st_obj_list_skip_kept;
 static sqlite3_stmt *st_cycle_check;
+static sqlite3_stmt *st_oid_map_read, *st_oid_map_write;
+static sqlite3_stmt *st_promisor_add, *st_promisor_del;
+static sqlite3_stmt *st_promised_add, *st_promised_del;
+static sqlite3_stmt *st_worktree_add, *st_worktree_del;
+static sqlite3_stmt *st_alt_add, *st_alt_del, *st_alt_list;
+static sqlite3_stmt *st_commit_gen;
+static sqlite3_stmt *st_connectivity_kept;
+static sqlite3_stmt *st_repack_scan, *st_repack_update;
+static sqlite3_stmt *st_is_promised, *st_fetch_promised;
+static sqlite3_stmt *st_worktree_list;
+static sqlite3_stmt *st_commits_scan;
 static int batch_kept = 0, batch_promisor = 0;
 
 /* Feature 7: Alternates linked list */
@@ -338,7 +349,9 @@ static int storage_init_db(sqlite3 *db) {
 
 	/* Migrate existing databases: add kept and promisor columns */
 	sqlite3_exec(db,
-		"ALTER TABLE objects ADD COLUMN kept INTEGER NOT NULL DEFAULT 0;"
+		"ALTER TABLE objects ADD COLUMN kept INTEGER NOT NULL DEFAULT 0;",
+		0, 0, 0);
+	sqlite3_exec(db,
 		"ALTER TABLE objects ADD COLUMN promisor INTEGER NOT NULL DEFAULT 0;",
 		0, 0, 0);
 
@@ -369,6 +382,27 @@ static int storage_init_db(sqlite3 *db) {
 	sqlite3_prepare_v3(db, "SELECT oid, type, size FROM objects WHERE promisor = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_list_promisor, 0);
 	sqlite3_prepare_v3(db, "SELECT oid, type, size FROM objects WHERE kept = 0",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_list_skip_kept, 0);
 	sqlite3_prepare_v3(db, "SELECT oid FROM objects",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_oids, 0);
+	sqlite3_prepare_v3(db, "SELECT base FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_cycle_check, 0);
+
+	sqlite3_prepare_v3(db, "SELECT dest FROM oid_map WHERE src = ? AND algo = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_oid_map_read, 0);
+	sqlite3_prepare_v3(db, "INSERT OR REPLACE INTO oid_map(src, dest, algo) VALUES(?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_oid_map_write, 0);
+	sqlite3_prepare_v3(db, "INSERT OR REPLACE INTO promisor_remotes(name, url) VALUES(?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_promisor_add, 0);
+	sqlite3_prepare_v3(db, "DELETE FROM promisor_remotes WHERE name = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_promisor_del, 0);
+	sqlite3_prepare_v3(db, "INSERT OR REPLACE INTO promised(oid, remote) VALUES(?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_promised_add, 0);
+	sqlite3_prepare_v3(db, "DELETE FROM promised WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_promised_del, 0);
+	sqlite3_prepare_v3(db, "INSERT OR REPLACE INTO worktrees(name, path, head_ref) VALUES(?,?,?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_worktree_add, 0);
+	sqlite3_prepare_v3(db, "DELETE FROM worktrees WHERE name = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_worktree_del, 0);
+	sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO alternates(path) VALUES(?)",  -1, SQLITE_PREPARE_PERSISTENT, &st_alt_add, 0);
+	sqlite3_prepare_v3(db, "DELETE FROM alternates WHERE path = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_alt_del, 0);
+	sqlite3_prepare_v3(db, "SELECT generation FROM commit_graph WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_commit_gen, 0);
+	sqlite3_prepare_v3(db, "SELECT path FROM alternates ORDER BY path",  -1, SQLITE_PREPARE_PERSISTENT, &st_alt_list, 0);
+	sqlite3_prepare_v3(db, "SELECT oid FROM objects WHERE kept = 1 AND type = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_connectivity_kept, 0);
+	sqlite3_prepare_v3(db, "SELECT oid, type, size, data, base, path FROM objects ORDER BY type, path, size",  -1, SQLITE_PREPARE_PERSISTENT, &st_repack_scan, 0);
+	sqlite3_prepare_v3(db, "UPDATE objects SET data = ?, base = ? WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_repack_update, 0);
+	sqlite3_prepare_v3(db, "SELECT 1 FROM promised WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_is_promised, 0);
+	sqlite3_prepare_v3(db, "SELECT p.remote, r.url FROM promised p JOIN promisor_remotes r ON p.remote = r.name WHERE p.oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_fetch_promised, 0);
+	sqlite3_prepare_v3(db, "SELECT name, path, head_ref FROM worktrees ORDER BY name",  -1, SQLITE_PREPARE_PERSISTENT, &st_worktree_list, 0);
+	sqlite3_prepare_v3(db, "SELECT oid FROM objects WHERE type = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_commits_scan, 0);
 
 	/* Load alternates from persisted table */
 	load_alternates();
@@ -391,6 +425,19 @@ void storage_close(void) {
 	sqlite3_finalize(st_have_kept); sqlite3_finalize(st_mark_promisor);
 	sqlite3_finalize(st_obj_list_promisor); sqlite3_finalize(st_obj_list_skip_kept);
 	sqlite3_finalize(st_obj_oids);
+	sqlite3_finalize(st_cycle_check);
+	sqlite3_finalize(st_oid_map_read); sqlite3_finalize(st_oid_map_write);
+	sqlite3_finalize(st_promisor_add); sqlite3_finalize(st_promisor_del);
+	sqlite3_finalize(st_promised_add); sqlite3_finalize(st_promised_del);
+	sqlite3_finalize(st_worktree_add); sqlite3_finalize(st_worktree_del);
+	sqlite3_finalize(st_alt_add); sqlite3_finalize(st_alt_del);
+	sqlite3_finalize(st_alt_list);
+	sqlite3_finalize(st_commit_gen);
+	sqlite3_finalize(st_connectivity_kept);
+	sqlite3_finalize(st_repack_scan); sqlite3_finalize(st_repack_update);
+	sqlite3_finalize(st_is_promised); sqlite3_finalize(st_fetch_promised);
+	sqlite3_finalize(st_worktree_list);
+	sqlite3_finalize(st_commits_scan);
 	batch_kept = 0; batch_promisor = 0;
 	/* Close alternate connections */
 	while (alt_list) {
@@ -415,9 +462,12 @@ void storage_refresh(void) {
 }
 
 void storage_mark_kept(const git_oid *oid) {
-	sqlite3_bind_blob(st_mark_kept, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-	sqlite3_step(st_mark_kept);
-	sqlite3_reset(st_mark_kept);
+	storage_savepoint("mark_kept");
+	sqlite3_stmt *st = stmt_acquire(st_mark_kept, "UPDATE objects SET kept = 1 WHERE oid = ?");
+	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	sqlite3_step(st);
+	stmt_release(st_mark_kept, st);
+	storage_release("mark_kept");
 }
 
 void storage_mark_kept_recent(void) { batch_kept = 1; }
@@ -427,23 +477,29 @@ void storage_mark_promisor_recent(void) { batch_promisor = 1; }
 void storage_end_promisor_batch(void) { batch_promisor = 0; }
 
 void storage_clear_kept(void) {
-	sqlite3_step(st_clear_kept);
-	sqlite3_reset(st_clear_kept);
+	storage_savepoint("clear_kept");
+	sqlite3_stmt *st = stmt_acquire(st_clear_kept, "UPDATE objects SET kept = 0 WHERE kept = 1");
+	sqlite3_step(st);
+	stmt_release(st_clear_kept, st);
 	batch_kept = 0;
+	storage_release("clear_kept");
 }
 
 int storage_have_kept(const git_oid *oid) {
-	int found;
-	sqlite3_bind_blob(st_have_kept, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-	found = (sqlite3_step(st_have_kept) == SQLITE_ROW);
-	sqlite3_reset(st_have_kept);
+	sqlite3_stmt *st = stmt_acquire(st_have_kept, "SELECT 1 FROM objects WHERE oid = ? AND kept = 1");
+	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	int found = (sqlite3_step(st) == SQLITE_ROW);
+	stmt_release(st_have_kept, st);
 	return found;
 }
 
 void storage_mark_promisor(const git_oid *oid) {
-	sqlite3_bind_blob(st_mark_promisor, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-	sqlite3_step(st_mark_promisor);
-	sqlite3_reset(st_mark_promisor);
+	storage_savepoint("mark_promisor");
+	sqlite3_stmt *st = stmt_acquire(st_mark_promisor, "UPDATE objects SET promisor = 1 WHERE oid = ?");
+	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	sqlite3_step(st);
+	stmt_release(st_mark_promisor, st);
+	storage_release("mark_promisor");
 }
 
 int storage_obj_oids(git_odb_foreach_cb cb, void *data) {
@@ -459,30 +515,32 @@ int storage_obj_oids(git_odb_foreach_cb cb, void *data) {
 
 int storage_obj_list_filtered(int promisor_only, int skip_kept,
 			      storage_obj_cb cb, void *data) {
-	sqlite3_stmt *st = promisor_only ? st_obj_list_promisor :
-			   skip_kept ? st_obj_list_skip_kept :
-			   st_obj_list;
+	sqlite3_stmt *cached = promisor_only ? st_obj_list_promisor :
+			       skip_kept ? st_obj_list_skip_kept :
+			       st_obj_list;
+	const char *sql = promisor_only ? "SELECT oid, type, size FROM objects WHERE promisor = 1" :
+			  skip_kept ? "SELECT oid, type, size FROM objects WHERE kept = 0" :
+			  "SELECT oid, type, size FROM objects";
+	sqlite3_stmt *st = stmt_acquire(cached, sql);
 	while (sqlite3_step(st) == SQLITE_ROW) {
 		git_oid oid;
 		memcpy(oid.id, sqlite3_column_blob(st, 0), GIT_OID_SHA1_SIZE);
 		git_object_t type = (git_object_t)sqlite3_column_int(st, 1);
 		size_t size = (size_t)sqlite3_column_int64(st, 2);
 		if (cb(&oid, type, size, data)) {
-			sqlite3_reset(st);
+			stmt_release(cached, st);
 			return -1;
 		}
 	}
-	sqlite3_reset(st);
+	stmt_release(cached, st);
 	return 0;
 }
 
 int storage_convert_oid(const git_oid *src, const char *algo,
 		       git_oid *dest) {
-	sqlite3_stmt *st;
 	int found = 0;
-	sqlite3_prepare_v2(sdb,
-		"SELECT dest FROM oid_map WHERE src = ? AND algo = ?",
-		-1, &st, 0);
+	sqlite3_stmt *st = stmt_acquire(st_oid_map_read,
+		"SELECT dest FROM oid_map WHERE src = ? AND algo = ?");
 	sqlite3_bind_blob(st, 1, src->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	sqlite3_bind_text(st, 2, algo, -1, SQLITE_STATIC);
 	if (sqlite3_step(st) == SQLITE_ROW) {
@@ -490,21 +548,21 @@ int storage_convert_oid(const git_oid *src, const char *algo,
 		       GIT_OID_SHA1_SIZE);
 		found = 1;
 	}
-	sqlite3_finalize(st);
+	stmt_release(st_oid_map_read, st);
 	return found ? 0 : -1;
 }
 
 void storage_store_oid_map(const git_oid *src, const git_oid *dest,
 			   const char *algo) {
-	sqlite3_stmt *st;
-	sqlite3_prepare_v2(sdb,
-		"INSERT OR REPLACE INTO oid_map(src, dest, algo) VALUES(?,?,?)",
-		-1, &st, 0);
+	storage_savepoint("store_oid_map");
+	sqlite3_stmt *st = stmt_acquire(st_oid_map_write,
+		"INSERT OR REPLACE INTO oid_map(src, dest, algo) VALUES(?,?,?)");
 	sqlite3_bind_blob(st, 1, src->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	sqlite3_bind_blob(st, 2, dest->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	sqlite3_bind_text(st, 3, algo, -1, SQLITE_STATIC);
 	sqlite3_step(st);
-	sqlite3_finalize(st);
+	stmt_release(st_oid_map_write, st);
+	storage_release("store_oid_map");
 }
 
 /*
@@ -526,15 +584,14 @@ int storage_check_connectivity(void) {
 		return -1;
 
 	/* Push all kept commits */
-	sqlite3_prepare_v2(sdb,
-		"SELECT oid FROM objects WHERE kept = 1 AND type = 1",
-		-1, &st, 0);
+	st = stmt_acquire(st_connectivity_kept,
+		"SELECT oid FROM objects WHERE kept = 1 AND type = 1");
 	while (sqlite3_step(st) == SQLITE_ROW) {
 		git_oid oid;
 		memcpy(oid.id, sqlite3_column_blob(st, 0), GIT_OID_SHA1_SIZE);
 		git_revwalk_push(walk, &oid);
 	}
-	sqlite3_finalize(st);
+	stmt_release(st_connectivity_kept, st);
 
 	/* Walk the graph; each commit's tree and parents are resolved.
 	 * If any referenced object is missing, the lookup returns an error. */
@@ -661,12 +718,14 @@ int storage_gc(void) {
 	git_repository *repo = git0_storage_repo();
 	if (!repo) return -1;
 
+	storage_savepoint("gc");
+
 	/* Phase 1: Mark reachable objects */
 	sqlite3_exec(sdb, "CREATE TEMP TABLE reachable(oid BLOB PRIMARY KEY) WITHOUT ROWID", 0, 0, 0);
 
 	sqlite3_stmt *st_insert = NULL, *st_check = NULL;
-	sqlite3_prepare_v2(sdb, "INSERT OR IGNORE INTO temp.reachable(oid) VALUES(?)", -1, &st_insert, 0);
-	sqlite3_prepare_v2(sdb, "SELECT 1 FROM temp.reachable WHERE oid = ?", -1, &st_check, 0);
+	sqlite3_prepare_v3(sdb, "INSERT OR IGNORE INTO temp.reachable(oid) VALUES(?)", -1, SQLITE_PREPARE_PERSISTENT, &st_insert, 0);
+	sqlite3_prepare_v3(sdb, "SELECT 1 FROM temp.reachable WHERE oid = ?", -1, SQLITE_PREPARE_PERSISTENT, &st_check, 0);
 
 	git_revwalk *walk = NULL;
 	if (git_revwalk_new(&walk, repo) < 0) {
@@ -709,6 +768,7 @@ int storage_gc(void) {
 	/* Phase 3: Repack surviving objects */
 	storage_repack();
 
+	storage_release("gc");
 	return deleted;
 }
 
@@ -723,36 +783,34 @@ static int delta_chain_depth(const git_oid *oid) {
 	memcpy(&cur, oid, sizeof(git_oid));
 
 	while (depth <= MAX_DELTA_DEPTH) {
-		sqlite3_stmt *st = NULL;
-		sqlite3_prepare_v2(sdb, "SELECT base FROM objects WHERE oid = ?", -1, &st, 0);
+		sqlite3_stmt *st = stmt_acquire(st_cycle_check,
+			"SELECT base FROM objects WHERE oid = ?");
 		sqlite3_bind_blob(st, 1, cur.id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 		if (sqlite3_step(st) != SQLITE_ROW) {
-			sqlite3_finalize(st);
+			stmt_release(st_cycle_check, st);
 			break;
 		}
 		const void *base_blob = sqlite3_column_blob(st, 0);
 		if (!base_blob) {
-			sqlite3_finalize(st);
+			stmt_release(st_cycle_check, st);
 			break; /* not a delta, depth is 0 from here */
 		}
 		memcpy(cur.id, base_blob, GIT_OID_SHA1_SIZE);
-		sqlite3_finalize(st);
+		stmt_release(st_cycle_check, st);
 		depth++;
 	}
 	return depth;
 }
 
 int storage_repack(void) {
-	sqlite3_stmt *st_scan = NULL, *st_update = NULL;
+	storage_savepoint("repack");
 	int repacked = 0;
 
-	sqlite3_prepare_v2(sdb,
+	sqlite3_stmt *st_scan = stmt_acquire(st_repack_scan,
 		"SELECT oid, type, size, data, base, path FROM objects"
-		" ORDER BY type, path, size",
-		-1, &st_scan, 0);
-	sqlite3_prepare_v2(sdb,
-		"UPDATE objects SET data = ?, base = ? WHERE oid = ?",
-		-1, &st_update, 0);
+		" ORDER BY type, path, size");
+	sqlite3_stmt *st_update = stmt_acquire(st_repack_update,
+		"UPDATE objects SET data = ?, base = ? WHERE oid = ?");
 
 	/* Sliding window of recent objects of the same type */
 	struct window_entry {
@@ -905,16 +963,19 @@ next_entry:
 	for (int i = 0; i < win_count; i++)
 		free(window[i].full_data);
 
-	sqlite3_finalize(st_scan);
-	sqlite3_finalize(st_update);
+	stmt_release(st_repack_scan, st_scan);
+	stmt_release(st_repack_update, st_update);
+	storage_release("repack");
 	return repacked;
 }
 
 void storage_destroy(void) {
+	storage_savepoint("destroy");
 	sqlite3_exec(sdb, "DROP TABLE IF EXISTS objects;"
 		     "DROP TABLE IF EXISTS refs;"
 		     "DROP TABLE IF EXISTS reflog;"
 		     "DROP TABLE IF EXISTS lfs;", 0, 0, 0);
+	storage_release("destroy");
 }
 
 void storage_begin(void) { sqlite3_exec(sdb, "BEGIN", 0, 0, 0); }
@@ -990,8 +1051,9 @@ static int read_object_depth(const git_oid *oid, git_object_t *out_type,
 		return -1;
 	}
 
-	int target_size = delta_output_size(delta, delta_len);
-	if (target_size < 0) { free(base_data); free(delta); return -1; }
+	int raw_size = delta_output_size(delta, delta_len);
+	if (raw_size < 0) { free(base_data); free(delta); return -1; }
+	size_t target_size = (size_t)raw_size;
 
 	/* delta_apply writes a NUL terminator past the output data */
 	*out_data = malloc(target_size + 1);
@@ -1016,11 +1078,12 @@ int storage_read_object(const git_oid *oid, git_object_t *out_type,
 void storage_write_object_named(const git_oid *oid, git_object_t type,
 				const void *data, size_t size,
 				const char *path) {
+	storage_savepoint("write_object_named");
 	sqlite3_stmt *st = stmt_acquire(st_obj_exists, "SELECT 1 FROM objects WHERE oid = ?");
 	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	int exists = (sqlite3_step(st) == SQLITE_ROW);
 	stmt_release(st_obj_exists, st);
-	if (exists) return;
+	if (exists) { storage_release("write_object_named"); return; }
 
 	git_oid base_oid;
 	unsigned char *base_data = NULL;
@@ -1060,13 +1123,14 @@ void storage_write_object_named(const git_oid *oid, git_object_t type,
 	} else {
 		unsigned long comp_len;
 		unsigned char *comp = zcompress(data, size, &comp_len);
-		if (!comp) { free(delta_buf); stmt_release(st_obj_write, st); return; }
+		if (!comp) { free(delta_buf); stmt_release(st_obj_write, st); storage_release("write_object_named"); return; }
 		sqlite3_bind_blob(st, 4, comp, comp_len, SQLITE_STATIC);
 		sqlite3_bind_null(st, 5);
 		sqlite3_step(st);
 		free(comp); free(delta_buf);
 	}
 	stmt_release(st_obj_write, st);
+	storage_release("write_object_named");
 }
 
 void storage_write_object(const git_oid *oid, git_object_t type,
@@ -1129,6 +1193,7 @@ int storage_ref_read(const char *refname, git_oid *oid, char *symref, size_t sym
 }
 
 void storage_ref_write(const char *refname, const git_oid *oid, const char *symref) {
+	storage_savepoint("ref_write");
 	sqlite3_stmt *st = stmt_acquire(st_ref_write, "INSERT OR REPLACE INTO refs(refname, oid, symref) VALUES(?,?,?)");
 	sqlite3_bind_text(st, 1, refname, -1, SQLITE_STATIC);
 	if (oid) sqlite3_bind_blob(st, 2, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
@@ -1137,13 +1202,16 @@ void storage_ref_write(const char *refname, const git_oid *oid, const char *symr
 	else sqlite3_bind_null(st, 3);
 	sqlite3_step(st);
 	stmt_release(st_ref_write, st);
+	storage_release("ref_write");
 }
 
 void storage_ref_delete(const char *refname) {
+	storage_savepoint("ref_delete");
 	sqlite3_stmt *st = stmt_acquire(st_ref_delete, "DELETE FROM refs WHERE refname = ?");
 	sqlite3_bind_text(st, 1, refname, -1, SQLITE_STATIC);
 	sqlite3_step(st);
 	stmt_release(st_ref_delete, st);
+	storage_release("ref_delete");
 }
 
 int storage_ref_list(const char *prefix, storage_ref_cb cb, void *data) {
@@ -1191,10 +1259,12 @@ int storage_reflog_exists(const char *refname) {
 }
 
 void storage_reflog_delete(const char *refname) {
+	storage_savepoint("reflog_delete");
 	sqlite3_stmt *st = stmt_acquire(st_reflog_delete, "DELETE FROM reflog WHERE refname = ?");
 	sqlite3_bind_text(st, 1, refname, -1, SQLITE_STATIC);
 	sqlite3_step(st);
 	stmt_release(st_reflog_delete, st);
+	storage_release("reflog_delete");
 }
 
 int storage_reflog_read(const char *refname, storage_reflog_cb cb, void *data) {
@@ -1244,6 +1314,7 @@ int storage_reflog_list(storage_reflog_name_cb cb, void *data) {
 void storage_reflog_append(const char *refname, const git_oid *old_oid,
 			   const git_oid *new_oid, const char *committer,
 			   long long timestamp, int tz, const char *msg) {
+	storage_savepoint("reflog_append");
 	sqlite3_stmt *st = stmt_acquire(st_reflog_append, "INSERT INTO reflog(refname, idx, old_oid, new_oid, committer, timestamp, tz, msg) VALUES(?, COALESCE((SELECT MAX(idx)+1 FROM reflog WHERE refname = ?), 0), ?, ?, ?, ?, ?, ?)");
 	sqlite3_bind_text(st, 1, refname, -1, SQLITE_STATIC);
 	sqlite3_bind_text(st, 2, refname, -1, SQLITE_STATIC);
@@ -1255,6 +1326,7 @@ void storage_reflog_append(const char *refname, const git_oid *old_oid,
 	sqlite3_bind_text(st, 8, msg ? msg : "", -1, SQLITE_STATIC);
 	sqlite3_step(st);
 	stmt_release(st_reflog_append, st);
+	storage_release("reflog_append");
 }
 
 /* ---- Git delta apply ---- */
@@ -1437,19 +1509,22 @@ static git_object_t pack_type_to_git(int ptype) {
 
 int storage_write_packfile(FILE *in)
 {
+	storage_savepoint("write_packfile");
+
 	/* 1. Read 12-byte header */
 	unsigned char hdr[12];
 	size_t stream_offset = 0;
-	if (pack_read_exact(in, hdr, 12, NULL) < 0) return -1;
+	if (pack_read_exact(in, hdr, 12, NULL) < 0)
+		goto err_early;
 
 	/* Verify PACK magic */
 	if (hdr[0] != 'P' || hdr[1] != 'A' || hdr[2] != 'C' || hdr[3] != 'K')
-		return -1;
+		goto err_early;
 
 	/* Version (network byte order) */
 	uint32_t version = ((uint32_t)hdr[4] << 24) | ((uint32_t)hdr[5] << 16) |
 			   ((uint32_t)hdr[6] << 8)  | (uint32_t)hdr[7];
-	if (version != 2 && version != 3) return -1;
+	if (version != 2 && version != 3) goto err_early;
 
 	/* Object count (network byte order) */
 	uint32_t obj_count = ((uint32_t)hdr[8] << 24) | ((uint32_t)hdr[9] << 16) |
@@ -1459,7 +1534,7 @@ int storage_write_packfile(FILE *in)
 	typedef struct { size_t offset; git_oid oid; } ofs_entry;
 	size_t ofs_cap = obj_count ? obj_count : 1;
 	ofs_entry *ofs_map = calloc(ofs_cap, sizeof(ofs_entry));
-	if (!ofs_map) return -1;
+	if (!ofs_map) goto err_early;
 
 	int written = 0;
 
@@ -1624,52 +1699,59 @@ int storage_write_packfile(FILE *in)
 	}
 
 	free(ofs_map);
+	storage_release("write_packfile");
 	return written;
 
 err:
 	free(ofs_map);
+err_early:
+	storage_rollback_to("write_packfile");
 	return -1;
 }
 
 /* ---- Feature 3: Partial Clone ---- */
 
 void storage_promise_object(const git_oid *oid, const char *remote) {
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
-		"INSERT OR REPLACE INTO promised(oid, remote) VALUES(?,?)",
-		-1, &st, 0);
+	storage_savepoint("promise_object");
+	sqlite3_stmt *st = stmt_acquire(st_promised_add,
+		"INSERT OR REPLACE INTO promised(oid, remote) VALUES(?,?)");
 	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	sqlite3_bind_text(st, 2, remote, -1, SQLITE_STATIC);
 	sqlite3_step(st);
-	sqlite3_finalize(st);
+	stmt_release(st_promised_add, st);
+	storage_release("promise_object");
 }
 
 int storage_is_promised(const git_oid *oid) {
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
-		"SELECT 1 FROM promised WHERE oid = ?", -1, &st, 0);
+	sqlite3_stmt *st = stmt_acquire(st_is_promised,
+		"SELECT 1 FROM promised WHERE oid = ?");
 	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	int found = (sqlite3_step(st) == SQLITE_ROW);
-	sqlite3_finalize(st);
+	stmt_release(st_is_promised, st);
 	return found;
 }
 
 int storage_fetch_promised(const git_oid *oid) {
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
+	storage_savepoint("fetch_promised");
+
+	sqlite3_stmt *st = stmt_acquire(st_fetch_promised,
 		"SELECT p.remote, r.url FROM promised p"
 		" JOIN promisor_remotes r ON p.remote = r.name"
-		" WHERE p.oid = ?",
-		-1, &st, 0);
+		" WHERE p.oid = ?");
 	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	if (sqlite3_step(st) != SQLITE_ROW) {
-		sqlite3_finalize(st);
+		stmt_release(st_fetch_promised, st);
+		storage_rollback_to("fetch_promised");
 		return -1;
 	}
 	const char *url = (const char *)sqlite3_column_text(st, 1);
-	if (!url) { sqlite3_finalize(st); return -1; }
+	if (!url) {
+		stmt_release(st_fetch_promised, st);
+		storage_rollback_to("fetch_promised");
+		return -1;
+	}
 	char *url_copy = strdup(url);
-	sqlite3_finalize(st);
+	stmt_release(st_fetch_promised, st);
 
 	/* Open the remote's sqlite.db */
 	sqlite3 *remote_db = NULL;
@@ -1677,61 +1759,124 @@ int storage_fetch_promised(const git_oid *oid) {
 	free(url_copy);
 	if (rc != SQLITE_OK) {
 		if (remote_db) sqlite3_close(remote_db);
+		storage_rollback_to("fetch_promised");
 		return -1;
 	}
 
-	/* Read the object from the remote db */
-	sqlite3_stmt *rd = NULL;
-	sqlite3_prepare_v2(remote_db,
-		"SELECT type, size, data FROM objects WHERE oid = ? AND base IS NULL",
-		-1, &rd, 0);
-	sqlite3_bind_blob(rd, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-	if (sqlite3_step(rd) != SQLITE_ROW) {
+	/* Read the object from the remote db, resolving delta chains */
+	git_object_t type;
+	size_t size;
+	unsigned char *data = NULL;
+	{
+		int resolved = 0;
+		git_oid cur_oid;
+		memcpy(&cur_oid, oid, sizeof(git_oid));
+
+		/* Walk the delta chain collecting links, then resolve */
+		struct { git_oid oid; char *delta; int delta_len; } chain[MAX_DELTA_DEPTH];
+		int chain_len = 0;
+
+		sqlite3_stmt *rd = NULL;
+		sqlite3_prepare_v2(remote_db,
+			"SELECT type, size, data, base FROM objects WHERE oid = ?",
+			-1, &rd, 0);
+
+		while (chain_len < MAX_DELTA_DEPTH) {
+			sqlite3_reset(rd);
+			sqlite3_bind_blob(rd, 1, cur_oid.id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+			if (sqlite3_step(rd) != SQLITE_ROW)
+				break;
+
+			type = (git_object_t)sqlite3_column_int(rd, 0);
+			size_t obj_size = (size_t)sqlite3_column_int64(rd, 1);
+			const void *comp = sqlite3_column_blob(rd, 2);
+			int comp_len = sqlite3_column_bytes(rd, 2);
+			const void *base_blob = sqlite3_column_blob(rd, 3);
+
+			if (!base_blob) {
+				/* Base object, decompress directly */
+				data = zdecompress(comp, comp_len, obj_size);
+				size = obj_size;
+				resolved = 1;
+				break;
+			}
+
+			/* Delta: save and continue to base */
+			chain[chain_len].delta = malloc(comp_len ? comp_len : 1);
+			if (!chain[chain_len].delta) break;
+			memcpy(chain[chain_len].delta, comp, comp_len);
+			chain[chain_len].delta_len = comp_len;
+			memcpy(chain[chain_len].oid.id, cur_oid.id, GIT_OID_SHA1_SIZE);
+			memcpy(cur_oid.id, base_blob, GIT_OID_SHA1_SIZE);
+			chain_len++;
+		}
 		sqlite3_finalize(rd);
-		sqlite3_close(remote_db);
-		return -1;
-	}
 
-	git_object_t type = (git_object_t)sqlite3_column_int(rd, 0);
-	size_t size = (size_t)sqlite3_column_int64(rd, 1);
-	const void *comp = sqlite3_column_blob(rd, 2);
-	int comp_len = sqlite3_column_bytes(rd, 2);
-	unsigned char *data = zdecompress(comp, comp_len, size);
-	sqlite3_finalize(rd);
-	sqlite3_close(remote_db);
-	if (!data) return -1;
+		/* Apply delta chain in reverse to reconstruct the object */
+		if (resolved && data) {
+			for (int i = chain_len - 1; i >= 0; i--) {
+				int raw_sz = delta_output_size(chain[i].delta, chain[i].delta_len);
+				if (raw_sz < 0) { free(data); data = NULL; break; }
+				size_t target_size = (size_t)raw_sz;
+				unsigned char *out = malloc(target_size + 1);
+				if (!out) { free(data); data = NULL; break; }
+				if (delta_apply((const char *)data, size,
+						chain[i].delta, chain[i].delta_len,
+						(char *)out) < 0) {
+					free(out); free(data); data = NULL; break;
+				}
+				free(data);
+				data = out;
+				size = target_size;
+			}
+		}
+
+		/* Free delta chain */
+		for (int i = 0; i < chain_len; i++)
+			free(chain[i].delta);
+
+		sqlite3_close(remote_db);
+		if (!data) {
+			storage_rollback_to("fetch_promised");
+			return -1;
+		}
+	}
 
 	/* Write locally and remove from promised */
 	storage_write_object(oid, type, data, size);
 	free(data);
 
-	st = NULL;
-	sqlite3_prepare_v2(sdb, "DELETE FROM promised WHERE oid = ?", -1, &st, 0);
-	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
-	sqlite3_step(st);
-	sqlite3_finalize(st);
+	{
+		sqlite3_stmt *del = stmt_acquire(st_promised_del,
+			"DELETE FROM promised WHERE oid = ?");
+		sqlite3_bind_blob(del, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+		sqlite3_step(del);
+		stmt_release(st_promised_del, del);
+	}
 
+	storage_release("fetch_promised");
 	return 0;
 }
 
 void storage_add_promisor_remote(const char *name, const char *url) {
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
-		"INSERT OR REPLACE INTO promisor_remotes(name, url) VALUES(?,?)",
-		-1, &st, 0);
+	storage_savepoint("add_promisor_remote");
+	sqlite3_stmt *st = stmt_acquire(st_promisor_add,
+		"INSERT OR REPLACE INTO promisor_remotes(name, url) VALUES(?,?)");
 	sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
 	sqlite3_bind_text(st, 2, url, -1, SQLITE_STATIC);
 	sqlite3_step(st);
-	sqlite3_finalize(st);
+	stmt_release(st_promisor_add, st);
+	storage_release("add_promisor_remote");
 }
 
 void storage_remove_promisor_remote(const char *name) {
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
-		"DELETE FROM promisor_remotes WHERE name = ?", -1, &st, 0);
+	storage_savepoint("remove_promisor_remote");
+	sqlite3_stmt *st = stmt_acquire(st_promisor_del,
+		"DELETE FROM promisor_remotes WHERE name = ?");
 	sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
 	sqlite3_step(st);
-	sqlite3_finalize(st);
+	stmt_release(st_promisor_del, st);
+	storage_release("remove_promisor_remote");
 }
 
 /* ---- Feature 4: Commit Graph ---- */
@@ -1785,10 +1930,11 @@ static long long parse_commit_time(const unsigned char *data, size_t size) {
 }
 
 int storage_build_commit_graph(void) {
+	storage_savepoint("commit_graph");
+
 	/* Collect all commits */
-	sqlite3_stmt *st_scan = NULL;
-	sqlite3_prepare_v2(sdb,
-		"SELECT oid FROM objects WHERE type = 1", -1, &st_scan, 0);
+	sqlite3_stmt *st_scan = stmt_acquire(st_commits_scan,
+		"SELECT oid FROM objects WHERE type = 1");
 
 	/* Use a temp table for BFS */
 	sqlite3_exec(sdb,
@@ -1840,61 +1986,42 @@ int storage_build_commit_graph(void) {
 			sqlite3_reset(st_ins_parent);
 		}
 	}
-	sqlite3_finalize(st_scan);
+	stmt_release(st_commits_scan, st_scan);
 	sqlite3_finalize(st_ins_work);
 	sqlite3_finalize(st_ins_parent);
 
-	/*
-	 * BFS generation computation:
-	 * 1. Find roots (commits not appearing as children in cg_parents), set gen=1
-	 * 2. Iterate: for each commit with generation set, find children whose
-	 *    parents all have generation > 0, set child gen = max(parent gen) + 1
-	 */
 	/* Remove parent edges pointing to missing objects (deleted/orphaned).
-	   This ensures the relaxation doesn't wait forever for them. */
+	   This ensures the generation computation doesn't stall on them. */
 	sqlite3_exec(sdb,
 		"DELETE FROM temp.cg_parents"
 		" WHERE parent NOT IN (SELECT oid FROM temp.cg_work);",
 		0, 0, 0);
 
-	/* Roots: commits with no parent edges (true roots + orphans). */
+	/*
+	 * Compute generations via WITH RECURSIVE over the parent edges.
+	 * Roots (no parent edges) get generation=1. Each child gets
+	 * max(parent generation) + 1, computed by the recursive CTE
+	 * propagating depth through the DAG one level at a time.
+	 * The final INSERT OR REPLACE writes directly to commit_graph.
+	 */
 	sqlite3_exec(sdb,
-		"UPDATE temp.cg_work SET generation = 1"
-		" WHERE oid NOT IN (SELECT DISTINCT child FROM temp.cg_parents);",
-		0, 0, 0);
-
-	/* Iterative SQL relaxation: each pass resolves one depth level.
-	   WHERE generation = 0 limits to unresolved commits.
-	   HAVING MIN(pw.generation) > 0 ensures all parents are resolved.
-	   Prepare+step+finalize per iteration for fresh reads. */
-	int changed = 1;
-	while (changed) {
-		sqlite3_stmt *st_relax = NULL;
-		sqlite3_prepare_v2(sdb,
-			"UPDATE temp.cg_work SET generation = ("
-			"  SELECT MAX(pw.generation) + 1"
-			"  FROM temp.cg_parents cp"
-			"  JOIN temp.cg_work pw ON cp.parent = pw.oid"
-			"  WHERE cp.child = cg_work.oid"
-			")"
-			" WHERE generation = 0"
-			" AND oid IN ("
-			"  SELECT cp.child FROM temp.cg_parents cp"
-			"  JOIN temp.cg_work pw ON cp.parent = pw.oid"
-			"  WHERE pw.generation > 0"
-			"  GROUP BY cp.child"
-			"  HAVING MIN(pw.generation) > 0"
-			")",
-			-1, &st_relax, 0);
-		sqlite3_step(st_relax);
-		changed = sqlite3_changes(sdb);
-		sqlite3_finalize(st_relax);
-	}
-
-	/* Write results to commit_graph */
-	sqlite3_exec(sdb,
-		"INSERT OR REPLACE INTO commit_graph(oid, generation, commit_time)"
-		" SELECT oid, generation, commit_time FROM temp.cg_work;",
+		"WITH RECURSIVE"
+		"  roots(oid) AS ("
+		"    SELECT oid FROM temp.cg_work"
+		"    WHERE oid NOT IN (SELECT DISTINCT child FROM temp.cg_parents)"
+		"  ),"
+		"  gen(oid, generation) AS ("
+		"    SELECT oid, 1 FROM roots"
+		"    UNION ALL"
+		"    SELECT cp.child, g.generation + 1"
+		"    FROM temp.cg_parents cp"
+		"    JOIN gen g ON cp.parent = g.oid"
+		"  )"
+		" INSERT OR REPLACE INTO commit_graph(oid, generation, commit_time)"
+		" SELECT w.oid, MAX(g.generation), w.commit_time"
+		" FROM gen g"
+		" JOIN temp.cg_work w ON g.oid = w.oid"
+		" GROUP BY g.oid;",
 		0, 0, 0);
 
 	int count = 0;
@@ -1910,70 +2037,69 @@ int storage_build_commit_graph(void) {
 		"DROP TABLE IF EXISTS temp.cg_work;",
 		0, 0, 0);
 
+	storage_release("commit_graph");
 	return count;
 }
 
 int storage_commit_generation(const git_oid *oid) {
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
-		"SELECT generation FROM commit_graph WHERE oid = ?", -1, &st, 0);
+	sqlite3_stmt *st = stmt_acquire(st_commit_gen,
+		"SELECT generation FROM commit_graph WHERE oid = ?");
 	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
 	int gen = -1;
 	if (sqlite3_step(st) == SQLITE_ROW)
 		gen = sqlite3_column_int(st, 0);
-	sqlite3_finalize(st);
+	stmt_release(st_commit_gen, st);
 	return gen;
 }
 
 /* ---- Feature 6: Worktrees ---- */
 
 void storage_worktree_add(const char *name, const char *path, const char *branch) {
+	storage_savepoint("worktree_add");
 	/* Create the worktree entry */
 	char head_ref[4096];
 	snprintf(head_ref, sizeof(head_ref), "refs/heads/%s", branch);
 
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
-		"INSERT OR REPLACE INTO worktrees(name, path, head_ref) VALUES(?,?,?)",
-		-1, &st, 0);
+	sqlite3_stmt *st = stmt_acquire(st_worktree_add,
+		"INSERT OR REPLACE INTO worktrees(name, path, head_ref) VALUES(?,?,?)");
 	sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
 	sqlite3_bind_text(st, 2, path, -1, SQLITE_STATIC);
 	sqlite3_bind_text(st, 3, head_ref, -1, SQLITE_STATIC);
 	sqlite3_step(st);
-	sqlite3_finalize(st);
+	stmt_release(st_worktree_add, st);
 
 	/* Create symref refs/worktrees/<name>/HEAD pointing to the branch */
 	char wt_head[4096];
 	snprintf(wt_head, sizeof(wt_head), "refs/worktrees/%s/HEAD", name);
 	storage_ref_write(wt_head, NULL, head_ref);
+	storage_release("worktree_add");
 }
 
 void storage_worktree_remove(const char *name) {
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
-		"DELETE FROM worktrees WHERE name = ?", -1, &st, 0);
+	storage_savepoint("worktree_remove");
+	sqlite3_stmt *st = stmt_acquire(st_worktree_del,
+		"DELETE FROM worktrees WHERE name = ?");
 	sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
 	sqlite3_step(st);
-	sqlite3_finalize(st);
+	stmt_release(st_worktree_del, st);
 
 	/* Remove the HEAD symref */
 	char wt_head[4096];
 	snprintf(wt_head, sizeof(wt_head), "refs/worktrees/%s/HEAD", name);
 	storage_ref_delete(wt_head);
+	storage_release("worktree_remove");
 }
 
 int storage_worktree_list(storage_worktree_cb cb, void *data) {
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
-		"SELECT name, path, head_ref FROM worktrees ORDER BY name",
-		-1, &st, 0);
+	sqlite3_stmt *st = stmt_acquire(st_worktree_list,
+		"SELECT name, path, head_ref FROM worktrees ORDER BY name");
 	while (sqlite3_step(st) == SQLITE_ROW) {
 		const char *name = (const char *)sqlite3_column_text(st, 0);
 		const char *path = (const char *)sqlite3_column_text(st, 1);
 		const char *head_ref = (const char *)sqlite3_column_text(st, 2);
 		if (cb(name, path, head_ref, data)) break;
 	}
-	sqlite3_finalize(st);
+	stmt_release(st_worktree_list, st);
 	return 0;
 }
 
@@ -2025,8 +2151,9 @@ static int read_from_alternate(struct alternate *alt, const git_oid *oid,
 		return -1;
 	}
 
-	int target_size = delta_output_size(delta, delta_len);
-	if (target_size < 0) { free(base_data); free(delta); return -1; }
+	int raw_size = delta_output_size(delta, delta_len);
+	if (raw_size < 0) { free(base_data); free(delta); return -1; }
+	size_t target_size = (size_t)raw_size;
 
 	*out_data = malloc(target_size + 1);
 	if (!*out_data) { free(base_data); free(delta); return -1; }
@@ -2067,17 +2194,19 @@ static void alternate_open(const char *path) {
 }
 
 void storage_alternate_add(const char *path) {
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
-		"INSERT OR IGNORE INTO alternates(path) VALUES(?)", -1, &st, 0);
+	storage_savepoint("alternate_add");
+	sqlite3_stmt *st = stmt_acquire(st_alt_add,
+		"INSERT OR IGNORE INTO alternates(path) VALUES(?)");
 	sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
 	sqlite3_step(st);
-	sqlite3_finalize(st);
+	stmt_release(st_alt_add, st);
 
 	alternate_open(path);
+	storage_release("alternate_add");
 }
 
 void storage_alternate_remove(const char *path) {
+	storage_savepoint("alternate_remove");
 	/* Remove from linked list */
 	struct alternate **pp = &alt_list;
 	while (*pp) {
@@ -2094,36 +2223,34 @@ void storage_alternate_remove(const char *path) {
 	}
 
 	/* Remove from table */
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
-		"DELETE FROM alternates WHERE path = ?", -1, &st, 0);
+	sqlite3_stmt *st = stmt_acquire(st_alt_del,
+		"DELETE FROM alternates WHERE path = ?");
 	sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
 	sqlite3_step(st);
-	sqlite3_finalize(st);
+	stmt_release(st_alt_del, st);
+	storage_release("alternate_remove");
 }
 
 int storage_alternate_list(storage_alternate_cb cb, void *data) {
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
-		"SELECT path FROM alternates ORDER BY path", -1, &st, 0);
+	sqlite3_stmt *st = stmt_acquire(st_alt_list,
+		"SELECT path FROM alternates ORDER BY path");
 	while (sqlite3_step(st) == SQLITE_ROW) {
 		const char *path = (const char *)sqlite3_column_text(st, 0);
 		if (cb(path, data)) break;
 	}
-	sqlite3_finalize(st);
+	stmt_release(st_alt_list, st);
 	return 0;
 }
 
 /* Load alternates from the table (called during storage_open / storage_init_db) */
 static void load_alternates(void) {
-	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb,
-		"SELECT path FROM alternates", -1, &st, 0);
+	sqlite3_stmt *st = stmt_acquire(st_alt_list,
+		"SELECT path FROM alternates ORDER BY path");
 	while (sqlite3_step(st) == SQLITE_ROW) {
 		const char *path = (const char *)sqlite3_column_text(st, 0);
 		alternate_open(path);
 	}
-	sqlite3_finalize(st);
+	stmt_release(st_alt_list, st);
 }
 
 /* ---- LFS ---- */
@@ -2171,15 +2298,16 @@ int storage_lfs_read(const unsigned char oid[LFS_OID_RAWSZ],
 
 void storage_lfs_write(const unsigned char oid[LFS_OID_RAWSZ],
 		       const void *data, size_t size) {
+	storage_savepoint("lfs_write");
 	sqlite3_stmt *st = stmt_acquire(st_lfs_exists, "SELECT 1 FROM lfs WHERE oid = ?");
 	sqlite3_bind_blob(st, 1, oid, LFS_OID_RAWSZ, SQLITE_STATIC);
 	int exists = (sqlite3_step(st) == SQLITE_ROW);
 	stmt_release(st_lfs_exists, st);
-	if (exists) return;
+	if (exists) { storage_release("lfs_write"); return; }
 
 	unsigned long comp_len;
 	unsigned char *comp = zcompress(data, size, &comp_len);
-	if (!comp) return;
+	if (!comp) { storage_release("lfs_write"); return; }
 
 	st = stmt_acquire(st_lfs_write, "INSERT OR IGNORE INTO lfs(oid, size, data) VALUES(?,?,?)");
 	sqlite3_bind_blob(st, 1, oid, LFS_OID_RAWSZ, SQLITE_STATIC);
@@ -2188,6 +2316,7 @@ void storage_lfs_write(const unsigned char oid[LFS_OID_RAWSZ],
 	sqlite3_step(st);
 	stmt_release(st_lfs_write, st);
 	free(comp);
+	storage_release("lfs_write");
 }
 
 int storage_lfs_exists(const unsigned char oid[LFS_OID_RAWSZ]) {
