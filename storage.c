@@ -121,6 +121,32 @@ static unsigned char *zdecompress(const void *src, unsigned long srclen,
 	return dst;
 }
 
+/* ---- Fossil delta wrappers (size-safe) ----
+ *
+ * The vendored fossil delta library uses int/unsigned int for sizes.
+ * Objects > 2GB cannot be processed. These wrappers reject oversized
+ * inputs instead of silently truncating.
+ */
+
+static int safe_delta_create(const char *src, size_t src_len,
+			     const char *out, size_t out_len,
+			     char *delta) {
+	if (src_len > UINT_MAX || out_len > UINT_MAX) return -1;
+	return delta_create(src, (unsigned int)src_len, out, (unsigned int)out_len, delta);
+}
+
+static int safe_delta_apply(const char *src, size_t src_len,
+			    const char *delta, size_t delta_len,
+			    char *out) {
+	if (src_len > INT_MAX || delta_len > INT_MAX) return -1;
+	return delta_apply(src, (int)src_len, delta, (int)delta_len, out);
+}
+
+static int safe_delta_output_size(const char *delta, size_t delta_len) {
+	if (delta_len > INT_MAX) return -1;
+	return delta_output_size(delta, (int)delta_len);
+}
+
 /* ---- Delta base selection ---- */
 
 static int find_delta_base(git_object_t type, size_t target_size,
@@ -909,7 +935,7 @@ int storage_repack(void) {
 
 			char *dbuf = malloc(full_size + 60);
 			if (!dbuf) continue;
-			int dlen = delta_create((const char *)we->full_data, we->full_size,
+			int dlen = safe_delta_create((const char *)we->full_data, we->full_size,
 						(const char *)full_data, full_size, dbuf);
 			if (dlen <= 0) { free(dbuf); continue; }
 
@@ -1054,14 +1080,14 @@ static int read_object_depth(const git_oid *oid, git_object_t *out_type,
 		return -1;
 	}
 
-	int raw_size = delta_output_size(delta, delta_len);
+	int raw_size = safe_delta_output_size(delta, delta_len);
 	if (raw_size < 0) { free(base_data); free(delta); return -1; }
 	size_t target_size = (size_t)raw_size;
 
 	/* delta_apply writes a NUL terminator past the output data */
 	*out_data = malloc(target_size + 1);
 	if (!*out_data) { free(base_data); free(delta); return -1; }
-	if (delta_apply((const char *)base_data, base_size,
+	if (safe_delta_apply((const char *)base_data, base_size,
 			delta, delta_len, (char *)*out_data) < 0) {
 		free(base_data); free(delta); free(*out_data);
 		return -1;
@@ -1098,7 +1124,7 @@ void storage_write_object_named(const git_oid *oid, git_object_t type,
 	if (size > 64 && find_delta_base(type, size, path, &base_oid, &base_data, &base_len) == 0) {
 		delta_buf = malloc(size + 60);
 		if (delta_buf) {
-			delta_len = delta_create((const char *)base_data, base_len,
+			delta_len = safe_delta_create((const char *)base_data, base_len,
 						 (const char *)data, size, delta_buf);
 			if (delta_len > 0 && (size_t)delta_len < size * 9 / 10)
 					use_delta = 1;
@@ -1471,7 +1497,7 @@ static unsigned char *inflate_from_stream(FILE *in, size_t expected_size,
 	if (!out) { inflateEnd(&zs); return NULL; }
 
 	zs.next_out = out;
-	zs.avail_out = (uInt)expected_size;
+	zs.avail_out = (expected_size > UINT_MAX) ? UINT_MAX : (uInt)expected_size;
 
 	unsigned char inbuf[8192];
 	size_t total_in = 0;
@@ -1931,12 +1957,12 @@ int storage_fetch_promised(const git_oid *oid) {
 		/* Apply delta chain in reverse to reconstruct the object */
 		if (resolved && data) {
 			for (int i = chain_len - 1; i >= 0; i--) {
-				int raw_sz = delta_output_size(chain[i].delta, chain[i].delta_len);
+				int raw_sz = safe_delta_output_size(chain[i].delta, chain[i].delta_len);
 				if (raw_sz < 0) { free(data); data = NULL; break; }
 				size_t target_size = (size_t)raw_sz;
 				unsigned char *out = malloc(target_size + 1);
 				if (!out) { free(data); data = NULL; break; }
-				if (delta_apply((const char *)data, size,
+				if (safe_delta_apply((const char *)data, size,
 						chain[i].delta, chain[i].delta_len,
 						(char *)out) < 0) {
 					free(out); free(data); data = NULL; break;
@@ -2181,13 +2207,13 @@ static int read_from_alternate(struct alternate *alt, const git_oid *oid,
 		return -1;
 	}
 
-	int raw_size = delta_output_size(delta, delta_len);
+	int raw_size = safe_delta_output_size(delta, delta_len);
 	if (raw_size < 0) { free(base_data); free(delta); return -1; }
 	size_t target_size = (size_t)raw_size;
 
 	*out_data = malloc(target_size + 1);
 	if (!*out_data) { free(base_data); free(delta); return -1; }
-	if (delta_apply((const char *)base_data, base_size,
+	if (safe_delta_apply((const char *)base_data, base_size,
 			delta, delta_len, (char *)*out_data) < 0) {
 		free(base_data); free(delta); free(*out_data);
 		return -1;
