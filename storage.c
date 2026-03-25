@@ -85,7 +85,7 @@ static sqlite3_stmt *stmt_acquire(sqlite3_stmt *cached, const char *sql) {
 		return cached;
 	}
 	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v2(sdb, sql, -1, &st, 0);
+	sqlite3_prepare_v3(sdb, sql, -1, SQLITE_PREPARE_PERSISTENT, &st, 0);
 	return st;
 }
 
