@@ -85,7 +85,9 @@ static sqlite3_stmt *stmt_acquire(sqlite3_stmt *cached, const char *sql) {
 		return cached;
 	}
 	sqlite3_stmt *st = NULL;
-	sqlite3_prepare_v3(sdb, sql, -1, SQLITE_PREPARE_PERSISTENT, &st, 0);
+	int rc = sqlite3_prepare_v3(sdb, sql, -1, SQLITE_PREPARE_PERSISTENT, &st, 0);
+	if (rc != SQLITE_OK)
+		fprintf(stderr, "sqlite-git: prepare failed (%d): %s\n", rc, sqlite3_errmsg(sdb));
 	return st;
 }
 
