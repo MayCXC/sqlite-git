@@ -255,7 +255,8 @@ int storage_open_db(sqlite3 *db, int persistent) {
 		"  base BLOB, path TEXT,"
 		"  kept INTEGER NOT NULL DEFAULT 0,"
 		"  promisor INTEGER NOT NULL DEFAULT 0,"
-		"  reachable INTEGER NOT NULL DEFAULT 0"
+		"  reachable INTEGER NOT NULL DEFAULT 0,"
+		"  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
 		") WITHOUT ROWID;"
 		"CREATE TABLE IF NOT EXISTS refs("
 		"  refname TEXT PRIMARY KEY, oid BLOB, symref TEXT"
@@ -319,7 +320,8 @@ static int storage_init_db(sqlite3 *db) {
 		"  base BLOB, path TEXT,"
 		"  kept INTEGER NOT NULL DEFAULT 0,"
 		"  promisor INTEGER NOT NULL DEFAULT 0,"
-		"  reachable INTEGER NOT NULL DEFAULT 0"
+		"  reachable INTEGER NOT NULL DEFAULT 0,"
+		"  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
 		") WITHOUT ROWID;"
 		"CREATE TABLE IF NOT EXISTS refs("
 		"  refname TEXT PRIMARY KEY, oid BLOB, symref TEXT"
@@ -388,6 +390,9 @@ static int storage_init_db(sqlite3 *db) {
 	sqlite3_exec(db,
 		"ALTER TABLE objects ADD COLUMN reachable INTEGER NOT NULL DEFAULT 0;",
 		0, 0, 0);
+	sqlite3_exec(db,
+		"ALTER TABLE objects ADD COLUMN created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'));",
+		0, 0, 0);
 
 	sqlite3_prepare_v3(db, "SELECT type, size, data, base FROM objects WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_read, 0);
 	sqlite3_prepare_v3(db, "INSERT OR IGNORE INTO objects(oid, type, size, data, base, path, kept, promisor, reachable) VALUES(?,?,?,?,?,?,?,?,0)",  -1, SQLITE_PREPARE_PERSISTENT, &st_obj_write, 0);
@@ -431,7 +436,7 @@ static int storage_init_db(sqlite3 *db) {
 	sqlite3_prepare_v3(db, "SELECT generation FROM commit_graph WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_commit_gen, 0);
 	sqlite3_prepare_v3(db, "SELECT path FROM alternates ORDER BY path",  -1, SQLITE_PREPARE_PERSISTENT, &st_alt_list, 0);
 	sqlite3_prepare_v3(db, "SELECT oid FROM objects WHERE kept = 1 AND type = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_connectivity_kept, 0);
-	sqlite3_prepare_v3(db, "SELECT oid, type, size, data, base, path FROM objects ORDER BY type, path, size",  -1, SQLITE_PREPARE_PERSISTENT, &st_repack_scan, 0);
+	sqlite3_prepare_v3(db, "SELECT oid, type, size, data, base, path FROM objects ORDER BY type, SUBSTR(path, LENGTH(path) - LENGTH(REPLACE(path, '/', '')) + 1), size",  -1, SQLITE_PREPARE_PERSISTENT, &st_repack_scan, 0);
 	sqlite3_prepare_v3(db, "UPDATE objects SET data = ?, base = ? WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_repack_update, 0);
 	sqlite3_prepare_v3(db, "SELECT 1 FROM promised WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_is_promised, 0);
 	sqlite3_prepare_v3(db, "SELECT p.remote, r.url FROM promised p JOIN promisor_remotes r ON p.remote = r.name WHERE p.oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_fetch_promised, 0);
@@ -440,7 +445,7 @@ static int storage_init_db(sqlite3 *db) {
 	sqlite3_prepare_v3(db, "UPDATE objects SET reachable = 1 WHERE oid = ?",  -1, SQLITE_PREPARE_PERSISTENT, &st_mark_reachable, 0);
 	sqlite3_prepare_v3(db, "SELECT 1 FROM objects WHERE oid = ? AND reachable = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_is_reachable, 0);
 	sqlite3_prepare_v3(db, "UPDATE objects SET reachable = 0 WHERE reachable = 1",  -1, SQLITE_PREPARE_PERSISTENT, &st_clear_reachable, 0);
-	sqlite3_prepare_v3(db, "DELETE FROM objects WHERE reachable = 0 AND kept = 0 AND promisor = 0",  -1, SQLITE_PREPARE_PERSISTENT, &st_gc_sweep, 0);
+	sqlite3_prepare_v3(db, "DELETE FROM objects WHERE reachable = 0 AND kept = 0 AND promisor = 0 AND created_at < strftime('%s','now') - 1209600",  -1, SQLITE_PREPARE_PERSISTENT, &st_gc_sweep, 0);
 
 	/* Load alternates from persisted table */
 	load_alternates();
@@ -790,7 +795,8 @@ int storage_gc(void) {
 	/* Phase 2: Sweep unreachable objects (preserve kept and promisor) */
 	{
 		sqlite3_stmt *st = stmt_acquire(st_gc_sweep,
-			"DELETE FROM objects WHERE reachable = 0 AND kept = 0 AND promisor = 0");
+			"DELETE FROM objects WHERE reachable = 0 AND kept = 0 AND promisor = 0"
+			" AND created_at < strftime('%s','now') - 1209600");
 		sqlite3_step(st);
 		stmt_release(st_gc_sweep, st);
 	}
@@ -839,7 +845,7 @@ int storage_repack(void) {
 
 	sqlite3_stmt *st_scan = stmt_acquire(st_repack_scan,
 		"SELECT oid, type, size, data, base, path FROM objects"
-		" ORDER BY type, path, size");
+		" ORDER BY type, SUBSTR(path, LENGTH(path) - LENGTH(REPLACE(path, '/', '')) + 1), size");
 	sqlite3_stmt *st_update = stmt_acquire(st_repack_update,
 		"UPDATE objects SET data = ?, base = ? WHERE oid = ?");
 
