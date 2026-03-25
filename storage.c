@@ -1500,6 +1500,61 @@ static int pack_read_exact(FILE *in, void *buf, size_t n, size_t *offset)
 #define PACK_OBJ_OFS_DELTA 6
 #define PACK_OBJ_REF_DELTA 7
 
+/* Pending delta for thin pack resolution */
+struct pending_delta {
+	git_oid base_oid;
+	unsigned char *delta;
+	size_t delta_len;
+	uint32_t pack_idx;
+	struct pending_delta *next;
+};
+
+/*
+ * After writing an object, scan the pending delta list for any deltas
+ * that depend on it. Resolve them eagerly, which may in turn unblock
+ * further deltas (restart scan after each resolution).
+ * Same pattern as git-core unpack-objects.c:added_object().
+ */
+typedef struct { size_t offset; git_oid oid; } ofs_entry;
+
+static void resolve_pending_deltas(struct pending_delta **list,
+				   const git_oid *oid,
+				   ofs_entry *ofs_map, int *written)
+{
+	struct pending_delta **pp = list;
+	while (*pp) {
+		struct pending_delta *pd = *pp;
+		if (memcmp(pd->base_oid.id, oid->id, GIT_OID_SHA1_SIZE)) {
+			pp = &pd->next;
+			continue;
+		}
+		/* Remove from list before resolving */
+		*pp = pd->next;
+
+		git_object_t bt; size_t bs; unsigned char *bd;
+		if (storage_read_object(&pd->base_oid, &bt, &bs, &bd) < 0) {
+			free(pd->delta); free(pd);
+			continue;
+		}
+		unsigned char *res; size_t rlen;
+		if (git_delta_apply(bd, bs, pd->delta, pd->delta_len,
+				    &res, &rlen) < 0) {
+			free(bd); free(pd->delta); free(pd);
+			continue;
+		}
+		git_oid resolved_oid;
+		git_odb_hash(&resolved_oid, res, rlen, bt);
+		storage_write_object(&resolved_oid, bt, res, rlen);
+		memcpy(&ofs_map[pd->pack_idx].oid, &resolved_oid, sizeof(git_oid));
+		(*written)++;
+		free(bd); free(res); free(pd->delta); free(pd);
+
+		/* Restart: the resolved object may unblock others */
+		resolve_pending_deltas(list, &resolved_oid, ofs_map, written);
+		pp = list;
+	}
+}
+
 static git_object_t pack_type_to_git(int ptype) {
 	switch (ptype) {
 	case PACK_OBJ_COMMIT: return GIT_OBJECT_COMMIT;
@@ -1521,23 +1576,26 @@ int storage_write_packfile(FILE *in)
 		goto err_early;
 
 	/* Verify PACK magic */
-	if (hdr[0] != 'P' || hdr[1] != 'A' || hdr[2] != 'C' || hdr[3] != 'K')
+	if (hdr[0] != 'P' || hdr[1] != 'A' || hdr[2] != 'C' || hdr[3] != 'K') {
 		goto err_early;
+	}
 
 	/* Version (network byte order) */
 	uint32_t version = ((uint32_t)hdr[4] << 24) | ((uint32_t)hdr[5] << 16) |
 			   ((uint32_t)hdr[6] << 8)  | (uint32_t)hdr[7];
-	if (version != 2 && version != 3) goto err_early;
-
+	if (version != 2 && version != 3) {
+		goto err_early;
+	}
 	/* Object count (network byte order) */
 	uint32_t obj_count = ((uint32_t)hdr[8] << 24) | ((uint32_t)hdr[9] << 16) |
 			     ((uint32_t)hdr[10] << 8) | (uint32_t)hdr[11];
-
 	/* 2. Allocate offset-to-OID mapping */
-	typedef struct { size_t offset; git_oid oid; } ofs_entry;
 	size_t ofs_cap = obj_count ? obj_count : 1;
 	ofs_entry *ofs_map = calloc(ofs_cap, sizeof(ofs_entry));
 	if (!ofs_map) goto err_early;
+
+	/* Deferred deltas: linked list, resolved eagerly after each write */
+	struct pending_delta *pending = NULL;
 
 	int written = 0;
 
@@ -1566,7 +1624,9 @@ int storage_write_packfile(FILE *in)
 			/* Non-delta object: inflate, hash, store */
 			size_t consumed = 0;
 			unsigned char *data = inflate_from_stream(in, size, &consumed);
-			if (!data) goto err;
+			if (!data) {
+				goto err;
+			}
 			stream_offset += consumed;
 
 			git_object_t gtype = pack_type_to_git(ptype);
@@ -1578,6 +1638,7 @@ int storage_write_packfile(FILE *in)
 			ofs_map[i].offset = obj_offset;
 			memcpy(&ofs_map[i].oid, &oid, sizeof(git_oid));
 			written++;
+			resolve_pending_deltas(&pending, &oid, ofs_map, &written);
 
 		} else if (ptype == PACK_OBJ_OFS_DELTA) {
 			/* OFS_DELTA: read negative offset, then delta */
@@ -1604,7 +1665,9 @@ int storage_write_packfile(FILE *in)
 					break;
 				}
 			}
-			if (!found) goto err;
+			if (!found) {
+				goto err;
+			}
 
 			/* Inflate delta */
 			size_t consumed = 0;
@@ -1612,26 +1675,30 @@ int storage_write_packfile(FILE *in)
 			if (!delta) goto err;
 			stream_offset += consumed;
 
-			/* Read base object */
+			/* Read base, apply delta, store. Defer if base missing. */
 			git_object_t base_type;
 			size_t base_size;
 			unsigned char *base_data;
 			if (storage_read_object(&base_oid, &base_type, &base_size, &base_data) < 0) {
-				free(delta);
-				goto err;
+				/* Base not available yet; defer */
+				struct pending_delta *pd = malloc(sizeof(*pd));
+				pd->base_oid = base_oid;
+				pd->delta = delta;
+				pd->delta_len = size;
+				pd->pack_idx = i;
+				pd->next = pending;
+				pending = pd;
+				ofs_map[i].offset = obj_offset;
+				continue;
 			}
 
-			/* Apply git delta */
 			unsigned char *result;
 			size_t result_len;
 			if (git_delta_apply(base_data, base_size, delta, size,
 					    &result, &result_len) < 0) {
-				free(base_data);
-				free(delta);
-				goto err;
+				free(base_data); free(delta); goto err;
 			}
 
-			/* Hash and store */
 			git_oid oid;
 			git_odb_hash(&oid, result, result_len, base_type);
 			storage_write_object(&oid, base_type, result, result_len);
@@ -1639,10 +1706,9 @@ int storage_write_packfile(FILE *in)
 			ofs_map[i].offset = obj_offset;
 			memcpy(&ofs_map[i].oid, &oid, sizeof(git_oid));
 			written++;
+			resolve_pending_deltas(&pending, &oid, ofs_map, &written);
 
-			free(base_data);
-			free(delta);
-			free(result);
+			free(base_data); free(delta); free(result);
 
 		} else if (ptype == PACK_OBJ_REF_DELTA) {
 			/* REF_DELTA: read 20-byte base OID, then delta */
@@ -1650,32 +1716,35 @@ int storage_write_packfile(FILE *in)
 			if (pack_read_exact(in, base_oid.id, GIT_OID_SHA1_SIZE, &stream_offset) < 0)
 				goto err;
 
-			/* Inflate delta */
 			size_t consumed = 0;
 			unsigned char *delta = inflate_from_stream(in, size, &consumed);
 			if (!delta) goto err;
 			stream_offset += consumed;
 
-			/* Read base object */
+			/* Read base, apply delta, store. Defer if base missing. */
 			git_object_t base_type;
 			size_t base_size;
 			unsigned char *base_data;
 			if (storage_read_object(&base_oid, &base_type, &base_size, &base_data) < 0) {
-				free(delta);
-				goto err;
+				/* Base not available yet; defer */
+				struct pending_delta *pd = malloc(sizeof(*pd));
+				pd->base_oid = base_oid;
+				pd->delta = delta;
+				pd->delta_len = size;
+				pd->pack_idx = i;
+				pd->next = pending;
+				pending = pd;
+				ofs_map[i].offset = obj_offset;
+				continue;
 			}
 
-			/* Apply git delta */
 			unsigned char *result;
 			size_t result_len;
 			if (git_delta_apply(base_data, base_size, delta, size,
 					    &result, &result_len) < 0) {
-				free(base_data);
-				free(delta);
-				goto err;
+				free(base_data); free(delta); goto err;
 			}
 
-			/* Hash and store */
 			git_oid oid;
 			git_odb_hash(&oid, result, result_len, base_type);
 			storage_write_object(&oid, base_type, result, result_len);
@@ -1683,15 +1752,23 @@ int storage_write_packfile(FILE *in)
 			ofs_map[i].offset = obj_offset;
 			memcpy(&ofs_map[i].oid, &oid, sizeof(git_oid));
 			written++;
+			resolve_pending_deltas(&pending, &oid, ofs_map, &written);
 
-			free(base_data);
-			free(delta);
-			free(result);
+			free(base_data); free(delta); free(result);
 
 		} else {
-			/* Unknown type */
 			goto err;
 		}
+	}
+
+	/* Check for unresolved thin-pack deltas */
+	if (pending) {
+		int n_unresolved = 0;
+		for (struct pending_delta *pd = pending; pd; pd = pd->next)
+			n_unresolved++;
+		fprintf(stderr, "write_packfile: %d unresolved deltas remaining\n",
+			n_unresolved);
+		goto err;
 	}
 
 	/* 4. Read trailing 20-byte pack checksum (skip verification) */
@@ -1706,6 +1783,12 @@ int storage_write_packfile(FILE *in)
 	return written;
 
 err:
+	while (pending) {
+		struct pending_delta *pd = pending;
+		pending = pd->next;
+		free(pd->delta);
+		free(pd);
+	}
 	free(ofs_map);
 err_early:
 	storage_rollback_to("write_packfile");
