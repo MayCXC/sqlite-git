@@ -3,11 +3,11 @@
 # Test suite for git-local-sqlite and git-lfs-sqlite-transfer.
 #
 # Exercises the local helper protocol (18 commands), LFS transfer
-# adapter, and the git-remote-sqlite transport. Each test creates
+# adapter. Each test creates
 # a fresh database in a temp directory and cleans up after itself.
 #
 # Usage: ./tests/test_helper.sh
-#   Requires: git-sqlite, git-lfs-sqlite-transfer built in the repo root.
+#   Requires: git-local-sqlite, git-lfs-sqlite-transfer built in the repo root.
 
 set -e
 
@@ -40,7 +40,7 @@ check() {
 }
 
 # Ensure binaries exist
-test -x "$BINDIR/git-sqlite" || { echo "git-sqlite not built"; exit 1; }
+test -x "$BINDIR/git-local-sqlite" || { echo "git-local-sqlite not built"; exit 1; }
 test -x "$LFS_TRANSFER" || { echo "git-lfs-sqlite-transfer not built"; exit 1; }
 
 # ---- Capabilities ----
@@ -333,11 +333,6 @@ BAD_OID=$(printf '{"event":"init","operation":"download","concurrent":true}\n{"e
 
 check "lfs download: 400 for bad oid" \
 	'echo "$BAD_OID" | grep -q "\"code\":400"'
-
-# ---- argv[0] dispatch ----
-
-check "git-sqlite: rejects unknown argv[0]" \
-	'"$BINDIR/git-sqlite" 2>&1 | grep -q "invoke as"'
 
 # ---- Summary ----
 

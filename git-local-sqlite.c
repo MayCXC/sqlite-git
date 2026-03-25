@@ -482,7 +482,7 @@ static void cmd_alternate_list(void) {
 
 /* ---- Main loop ---- */
 
-int local_main(int argc, char **argv) {
+int main(int argc, char **argv) {
 	if (argc < 2) { fprintf(stderr, "usage: git-local-sqlite <gitdir>\n"); return 1; }
 	git_libgit2_init();
 	if (storage_open(argv[1]) < 0) { fprintf(stderr, "error: cannot open db\n"); return 1; }

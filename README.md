@@ -4,9 +4,7 @@ Git storage in SQLite. Three tools:
 
 - **git0** (SQLite extension): Query any git repo from SQL. `git_blob()`, `git_log()`, `git_tree()`, etc.
 - **git-local-sqlite** (local helper): Use SQLite as the storage backend for a git repo. Objects, refs, and reflogs in one `.db` file.
-- **git-remote-sqlite** (remote helper): Push/fetch between git repos and SQLite databases.
-
-All three are built from one source tree. `git-local-sqlite` and `git-remote-sqlite` are symlinks to the `git-sqlite` binary, which dispatches on `argv[0]`.
+- **git-lfs-sqlite-transfer** (LFS transfer adapter): Large file storage in the same SQLite database.
 
 ## Build
 
@@ -150,18 +148,6 @@ The helper speaks the git local helper protocol. Commands use a flat namespace m
 | `convert-oid <hex> <algo>` | converted oid or `missing` |
 | `refresh` | clears kept marks, reloads state |
 | `close` | exits |
-
-## Remote helper (git-remote-sqlite)
-
-Push and fetch between a git repo and a SQLite database:
-
-```sh
-git remote add backup sqlite:///path/to/backup.db
-git push backup main
-git fetch backup
-```
-
-The remote helper walks the object graph (commits, trees, blobs) and transfers objects between the local git repo and the SQLite database.
 
 ## SQLite extension (git0)
 
