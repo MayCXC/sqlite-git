@@ -1141,6 +1141,36 @@ void storage_write_object(const git_oid *oid, git_object_t type,
 	storage_write_object_named(oid, type, data, size, NULL);
 }
 
+/* Write without delta compression (for bulk imports). */
+static void storage_write_object_raw(const git_oid *oid, git_object_t type,
+				     const void *data, size_t size) {
+	storage_savepoint("write_object_raw");
+	sqlite3_stmt *st = stmt_acquire(st_obj_exists, "SELECT 1 FROM objects WHERE oid = ?");
+	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	int exists = (sqlite3_step(st) == SQLITE_ROW);
+	stmt_release(st_obj_exists, st);
+	if (exists) { storage_release("write_object_raw"); return; }
+
+	unsigned long comp_len;
+	unsigned char *comp = zcompress(data, size, &comp_len);
+	if (!comp) { storage_release("write_object_raw"); return; }
+
+	st = stmt_acquire(st_obj_write,
+		"INSERT OR IGNORE INTO objects(oid, type, size, data, base, path, kept, promisor, reachable) VALUES(?,?,?,?,?,?,?,?,0)");
+	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
+	sqlite3_bind_int(st, 2, (int)type);
+	sqlite3_bind_int64(st, 3, (sqlite3_int64)size);
+	sqlite3_bind_blob(st, 4, comp, comp_len, SQLITE_STATIC);
+	sqlite3_bind_null(st, 5);
+	sqlite3_bind_null(st, 6);
+	sqlite3_bind_int(st, 7, batch_kept);
+	sqlite3_bind_int(st, 8, batch_promisor);
+	sqlite3_step(st);
+	stmt_release(st_obj_write, st);
+	free(comp);
+	storage_release("write_object_raw");
+}
+
 int storage_object_exists(const git_oid *oid) {
 	sqlite3_stmt *st = stmt_acquire(st_obj_exists, "SELECT 1 FROM objects WHERE oid = ?");
 	sqlite3_bind_blob(st, 1, oid->id, GIT_OID_SHA1_SIZE, SQLITE_STATIC);
@@ -1544,7 +1574,7 @@ static void resolve_pending_deltas(struct pending_delta **list,
 		}
 		git_oid resolved_oid;
 		git_odb_hash(&resolved_oid, res, rlen, bt);
-		storage_write_object(&resolved_oid, bt, res, rlen);
+		storage_write_object_raw(&resolved_oid, bt, res, rlen);
 		memcpy(&ofs_map[pd->pack_idx].oid, &resolved_oid, sizeof(git_oid));
 		(*written)++;
 		free(bd); free(res); free(pd->delta); free(pd);
@@ -1632,7 +1662,7 @@ int storage_write_packfile(FILE *in)
 			git_object_t gtype = pack_type_to_git(ptype);
 			git_oid oid;
 			git_odb_hash(&oid, data, size, gtype);
-			storage_write_object(&oid, gtype, data, size);
+			storage_write_object_raw(&oid, gtype, data, size);
 			free(data);
 
 			ofs_map[i].offset = obj_offset;
@@ -1701,7 +1731,7 @@ int storage_write_packfile(FILE *in)
 
 			git_oid oid;
 			git_odb_hash(&oid, result, result_len, base_type);
-			storage_write_object(&oid, base_type, result, result_len);
+			storage_write_object_raw(&oid, base_type, result, result_len);
 
 			ofs_map[i].offset = obj_offset;
 			memcpy(&ofs_map[i].oid, &oid, sizeof(git_oid));
@@ -1747,7 +1777,7 @@ int storage_write_packfile(FILE *in)
 
 			git_oid oid;
 			git_odb_hash(&oid, result, result_len, base_type);
-			storage_write_object(&oid, base_type, result, result_len);
+			storage_write_object_raw(&oid, base_type, result, result_len);
 
 			ofs_map[i].offset = obj_offset;
 			memcpy(&ofs_map[i].oid, &oid, sizeof(git_oid));
