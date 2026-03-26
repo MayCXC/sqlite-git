@@ -286,12 +286,12 @@ make test-asan  # run with AddressSanitizer + UndefinedBehaviorSanitizer
 
 ## Git upstream patches
 
-The local helper backend requires two patch series to git:
+The local helper backend requires two patch series to git. Most of the ODB vtable work landed upstream via `ps/odb-sources` and `ps/object-counting`. What remains:
 
-- **Series 1** (ODB vtable): Adds `write_packfile`, `for_each_unique_abbrev`, `approximate_object_count`, `convert_object_id` to the ODB source vtable and routes all external callers through it. [Submitted upstream](https://lore.kernel.org/git/pull.2068.git.1773674983.gitgitgadget@gmail.com).
-- **Series 2** (local helpers): Adds `git-local-<name>` helper backends for both ODB and refs, with worktree support matching the reftable two-backend pattern. Shared symref/HEAD splitting extracted to the generic refs layer.
+- **Series 1** ([PR #2074](https://github.com/gitgitgadget/git/pull/2074)): Adds `write_packfile`, `for_each_unique_abbrev`, and `convert_object_id` to the ODB source vtable. Routes the `object-name.c` abbreviation and disambiguation paths through `for_each_unique_abbrev` instead of directly accessing files-backend internals.
+- **Series 2** ([patch](https://github.com/gitgitgadget/git/compare/master...MayCXC:git:ps/series-2-helpers-v3.patch)): Extracts shared symref/HEAD transaction splitting into `refs.c`, then adds `git-local-<name>` helper backends for both ODB and refs with worktree support matching the reftable two-backend pattern.
 
-Both series are on our [git fork](https://github.com/MayCXC/git).
+Both series are on our [git fork](https://github.com/MayCXC/git) (`ps/series-1-vtable-v3`, `ps/series-2-helpers-v3`).
 
 ## Dependencies
 
