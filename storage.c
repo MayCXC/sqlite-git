@@ -207,6 +207,7 @@ static struct cached_stmt stmts[STMT_COUNT] = {
 };
 
 static int batch_kept = 0, batch_promisor = 0;
+static int savepoint_depth = 0;
 
 /* Feature 7: Alternates linked list */
 struct alternate {
@@ -468,11 +469,13 @@ int storage_open_db(sqlite3 *db, int persistent) {
 }
 
 static int storage_init_db(sqlite3 *db) {
+	int rc;
+	rc = sqlite3_exec(db, "PRAGMA busy_timeout = 5000;", 0, 0, 0);
+	if (rc) fprintf(stderr, "busy_timeout failed: %s\n", sqlite3_errmsg(db));
+	sqlite3_exec(db, "PRAGMA synchronous = NORMAL;", 0, 0, 0);
+	sqlite3_exec(db, "PRAGMA journal_mode = WAL;", 0, 0, 0);
+	sqlite3_exec(db, "PRAGMA page_size = 8192;", 0, 0, 0);
 	sqlite3_exec(db,
-		"PRAGMA busy_timeout = 5000;"
-		"PRAGMA synchronous = NORMAL;"
-		"PRAGMA journal_mode = WAL;"
-		"PRAGMA page_size = 8192;"
 		"CREATE TABLE IF NOT EXISTS objects("
 		"  oid BLOB PRIMARY KEY, type INTEGER NOT NULL,"
 		"  size INTEGER NOT NULL, data BLOB NOT NULL,"
@@ -1126,18 +1129,32 @@ void storage_begin(void) { storage_savepoint("odb_txn"); }
 void storage_commit(void) { storage_release("odb_txn"); }
 
 void storage_savepoint(const char *name) {
-	char *sql = sqlite3_mprintf("SAVEPOINT \"%w\"", name);
+	char *sql;
+	/*
+	 * When starting a new transaction (autocommit mode), use BEGIN
+	 * IMMEDIATE to acquire the write lock upfront. This prevents
+	 * deadlocks where two processes both hold deferred read locks
+	 * and then try to upgrade to write locks simultaneously.
+	 */
+	if (sqlite3_get_autocommit(sdb))
+		sqlite3_exec(sdb, "BEGIN IMMEDIATE", 0, 0, 0);
+	sql = sqlite3_mprintf("SAVEPOINT \"%w\"", name);
 	if (sql) { sqlite3_exec(sdb, sql, 0, 0, 0); sqlite3_free(sql); }
+	savepoint_depth++;
 }
 
 void storage_release(const char *name) {
 	char *sql = sqlite3_mprintf("RELEASE \"%w\"", name);
 	if (sql) { sqlite3_exec(sdb, sql, 0, 0, 0); sqlite3_free(sql); }
+	if (--savepoint_depth == 0 && !sqlite3_get_autocommit(sdb))
+		sqlite3_exec(sdb, "COMMIT", 0, 0, 0);
 }
 
 void storage_rollback_to(const char *name) {
 	char *sql = sqlite3_mprintf("ROLLBACK TO \"%w\"; RELEASE \"%w\"", name, name);
 	if (sql) { sqlite3_exec(sdb, sql, 0, 0, 0); sqlite3_free(sql); }
+	if (--savepoint_depth == 0 && !sqlite3_get_autocommit(sdb))
+		sqlite3_exec(sdb, "ROLLBACK", 0, 0, 0);
 }
 
 /* ---- Object read (resolves delta chains) ---- */
