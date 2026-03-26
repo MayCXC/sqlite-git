@@ -586,10 +586,17 @@ void storage_close(void) {
 sqlite3 *storage_db(void) { return sdb; }
 
 void storage_refresh(void) {
-	if (sdb)
-		sqlite3_wal_checkpoint_v2(sdb, NULL,
-					  SQLITE_CHECKPOINT_PASSIVE,
-					  NULL, NULL);
+	if (!sdb) return;
+	/* Reset all cached statements to release any implicit
+	 * read transactions holding an old WAL snapshot. */
+	for (int i = 0; i < STMT_COUNT; i++)
+		if (stmts[i].st)
+			sqlite3_reset(stmts[i].st);
+	/* Checkpoint WAL with TRUNCATE to force all frames
+	 * into the main DB and reset the WAL file. */
+	sqlite3_wal_checkpoint_v2(sdb, NULL,
+				  SQLITE_CHECKPOINT_TRUNCATE,
+				  NULL, NULL);
 }
 
 void storage_mark_kept(const git_oid *oid) {
