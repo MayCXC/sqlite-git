@@ -587,16 +587,45 @@ sqlite3 *storage_db(void) { return sdb; }
 
 void storage_refresh(void) {
 	if (!sdb) return;
-	/* Reset all cached statements to release any implicit
-	 * read transactions holding an old WAL snapshot. */
-	for (int i = 0; i < STMT_COUNT; i++)
-		if (stmts[i].st)
-			sqlite3_reset(stmts[i].st);
-	/* Checkpoint WAL with TRUNCATE to force all frames
-	 * into the main DB and reset the WAL file. */
-	sqlite3_wal_checkpoint_v2(sdb, NULL,
-				  SQLITE_CHECKPOINT_TRUNCATE,
-				  NULL, NULL);
+
+	/* Close and reopen the database connection to get a fresh
+	 * WAL read snapshot. This guarantees subsequent reads see
+	 * writes from other connections (subprocess helpers). */
+	const char *db_path = sqlite3_db_filename(sdb, "main");
+	char *path = sqlite3_mprintf("%s", db_path ? db_path : "");
+
+	/* Finalize all cached statements before closing */
+	for (int i = 0; i < STMT_COUNT; i++) {
+		if (stmts[i].st) {
+			sqlite3_finalize(stmts[i].st);
+			stmts[i].st = NULL;
+		}
+	}
+	sqlite3_close(sdb);
+	sdb = NULL;
+
+	/* Reopen */
+	int rc = sqlite3_open(path, &sdb);
+	if (rc != SQLITE_OK)
+		fprintf(stderr, "storage_refresh: reopen failed (%d): %s\n",
+			rc, sqlite3_errmsg(sdb));
+	sqlite3_free(path);
+
+	/* Re-initialize: PRAGMAs + re-prepare all statements */
+	sqlite3_exec(sdb,
+		"PRAGMA busy_timeout = 5000;"
+		"PRAGMA synchronous = NORMAL;"
+		"PRAGMA journal_mode = WAL;",
+		0, 0, 0);
+	for (int i = 0; i < STMT_COUNT; i++) {
+		sqlite3_prepare_v3(sdb, stmts[i].sql, -1,
+				   SQLITE_PREPARE_PERSISTENT,
+				   &stmts[i].st, 0);
+	}
+	/* Register git0_name_hash for repack sort order */
+	sqlite3_create_function(sdb, "git0_name_hash", 1,
+		SQLITE_UTF8|SQLITE_DETERMINISTIC, 0,
+		sql_name_hash_fn, 0, 0);
 }
 
 void storage_mark_kept(const git_oid *oid) {
@@ -1333,7 +1362,10 @@ int storage_obj_list(storage_obj_cb cb, void *data) {
 int storage_ref_read(const char *refname, git_oid *oid, char *symref, size_t symref_len) {
 	sqlite3_stmt *st = stmt_acquire(STMT_REF_READ);
 	sqlite3_bind_text(st, 1, refname, -1, SQLITE_STATIC);
-	if (sqlite3_step(st) != SQLITE_ROW) {
+	int step_rc = sqlite3_step(st);
+	if (step_rc != SQLITE_ROW) {
+		fprintf(stderr, "REF_READ(%s): step=%d (%s) db=%p\n",
+			refname, step_rc, sqlite3_errmsg(sdb), (void*)sdb);
 		stmt_release(STMT_REF_READ, st);
 		return -1;
 	}

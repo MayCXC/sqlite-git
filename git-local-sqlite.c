@@ -521,7 +521,19 @@ int main(int argc, char **argv) {
 		else if (!strncmp(line, "reflog-exists ", 14)) cmd_reflog_exists(line + 14);
 		else if (!strncmp(line, "reflog-delete ", 14)) cmd_reflog_delete(line + 14);
 		else if (!strcmp(line, "reflog-list")) cmd_reflog_list();
-		else if (!strcmp(line, "refresh")) { storage_clear_kept(); storage_refresh(); }
+		else if (!strcmp(line, "refresh")) {
+			storage_clear_kept();
+			storage_refresh();
+			/* Verify refresh worked: count refs */
+			sqlite3 *db = storage_db();
+			if (db) {
+				sqlite3_stmt *st = NULL;
+				sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM refs", -1, &st, 0);
+				if (sqlite3_step(st) == SQLITE_ROW)
+					fprintf(stderr, "REFRESH: %d refs in db\n", sqlite3_column_int(st, 0));
+				sqlite3_finalize(st);
+			}
+		}
 		else if (!strncmp(line, "mark-kept ", 10)) cmd_mark_kept(line + 10);
 		else if (!strcmp(line, "mark-kept-recent")) storage_mark_kept_recent();
 		else if (!strcmp(line, "mark-promisor-recent")) storage_mark_promisor_recent();
