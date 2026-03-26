@@ -248,6 +248,10 @@ static sqlite3_stmt *stmt_acquire(enum stmt_id id) {
 static void stmt_release(enum stmt_id id, sqlite3_stmt *used) {
 	if (used != stmts[id].st)
 		sqlite3_finalize(used);
+	else {
+		sqlite3_clear_bindings(used);
+		sqlite3_reset(used);
+	}
 }
 
 /* ---- Zlib ---- */
@@ -588,44 +592,30 @@ sqlite3 *storage_db(void) { return sdb; }
 void storage_refresh(void) {
 	if (!sdb) return;
 
-	/* Close and reopen the database connection to get a fresh
-	 * WAL read snapshot. This guarantees subsequent reads see
-	 * writes from other connections (subprocess helpers). */
-	const char *db_path = sqlite3_db_filename(sdb, "main");
-	char *path = sqlite3_mprintf("%s", db_path ? db_path : "");
-
-	/* Finalize all cached statements before closing */
-	for (int i = 0; i < STMT_COUNT; i++) {
-		if (stmts[i].st) {
-			sqlite3_finalize(stmts[i].st);
-			stmts[i].st = NULL;
-		}
+	/*
+	 * Release the WAL read snapshot so the next operation sees
+	 * writes from other processes (subprocess helpers). In WAL
+	 * mode, the snapshot is pinned at transaction start, not
+	 * connection open. Resetting all statements ends any
+	 * implicit read transaction held by prepared statements.
+	 *
+	 * ODB transactions use savepoints (not bare BEGIN), so they
+	 * do not pin the WAL snapshot at the connection level.
+	 * PASSIVE checkpoint reclaims WAL space.
+	 */
+	/*
+	 * Reset ALL statements on this connection, including any
+	 * leaked statements not in the cache. sqlite3_next_stmt
+	 * walks the connection's internal statement list.
+	 */
+	{
+		sqlite3_stmt *st = NULL;
+		while ((st = sqlite3_next_stmt(sdb, st)))
+			sqlite3_reset(st);
 	}
-	sqlite3_close(sdb);
-	sdb = NULL;
-
-	/* Reopen */
-	int rc = sqlite3_open(path, &sdb);
-	if (rc != SQLITE_OK)
-		fprintf(stderr, "storage_refresh: reopen failed (%d): %s\n",
-			rc, sqlite3_errmsg(sdb));
-	sqlite3_free(path);
-
-	/* Re-initialize: PRAGMAs + re-prepare all statements */
-	sqlite3_exec(sdb,
-		"PRAGMA busy_timeout = 5000;"
-		"PRAGMA synchronous = NORMAL;"
-		"PRAGMA journal_mode = WAL;",
-		0, 0, 0);
-	for (int i = 0; i < STMT_COUNT; i++) {
-		sqlite3_prepare_v3(sdb, stmts[i].sql, -1,
-				   SQLITE_PREPARE_PERSISTENT,
-				   &stmts[i].st, 0);
-	}
-	/* Register git0_name_hash for repack sort order */
-	sqlite3_create_function(sdb, "git0_name_hash", 1,
-		SQLITE_UTF8|SQLITE_DETERMINISTIC, 0,
-		sql_name_hash_fn, 0, 0);
+	sqlite3_wal_checkpoint_v2(sdb, NULL,
+				  SQLITE_CHECKPOINT_PASSIVE,
+				  NULL, NULL);
 }
 
 void storage_mark_kept(const git_oid *oid) {
@@ -1132,8 +1122,8 @@ void storage_destroy(void) {
 	storage_release("destroy");
 }
 
-void storage_begin(void) { sqlite3_exec(sdb, "BEGIN", 0, 0, 0); }
-void storage_commit(void) { sqlite3_exec(sdb, "COMMIT", 0, 0, 0); }
+void storage_begin(void) { storage_savepoint("odb_txn"); }
+void storage_commit(void) { storage_release("odb_txn"); }
 
 void storage_savepoint(const char *name) {
 	char *sql = sqlite3_mprintf("SAVEPOINT \"%w\"", name);
@@ -1364,8 +1354,6 @@ int storage_ref_read(const char *refname, git_oid *oid, char *symref, size_t sym
 	sqlite3_bind_text(st, 1, refname, -1, SQLITE_STATIC);
 	int step_rc = sqlite3_step(st);
 	if (step_rc != SQLITE_ROW) {
-		fprintf(stderr, "REF_READ(%s): step=%d (%s) db=%p\n",
-			refname, step_rc, sqlite3_errmsg(sdb), (void*)sdb);
 		stmt_release(STMT_REF_READ, st);
 		return -1;
 	}

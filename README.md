@@ -30,11 +30,20 @@ Stores git objects, refs, and reflogs in a single SQLite database. Git communica
 ### Setup
 
 ```sh
-git init --local-helper=sqlite myrepo
+git init --ref-format=helper --object-storage=helper --local-helper=sqlite myrepo
 cd myrepo
 ```
 
-This sets `extensions.objectStorage = helper`, `extensions.refStorage = helper`, and `extensions.localHelper = sqlite` in `.git/config`. All git operations go through SQLite:
+This sets three independent extensions in `.git/config`:
+
+```ini
+[extensions]
+    refstorage = helper
+    objectstorage = helper
+    localhelper = sqlite
+```
+
+All git operations go through SQLite:
 
 ```sh
 echo "hello" | git hash-object -w --stdin   # writes to .git/sqlite.db
@@ -272,12 +281,17 @@ make test       # run both test suites
 make test-asan  # run with AddressSanitizer + UndefinedBehaviorSanitizer
 ```
 
-- `tests/test_helper.sh`: 37 tests covering all 18 protocol commands, LFS transfer adapter, and argv[0] dispatch.
+- `tests/test_helper.sh`: 37 tests covering protocol commands, LFS transfer adapter, GC, repack, and alternates.
 - `tests/test_basic.sql`: SQL extension tests for scalar functions, table-valued functions, virtual tables, storage-native functions, self-contained repo operations, and LFS round-trips.
 
 ## Git upstream patches
 
-The local helper backend requires patches to git that add `git-local-*` support (pluggable ODB and ref storage via external processes). These patches are on the [`ps/local-helper-backends`](https://github.com/MayCXC/git/tree/ps/local-helper-backends) branch of our git fork. Series 1 has been [submitted upstream](https://lore.kernel.org/git/pull.2068.git.1773674983.gitgitgadget@gmail.com).
+The local helper backend requires two patch series to git:
+
+- **Series 1** (ODB vtable): Adds `write_packfile`, `for_each_unique_abbrev`, `approximate_object_count`, `convert_object_id` to the ODB source vtable and routes all external callers through it. [Submitted upstream](https://lore.kernel.org/git/pull.2068.git.1773674983.gitgitgadget@gmail.com).
+- **Series 2** (local helpers): Adds `git-local-<name>` helper backends for both ODB and refs, with worktree support matching the reftable two-backend pattern. Shared symref/HEAD splitting extracted to the generic refs layer.
+
+Both series are on our [git fork](https://github.com/MayCXC/git).
 
 ## Dependencies
 

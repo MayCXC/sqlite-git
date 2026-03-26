@@ -10,6 +10,7 @@ build/
 .DS_Store
 git-sqlite
 git-local-sqlite
+git-local-sqlite-asan
 git-remote-sqlite
 git-lfs-sqlite-transfer
 patches/

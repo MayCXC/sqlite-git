@@ -154,7 +154,10 @@ static void cmd_odb_transaction_commit(void) {
 
 static void cmd_read(const char *refname) {
 	git_oid oid; char symref[4096];
-	if (storage_ref_read(refname, &oid, symref, sizeof(symref)) < 0) {
+	int rc = storage_ref_read(refname, &oid, symref, sizeof(symref));
+	{ FILE *dbg = fopen("/tmp/helper-debug-log.txt", "a");
+	  if (dbg) { fprintf(dbg, "CMD_READ(%s): rc=%d symref='%s'\n", refname, rc, rc == 0 ? symref : "N/A"); fclose(dbg); } }
+	if (rc < 0) {
 		printf("missing\n");
 	} else if (symref[0]) {
 		printf("symref %s\n", symref);
@@ -200,19 +203,41 @@ static void cmd_txn_begin(void) {
 }
 
 static void cmd_txn_update(const char *args) {
-	char refname[4096], hex[GIT_OID_SHA1_HEXSIZE + 1];
-	if (sscanf(args, "%4095s %40s", refname, hex) < 2) {
+	char refname[4096], new_hex[GIT_OID_SHA1_HEXSIZE + 1],
+	     old_hex[GIT_OID_SHA1_HEXSIZE + 1];
+	const char *rest;
+	int n;
+
+	n = sscanf(args, "%4095s %40s %40s", refname, new_hex, old_hex);
+	if (n < 2) {
 		printf("error bad arguments\n"); fflush(stdout); return;
 	}
-	git_oid oid;
-	if (git_oid_fromstr(&oid, hex) != 0) { printf("error bad oid\n"); fflush(stdout); return; }
-	/* If this ref is a symref, follow it and update the target. */
-	git_oid cur; char symref[4096] = "";
-	if (storage_ref_read(refname, &cur, symref, sizeof(symref)) == 0 && symref[0]) {
-		storage_ref_write(symref, &oid, NULL);
-	} else {
-		storage_ref_write(refname, &oid, NULL);
+
+	git_oid new_oid;
+	if (git_oid_fromstr(&new_oid, new_hex) != 0) {
+		printf("error bad oid\n"); fflush(stdout); return;
 	}
+
+	git_oid old_oid;
+	int have_old = (n >= 3 && git_oid_fromstr(&old_oid, old_hex) == 0);
+
+	/*
+	 * Symref following is handled by the git core helper backend
+	 * (refs_transaction_split_symref_update). Write the ref directly.
+	 */
+	storage_ref_write(refname, &new_oid, NULL);
+
+	/* Parse optional message after the oid fields and write reflog */
+	rest = args + strlen(refname) + 1 + strlen(new_hex);
+	if (have_old) rest += 1 + strlen(old_hex);
+	while (*rest == ' ') rest++;
+	if (*rest) {
+		storage_reflog_append(refname,
+			have_old ? &old_oid : NULL, &new_oid,
+			"Git User <user@localhost>",
+			(long long)time(NULL), 0, rest);
+	}
+
 	printf("ok\n"); fflush(stdout);
 }
 
@@ -522,17 +547,8 @@ int main(int argc, char **argv) {
 		else if (!strncmp(line, "reflog-delete ", 14)) cmd_reflog_delete(line + 14);
 		else if (!strcmp(line, "reflog-list")) cmd_reflog_list();
 		else if (!strcmp(line, "refresh")) {
-			storage_clear_kept();
 			storage_refresh();
-			/* Verify refresh worked: count refs */
-			sqlite3 *db = storage_db();
-			if (db) {
-				sqlite3_stmt *st = NULL;
-				sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM refs", -1, &st, 0);
-				if (sqlite3_step(st) == SQLITE_ROW)
-					fprintf(stderr, "REFRESH: %d refs in db\n", sqlite3_column_int(st, 0));
-				sqlite3_finalize(st);
-			}
+			storage_clear_kept();
 		}
 		else if (!strncmp(line, "mark-kept ", 10)) cmd_mark_kept(line + 10);
 		else if (!strcmp(line, "mark-kept-recent")) storage_mark_kept_recent();
