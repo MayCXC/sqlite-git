@@ -469,12 +469,14 @@ int storage_open_db(sqlite3 *db, int persistent) {
 }
 
 static int storage_init_db(sqlite3 *db) {
-	int rc;
-	rc = sqlite3_exec(db, "PRAGMA busy_timeout = 5000;", 0, 0, 0);
-	if (rc) fprintf(stderr, "busy_timeout failed: %s\n", sqlite3_errmsg(db));
+	/* PRAGMAs: one per call so page_size failure does not
+	 * prevent busy_timeout or journal_mode from being set. */
+	sqlite3_exec(db, "PRAGMA busy_timeout = 5000;", 0, 0, 0);
 	sqlite3_exec(db, "PRAGMA synchronous = NORMAL;", 0, 0, 0);
 	sqlite3_exec(db, "PRAGMA journal_mode = WAL;", 0, 0, 0);
 	sqlite3_exec(db, "PRAGMA page_size = 8192;", 0, 0, 0);
+
+	/* Schema: one CREATE per call for error isolation. */
 	sqlite3_exec(db,
 		"CREATE TABLE IF NOT EXISTS objects("
 		"  oid BLOB PRIMARY KEY, type INTEGER NOT NULL,"
@@ -484,63 +486,55 @@ static int storage_init_db(sqlite3 *db) {
 		"  promisor INTEGER NOT NULL DEFAULT 0,"
 		"  reachable INTEGER NOT NULL DEFAULT 0,"
 		"  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))"
-		") WITHOUT ROWID;"
+		") WITHOUT ROWID;", 0, 0, 0);
+	sqlite3_exec(db,
 		"CREATE TABLE IF NOT EXISTS refs("
 		"  refname TEXT PRIMARY KEY, oid BLOB, symref TEXT"
-		") WITHOUT ROWID;"
+		") WITHOUT ROWID;", 0, 0, 0);
+	sqlite3_exec(db,
 		"CREATE TABLE IF NOT EXISTS reflog("
 		"  refname TEXT NOT NULL, idx INTEGER NOT NULL,"
 		"  old_oid BLOB NOT NULL, new_oid BLOB NOT NULL,"
 		"  committer TEXT NOT NULL, timestamp INTEGER NOT NULL,"
 		"  tz INTEGER NOT NULL, msg TEXT NOT NULL DEFAULT '',"
-		"  PRIMARY KEY(refname, idx)) WITHOUT ROWID;"
-
+		"  PRIMARY KEY(refname, idx)) WITHOUT ROWID;", 0, 0, 0);
+	sqlite3_exec(db,
 		"CREATE TABLE IF NOT EXISTS lfs("
 		"  oid BLOB PRIMARY KEY,"
 		"  size INTEGER NOT NULL,"
 		"  data BLOB NOT NULL"
-		") WITHOUT ROWID;"
+		") WITHOUT ROWID;", 0, 0, 0);
+	sqlite3_exec(db,
 		"CREATE TABLE IF NOT EXISTS oid_map("
 		"  src BLOB NOT NULL, dest BLOB NOT NULL,"
 		"  algo TEXT NOT NULL,"
 		"  PRIMARY KEY(src, algo)"
-		") WITHOUT ROWID;",
-		0, 0, 0);
-
-	/* Feature 3: Partial clone tables */
+		") WITHOUT ROWID;", 0, 0, 0);
 	sqlite3_exec(db,
 		"CREATE TABLE IF NOT EXISTS promised("
 		"  oid BLOB PRIMARY KEY, remote TEXT NOT NULL"
-		") WITHOUT ROWID;"
+		") WITHOUT ROWID;", 0, 0, 0);
+	sqlite3_exec(db,
 		"CREATE TABLE IF NOT EXISTS promisor_remotes("
 		"  name TEXT PRIMARY KEY, url TEXT NOT NULL"
-		") WITHOUT ROWID;",
-		0, 0, 0);
-
-	/* Feature 4: Commit graph */
+		") WITHOUT ROWID;", 0, 0, 0);
 	sqlite3_exec(db,
 		"CREATE TABLE IF NOT EXISTS commit_graph("
 		"  oid BLOB PRIMARY KEY, generation INT NOT NULL,"
 		"  commit_time INT NOT NULL"
-		") WITHOUT ROWID;"
+		") WITHOUT ROWID;", 0, 0, 0);
+	sqlite3_exec(db,
 		"CREATE INDEX IF NOT EXISTS idx_commit_graph_gen"
-		"  ON commit_graph(generation);",
-		0, 0, 0);
-
-	/* Feature 6: Worktrees */
+		"  ON commit_graph(generation);", 0, 0, 0);
 	sqlite3_exec(db,
 		"CREATE TABLE IF NOT EXISTS worktrees("
 		"  name TEXT PRIMARY KEY, path TEXT NOT NULL,"
 		"  head_ref TEXT NOT NULL DEFAULT 'refs/heads/main'"
-		") WITHOUT ROWID;",
-		0, 0, 0);
-
-	/* Feature 7: Alternates */
+		") WITHOUT ROWID;", 0, 0, 0);
 	sqlite3_exec(db,
 		"CREATE TABLE IF NOT EXISTS alternates("
 		"  path TEXT PRIMARY KEY"
-		") WITHOUT ROWID;",
-		0, 0, 0);
+		") WITHOUT ROWID;", 0, 0, 0);
 
 	/* Migrate existing databases: add kept and promisor columns */
 	sqlite3_exec(db,
