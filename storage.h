@@ -2,168 +2,71 @@
 #define STORAGE_H
 
 #include <stdio.h>
+#include <stddef.h>
 
 #ifndef SQLITE_CORE
   #include "sqlite3ext.h"
 #else
   #include <sqlite3.h>
 #endif
-#include <git2.h>
 
 /*
- * Open (or create) the sqlite.db in the given directory.
- * If path ends with /objects, strips it to find the gitdir root.
+ * Dependency-free storage core: the sqlite connection, transactions, database
+ * maintenance, and the generic prepared-statement mechanism shared by the
+ * git (storage_git.h) and git-lfs (storage_git_lfs.h) layers built on top.
+ *
+ * This layer links NOTHING beyond sqlite: no zlib, no sha256, no libgit2, no git
+ * source. It holds no domain schema of its own; each layer above creates its own
+ * tables via its *_init() and prepares statements through storage_stmt() here.
+ * The dependency rule is one-directional: the leaf layers may call into this
+ * core, never the reverse, so this header declares no git/lfs symbol.
+ */
+
+/*
+ * Open (or create) the sqlite.db in the given directory (owned mode: this layer
+ * opened the connection and closes it). If path ends with /objects, strips it to
+ * find the gitdir root. Applies the connection pragmas only; call a layer's
+ * *_init() afterwards to create that layer's schema.
  */
 int storage_open(const char *path_arg);
 
 /*
- * Use an existing database connection for storage.
- * If persistent is true, prepared statements are cached for the
- * lifetime of the connection (caller must call storage_close or
- * use sqlite3_close_v2). If false, statements are prepared and
- * finalized per call (safe with sqlite3_close v1).
+ * Adopt an existing database connection (borrowed mode: the extension borrows the
+ * loader's). Applies the pragmas; call a layer's *_init() afterwards for its
+ * schema. In borrowed mode statements are prepared per call rather than cached,
+ * so the connection may be closed with sqlite3_close (v1); the owned-mode
+ * storage_open() caches them instead.
  */
-int storage_open_db(sqlite3 *db, int persistent);
+int storage_open_db(sqlite3 *db);
 void storage_close(void);
 void storage_refresh(void);
-void storage_destroy(void);
 sqlite3 *storage_db(void);
 
-/* Transaction control */
-void storage_begin(void);
-void storage_commit(void);
-void storage_savepoint(const char *name);
-void storage_release(const char *name);
-void storage_rollback_to(const char *name);
+/* Transaction control. All return 0 on success, -1 on failure; storage_release
+ * is the durability point (its COMMIT failing -> -1), so a caller that acks a
+ * write to git must check the propagated return rather than assume success. The
+ * extension's borrowed connection no-ops these (the enclosing SQLite statement is
+ * the transaction). */
+int storage_begin(void);
+int storage_commit(void);
+int storage_savepoint(const char *name);
+int storage_release(const char *name);
+int storage_rollback_to(const char *name);
+
 
 /*
- * Object operations. OIDs are git_oid (binary 20 bytes).
- * Read resolves delta chains. Write handles compression + delta.
- * Caller must free *out_data from read.
+ * Generic prepared-statement mechanism for the storage_git / storage_git_lfs
+ * layers. Each layer keeps its own SQL table and a parallel array of cache slots,
+ * and wraps these: storage_stmt() returns a reset, ready-to-bind statement, and
+ * storage_stmt_done() releases it. In owned mode (storage_open) the slot caches
+ * the prepared handle across calls; in borrowed mode (storage_open_db) the slot
+ * stays NULL and each call prepares and finalizes its own, so no statement
+ * outlives a borrowed sqlite3_close(v1). storage_at_close() registers a finalizer
+ * (idempotently) run at storage_close, so each layer drops its cache before the
+ * connection closes.
  */
-int storage_read_object(const git_oid *oid,
-			git_object_t *out_type, size_t *out_size,
-			unsigned char **out_data);
+sqlite3_stmt *storage_stmt(const char *sql, sqlite3_stmt **slot);
+void storage_stmt_done(sqlite3_stmt *st, sqlite3_stmt **slot);
+void storage_at_close(void (*fn)(void));
 
-void storage_write_object(const git_oid *oid, git_object_t type,
-			  const void *data, size_t size);
-void storage_write_object_named(const git_oid *oid, git_object_t type,
-				const void *data, size_t size,
-				const char *path);
-
-int storage_object_exists(const git_oid *oid);
-
-/*
- * Ref operations. OIDs stored as BLOB(20) internally.
- */
-int storage_ref_read(const char *refname, git_oid *oid, char *symref, size_t symref_len);
-void storage_ref_write(const char *refname, const git_oid *oid, const char *symref);
-void storage_ref_delete(const char *refname);
-
-/* Callback for ref iteration. Return non-zero to stop. */
-typedef int (*storage_ref_cb)(const char *refname, const git_oid *oid,
-			      const char *symref, void *data);
-int storage_ref_list(const char *prefix, storage_ref_cb cb, void *data);
-
-/* Object listing callback. */
-typedef int (*storage_obj_cb)(const git_oid *oid, git_object_t type,
-			      size_t size, void *data);
-int storage_obj_list(storage_obj_cb cb, void *data);
-
-/* OID-only iteration (no type/size overhead) */
-int storage_obj_oids(git_odb_foreach_cb cb, void *data);
-int storage_obj_list_filtered(int promisor_only, int skip_kept,
-			      storage_obj_cb cb, void *data);
-
-/* Kept/promisor object metadata */
-void storage_mark_kept(const git_oid *oid);
-void storage_mark_kept_recent(void);
-void storage_end_kept_batch(void);
-void storage_clear_kept(void);
-int storage_have_kept(const git_oid *oid);
-void storage_mark_promisor(const git_oid *oid);
-void storage_mark_promisor_recent(void);
-void storage_end_promisor_batch(void);
-
-/* OID mapping for hash algorithm migration */
-int storage_convert_oid(const git_oid *src, const char *algo,
-			git_oid *dest);
-void storage_store_oid_map(const git_oid *src, const git_oid *dest,
-			   const char *algo);
-
-/* Packfile ingestion: read a git packfile from stream, store all objects */
-int storage_write_packfile(FILE *in);
-
-/* Connectivity verification using libgit2 revwalk */
-int storage_check_connectivity(void);
-
-/* GC and repack */
-int storage_gc(void);
-int storage_repack(void);
-
-/* Reflog operations */
-int storage_reflog_exists(const char *refname);
-void storage_reflog_delete(const char *refname);
-
-/* Reflog read callback */
-typedef int (*storage_reflog_cb)(const git_oid *old_oid, const git_oid *new_oid,
-				 const char *committer, long long timestamp,
-				 int tz, const char *msg, void *data);
-int storage_reflog_read(const char *refname, storage_reflog_cb cb, void *data);
-
-int storage_reflog_read_reverse(const char *refname, storage_reflog_cb cb, void *data);
-
-/* Reflog name listing callback. */
-typedef int (*storage_reflog_name_cb)(const char *refname, void *data);
-int storage_reflog_list(storage_reflog_name_cb cb, void *data);
-
-void storage_reflog_append(const char *refname, const git_oid *old_oid,
-			   const git_oid *new_oid, const char *committer,
-			   long long timestamp, int tz, const char *msg);
-
-/* Partial clone: promised objects and promisor remotes */
-void storage_promise_object(const git_oid *oid, const char *remote);
-int storage_is_promised(const git_oid *oid);
-int storage_fetch_promised(const git_oid *oid);
-void storage_add_promisor_remote(const char *name, const char *url);
-void storage_remove_promisor_remote(const char *name);
-
-/* Commit graph: generation numbers and commit timestamps */
-int storage_build_commit_graph(void);
-int storage_commit_generation(const git_oid *oid);
-
-/* Worktree support */
-void storage_worktree_add(const char *name, const char *path, const char *branch);
-void storage_worktree_remove(const char *name);
-
-typedef int (*storage_worktree_cb)(const char *name, const char *path,
-				   const char *head_ref, void *data);
-int storage_worktree_list(storage_worktree_cb cb, void *data);
-
-/* Alternates: borrow objects from other sqlite.db files */
-void storage_alternate_add(const char *path);
-void storage_alternate_remove(const char *path);
-
-typedef int (*storage_alternate_cb)(const char *path, void *data);
-int storage_alternate_list(storage_alternate_cb cb, void *data);
-
-/*
- * LFS content storage. OID is SHA-256 (32 bytes) per git-lfs spec.
- * Data is zlib compressed.
- */
-#define LFS_OID_RAWSZ 32
-#define LFS_OID_HEXSZ 64
-
-void storage_lfs_sha256(const void *data, size_t len,
-			unsigned char out[LFS_OID_RAWSZ]);
-void storage_lfs_oid_to_hex(const unsigned char oid[LFS_OID_RAWSZ],
-			    char hex[LFS_OID_HEXSZ + 1]);
-int storage_lfs_oid_from_hex(const char *hex,
-			     unsigned char oid[LFS_OID_RAWSZ]);
-int storage_lfs_read(const unsigned char oid[LFS_OID_RAWSZ],
-		     size_t *out_size, unsigned char **out_data);
-void storage_lfs_write(const unsigned char oid[LFS_OID_RAWSZ],
-		       const void *data, size_t size);
-int storage_lfs_exists(const unsigned char oid[LFS_OID_RAWSZ]);
-
-#endif
+#endif /* STORAGE_H */
