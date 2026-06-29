@@ -25,19 +25,20 @@
 **   git_config(repo, key)           -> value
 **   git_config_set(repo, key, val)  -> void
 **
-** Build: gcc -shared -fPIC -o git0.so git0.c git0_vtab.c -lgit2
-** Load:  .load ./git0
+** Build: make (see the Makefile; git0.so links the storage core + git layer +
+**        the git0 sources against libgit2).
+** Load:  .load <dir>/git0
 */
 
 #include "git0.h"
 #include "git0_internal.h"
-#include "storage.h"
+#include "storage_git.h"
 
 #ifndef SQLITE_CORE
   SQLITE_EXTENSION_INIT1
 #endif
 
-#include <git2.h>
+#include "oidhex.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -78,8 +79,7 @@ static git_repository *git0_repo(sqlite3_context *ctx, const char *path) {
       return NULL;
     }
     g->borrowed = 1;
-    strncpy(g->repo_path, path, sizeof(g->repo_path) - 1);
-    g->repo_path[sizeof(g->repo_path) - 1] = '\0';
+    snprintf(g->repo_path, sizeof(g->repo_path), "%s", path);
     return g->repo;
   }
   g->borrowed = 0;
@@ -90,33 +90,33 @@ static git_repository *git0_repo(sqlite3_context *ctx, const char *path) {
     sqlite3_result_error(ctx, e ? e->message : "failed to open repository", -1);
     return NULL;
   }
-  strncpy(g->repo_path, path, sizeof(g->repo_path) - 1);
-  g->repo_path[sizeof(g->repo_path) - 1] = '\0';
+  snprintf(g->repo_path, sizeof(g->repo_path), "%s", path);
   return g->repo;
 }
 
 /* Get repo for TVFs (no sqlite3_context, uses raw path).
- * ":storage:" returns the storage-backed repo from git0_backend.c. */
-git_repository *git0_repo_open(const char *path, char **err) {
+ * ":storage:" returns the shared storage-backed repo from git0_backend.c
+ * (borrowed: *borrowed=1, caller must NOT free); any other path is opened
+ * fresh and owned by the caller (*borrowed=0, release with git_repository_free).
+ * Each cursor opens and frees its own handle: a process-global cache would be
+ * freed out from under a concurrently-scanning cursor on a different repo. */
+git_repository *git0_repo_open(const char *path, int *borrowed, char **err) {
+  if (borrowed) *borrowed = 0;
   if (strcmp(path, ":storage:") == 0) {
     git_repository *r = git0_storage_repo();
     if (!r) { *err = (char *)"storage layer not initialized"; return NULL; }
+    if (borrowed) *borrowed = 1;
     return r;
   }
 
-  static git_repository *tvf_repo = NULL;
-  static char tvf_path[4096] = {0};
-  if (tvf_repo && strcmp(tvf_path, path) == 0) return tvf_repo;
-  if (tvf_repo) { git_repository_free(tvf_repo); tvf_repo = NULL; }
-  int rc = git_repository_open(&tvf_repo, path);
+  git_repository *repo = NULL;
+  int rc = git_repository_open(&repo, path);
   if (rc != 0) {
     const git_error *e = git_error_last();
     *err = (char *)(e ? e->message : "failed to open repository");
     return NULL;
   }
-  strncpy(tvf_path, path, sizeof(tvf_path) - 1);
-  tvf_path[sizeof(tvf_path) - 1] = '\0';
-  return tvf_repo;
+  return repo;
 }
 
 
@@ -163,7 +163,7 @@ static void fn_git_blob(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   if (argc == 2) {
     const char *spec = (const char *)sqlite3_value_text(argv[1]);
     git_oid oid;
-    if (git_oid_fromstr(&oid, spec) != 0) {
+    if (oid_from_hex(&oid, spec) != 0) {
       git_object *obj = resolve_rev(repo, spec, ctx);
       if (!obj) return;
       if (git_object_type(obj) != GIT_OBJECT_BLOB) {
@@ -274,7 +274,10 @@ static void fn_git_hash(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     return;
   }
   git_oid oid;
-  git_odb_hash(&oid, data, len, type);
+  /* git_hash is a pure content-hashing utility with no repo, so it hashes under
+   * sha1 (git's default). It must not consult the git0 storage object-format,
+   * which belongs to the storage-backed git0_* repo, not to this scalar. */
+  oid_hash(&oid, data, len, type, OID_ALGO_SHA1);
   char hex[GIT_OID_MAX_HEXSIZE + 1];
   git_oid_tostr(hex, GIT_OID_MAX_HEXSIZE + 1, &oid);
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
@@ -455,7 +458,7 @@ static void fn_git_ref_create(sqlite3_context *ctx, int argc, sqlite3_value **ar
   const char *oid_str = (const char *)sqlite3_value_text(argv[2]);
   int force = argc > 3 ? sqlite3_value_int(argv[3]) : 0;
   git_oid oid;
-  if (git_oid_fromstr(&oid, oid_str) != 0) {
+  if (oid_from_hex(&oid, oid_str) != 0) {
     sqlite3_result_error(ctx, "invalid oid", -1); return;
   }
   git_reference *ref = NULL;
@@ -615,12 +618,11 @@ GIT0_API int sqlite3_git_init(sqlite3 *db, char **pzErrMsg,
 #undef F
 
   git0_register_vtabs(db);
-  git0_register_objects(db);
-  git0_register_refs_vt(db);
   git0_register_repo(db);
-  git0_register_lfs(db);
   git0_register_storage(db);
   git0_register_backend(db);
+  git0_register_refs_vt(db);
+  git0_register_objects_vt(db);
 
   /* Storage layer initialized lazily on first git0_init() or git0_repo()
    * call. The storage prepared statements persist until process exit.

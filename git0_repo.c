@@ -6,19 +6,23 @@
 ** git0_mktree(entries)  -> build tree object from "mode name oid\n" entries
 ** git0_mkcommit(tree, parent, msg, author?) -> build commit object
 **
-** All operations go through the storage layer (storage.h).
+** Object and ref construction goes through libgit2 (git_odb_write,
+** git_treebuilder, git_commit_create, git_reference_create) against the
+** storage-backed odb/refdb in git0_backend.c, so libgit2 owns serialization
+** and hashing; sqlite is only the storage leaf.
 */
 
 #include "git0.h"
 #include "git0_internal.h"
-#include "storage.h"
+#include "storage_git.h"
 
 #ifndef SQLITE_CORE
   SQLITE_EXTENSION_INIT3
 #endif
 
-#include <git2.h>
+#include "oidhex.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -26,58 +30,126 @@
 
 /* ---- git0_init() ---- */
 
+/* The git-init options that apply to a sqlite-backed odb repo: object-format
+ * picks the hash (sha1 default; sha256 only on the experimental build) and
+ * initial-branch names the first ref (default master). The on-disk options (bare,
+ * ref-format, template, separate-git-dir, shared) have no meaning here. */
 static void fn_git0_init(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-  (void)argc; (void)argv;
-
   /* Lazily initialize storage if not already open */
   if (!storage_db())
-    storage_open_db(sqlite3_context_db_handle(ctx), 0);
+    storage_open_db(sqlite3_context_db_handle(ctx));
+  storage_git_init();	/* ensure the git schema exists (idempotent) */
 
-  /* Check if already initialized */
-  git_oid head_oid;
-  char symref[256];
-  if (storage_ref_read("HEAD", &head_oid, symref, sizeof(symref)) == 0) {
-    char hex[GIT_OID_SHA1_HEXSIZE + 1];
-    git_oid_tostr(hex, sizeof(hex), &head_oid);
-    sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
+  /* object-format: choose the repo's hash, like git init --object-format. */
+  int fmt = 0;
+  if (argc > 0 && sqlite3_value_type(argv[0]) != SQLITE_NULL) {
+    const char *of = (const char *)sqlite3_value_text(argv[0]);
+    if (of && !strcmp(of, "sha256")) {
+#ifdef GIT_EXPERIMENTAL_SHA256
+      fmt = 1;
+#else
+      sqlite3_result_error(ctx, "init: object-format sha256 requires the experimental build", -1);
+      return;
+#endif
+    } else if (of && strcmp(of, "sha1")) {
+      sqlite3_result_error(ctx, "init: unknown object-format (use sha1 or sha256)", -1);
+      return;
+    }
+  }
+
+  /* initial-branch: name the first branch, like git init -b. Defaults to master,
+   * matching git core's compiled default; pass a name to override. */
+  const char *branch = "master";
+  if (argc > 1 && sqlite3_value_type(argv[1]) != SQLITE_NULL) {
+    const char *b = (const char *)sqlite3_value_text(argv[1]);
+    if (b && *b) branch = b;
+  }
+
+  /* Check if already initialized. HEAD is normally a symref; follow it to the
+   * branch's commit so the result is HEAD's oid rather than an empty value. */
+  char head_hex[GIT_OID_MAX_HEXSIZE + 1] = "";
+  char symref[256] = "";
+  if (storage_ref_read("HEAD", head_hex, sizeof(head_hex), symref, sizeof(symref)) == 0) {
+    if (symref[0]) {
+      char tgt_sym[256] = "";
+      storage_ref_read(symref, head_hex, sizeof(head_hex), tgt_sym, sizeof(tgt_sym));
+    }
+    sqlite3_result_text(ctx, head_hex, -1, SQLITE_TRANSIENT);
     return;
   }
 
-  /* Create empty tree */
-  git_oid empty_tree_oid;
-  git_odb_hash(&empty_tree_oid, NULL, 0, GIT_OBJECT_TREE);
-  storage_write_object(&empty_tree_oid, GIT_OBJECT_TREE, "", 0);
+  /* Record the object format BEFORE the storage-backed repo is built, so its
+   * odb is wrapped with the matching hash (ensure_repo reads it). */
+  if (storage_set_object_format(fmt) != 0) {
+    sqlite3_result_error(ctx, "init: failed to record object format", -1);
+    return;
+  }
 
-  /* Build initial commit */
-  time_t now = time(NULL);
-  char tree_hex[GIT_OID_SHA1_HEXSIZE + 1];
-  git_oid_tostr(tree_hex, sizeof(tree_hex), &empty_tree_oid);
+  git_repository *repo = git0_storage_repo();
+  if (!repo) {
+    sqlite3_result_error(ctx, "init: storage repo unavailable", -1);
+    return;
+  }
 
-  char author[256];
-  snprintf(author, sizeof(author), "git0 <git0@sqlite> %lld +0000", (long long)now);
+  /* Build the empty tree, the initial commit, and the branch + HEAD through
+   * libgit2 against the storage-backed odb/refdb, so libgit2 owns the object
+   * serialization, hashing, and ref writes (no hand-rolled object bytes). */
+  git_treebuilder *bld = NULL;
+  git_oid tree_oid;
+  if (git_treebuilder_new(&bld, repo, NULL) != 0 ||
+      git_treebuilder_write(&tree_oid, bld) != 0) {
+    git_treebuilder_free(bld);
+    sqlite3_result_error(ctx, "init: empty tree write failed", -1);
+    return;
+  }
+  git_treebuilder_free(bld);
 
-  char commit_buf[2048];
-  int commit_len = snprintf(commit_buf, sizeof(commit_buf),
-    "tree %s\nauthor %s\ncommitter %s\n\ninitial commit\n",
-    tree_hex, author, author);
+  git_tree *tree = NULL;
+  git_signature *sig = NULL;
+  if (git_tree_lookup(&tree, repo, &tree_oid) != 0 ||
+      git_signature_now(&sig, "git0", "git0@sqlite") != 0) {
+    git_tree_free(tree);
+    sqlite3_result_error(ctx, "init: tree lookup / signature failed", -1);
+    return;
+  }
 
   git_oid commit_oid;
-  git_odb_hash(&commit_oid, commit_buf, commit_len, GIT_OBJECT_COMMIT);
-  storage_write_object(&commit_oid, GIT_OBJECT_COMMIT, commit_buf, commit_len);
+  int crc = git_commit_create(&commit_oid, repo, NULL, sig, sig, NULL,
+                              "initial commit\n", tree, 0, NULL);
+  git_tree_free(tree);
+  git_signature_free(sig);
+  if (crc != 0) {
+    sqlite3_result_error(ctx, "init: initial commit failed", -1);
+    return;
+  }
 
-  /* Set refs */
-  storage_ref_write("refs/heads/main", &commit_oid, NULL);
-  storage_ref_write("HEAD", NULL, "refs/heads/main");
+  char branch_ref[256];
+  snprintf(branch_ref, sizeof(branch_ref), "refs/heads/%s", branch);
+  git_reference *bref = NULL, *href = NULL;
+  if (git_reference_create(&bref, repo, branch_ref, &commit_oid, 0, NULL) != 0 ||
+      git_reference_symbolic_create(&href, repo, "HEAD", branch_ref, 0, NULL) != 0) {
+    git_reference_free(bref);
+    git_reference_free(href);
+    sqlite3_result_error(ctx, "init: branch/HEAD create failed", -1);
+    return;
+  }
+  git_reference_free(bref);
+  git_reference_free(href);
 
-  char hex[GIT_OID_SHA1_HEXSIZE + 1];
-  git_oid_tostr(hex, sizeof(hex), &commit_oid);
-  sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
+  char commit_hex[GIT_OID_MAX_HEXSIZE + 1];
+  git_oid_tostr(commit_hex, sizeof(commit_hex), &commit_oid);
+  sqlite3_result_text(ctx, commit_hex, -1, SQLITE_TRANSIENT);
 }
 
 /* ---- git0_add(path, data, type?) ---- */
 
 static void fn_git0_add(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
+  git_repository *repo = git0_storage_repo();
+  if (!repo) {
+    sqlite3_result_error(ctx, "storage not initialized (call git0_init first)", -1);
+    return;
+  }
   const void *data = sqlite3_value_blob(argv[1]);
   int data_len = sqlite3_value_bytes(argv[1]);
   git_object_t type = GIT_OBJECT_BLOB;
@@ -87,87 +159,36 @@ static void fn_git0_add(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     if (type == GIT_OBJECT_INVALID) type = GIT_OBJECT_BLOB;
   }
 
-  const char *path = (const char *)sqlite3_value_text(argv[0]);
-
+  /*
+   * argv[0] is the conventional name being "added" (so the SQL reads like
+   * `git add <path>`), but a git object is content-addressed: the path->oid
+   * mapping belongs in a tree (git0_mktree), not the object row, so the blob is
+   * stored by content alone. git_odb_write hashes under the repo's odb (the
+   * hash git0_init recorded) and writes through the storage backend.
+   */
+  git_odb *odb = NULL;
+  if (git_repository_odb(&odb, repo) != 0) {
+    sqlite3_result_error(ctx, "odb unavailable", -1);
+    return;
+  }
   git_oid oid;
-  git_odb_hash(&oid, data, data_len, type);
-  storage_write_object_named(&oid, type, data, data_len, path);
-
-  char hex[GIT_OID_SHA1_HEXSIZE + 1];
+  int rc = git_odb_write(&oid, odb, data ? data : "", (size_t)data_len, type);
+  git_odb_free(odb);
+  if (rc != 0) {
+    sqlite3_result_error(ctx, "object write failed", -1);
+    return;
+  }
+  char hex[GIT_OID_MAX_HEXSIZE + 1];
   git_oid_tostr(hex, sizeof(hex), &oid);
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
 }
 
 /* ---- git0_mktree(entries_text) ---- */
-/* entries: "mode path oid\n" per line
- * Paths with '/' create nested subtrees automatically.
- * Uses git_treebuilder from libgit2 for correct sorting and format. */
-
-struct parsed_entry {
-  char mode[16];
-  char path[256];
-  char oid_hex[GIT_OID_SHA1_HEXSIZE + 1];
-};
-
-static int mktree_recursive(git_repository *repo,
-                             struct parsed_entry *entries, int count,
-                             git_oid *out) {
-  git_treebuilder *bld = NULL;
-  if (git_treebuilder_new(&bld, repo, NULL) < 0) return -1;
-
-  /* Collect unique top-level directories */
-  char dirs[256][256];
-  int dir_count = 0;
-
-  for (int i = 0; i < count; i++) {
-    char *slash = strchr(entries[i].path, '/');
-    if (!slash) {
-      /* Direct entry: insert into treebuilder */
-      git_oid oid;
-      if (git_oid_fromstr(&oid, entries[i].oid_hex) < 0) continue;
-      unsigned int mode = (unsigned int)strtol(entries[i].mode, NULL, 8);
-      git_treebuilder_insert(NULL, bld, entries[i].path, &oid, (git_filemode_t)mode);
-    } else {
-      /* Collect unique directory names */
-      int dlen = (int)(slash - entries[i].path);
-      char dir[256];
-      snprintf(dir, sizeof(dir), "%.*s", dlen, entries[i].path);
-      int found = 0;
-      for (int j = 0; j < dir_count; j++) {
-        if (!strcmp(dirs[j], dir)) { found = 1; break; }
-      }
-      if (!found && dir_count < 256)
-        strcpy(dirs[dir_count++], dir);
-    }
-  }
-
-  /* Recurse for each subdirectory */
-  for (int d = 0; d < dir_count; d++) {
-    struct parsed_entry sub[1024];
-    int sub_count = 0;
-    int dlen = strlen(dirs[d]);
-
-    for (int i = 0; i < count; i++) {
-      if (strncmp(entries[i].path, dirs[d], dlen) != 0 ||
-          entries[i].path[dlen] != '/') continue;
-      strcpy(sub[sub_count].mode, entries[i].mode);
-      strcpy(sub[sub_count].path, entries[i].path + dlen + 1);
-      strcpy(sub[sub_count].oid_hex, entries[i].oid_hex);
-      sub_count++;
-    }
-
-    git_oid subtree_oid;
-    if (mktree_recursive(repo, sub, sub_count, &subtree_oid) < 0) {
-      git_treebuilder_free(bld);
-      return -1;
-    }
-    git_treebuilder_insert(NULL, bld, dirs[d], &subtree_oid, GIT_FILEMODE_TREE);
-  }
-
-  int rc = git_treebuilder_write(out, bld);
-  git_treebuilder_free(bld);
-  return rc;
-}
+/* entries: "mode path oid\n" per line. Paths with '/' create nested subtrees.
+ * Built through an in-memory git_index: git_index_add records each entry and
+ * git_index_write_tree_to writes the (possibly nested) tree objects into the
+ * storage-backed odb, so libgit2 owns the sorting, subtree creation, and the
+ * hash algorithm (inherited from the repository). */
 
 static void fn_git0_mktree(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
@@ -180,26 +201,46 @@ static void fn_git0_mktree(sqlite3_context *ctx, int argc, sqlite3_value **argv)
     return;
   }
 
-  /* Parse entries */
-  struct parsed_entry entries[1024];
-  int count = 0;
+  git_index *idx = NULL;
+#ifdef GIT_EXPERIMENTAL_SHA256
+  /* The experimental API carries the oid type; match the repository's so the
+   * written tree hashes under the same algorithm (mirrors ensure_repo's odb). */
+  git_index_options opts = GIT_INDEX_OPTIONS_INIT;
+  opts.oid_type = git_repository_oid_type(repo);
+  int irc = git_index_new(&idx, &opts);
+#else
+  int irc = git_index_new(&idx);
+#endif
+  if (irc < 0) { sqlite3_result_error(ctx, "failed to create index", -1); return; }
+
   const char *p = text;
-  while (*p && count < 1024) {
-    if (sscanf(p, "%15s %255s %40s",
-               entries[count].mode, entries[count].path,
-               entries[count].oid_hex) != 3) break;
-    count++;
+  while (*p) {
+    /* oid_hex must hold the longest git oid hex (sha256: 64) + NUL to match the
+     * %64s field width. GIT_OID_MAX_HEXSIZE is the wrong size here: a libgit2
+     * built without GIT_EXPERIMENTAL_SHA256 defines it as 40 (sha1), so %64s
+     * would overflow the buffer (ASan-confirmed stack-buffer-overflow). */
+    char mode[16], path[256], oid_hex[65];
+    if (sscanf(p, "%15s %255s %64s", mode, path, oid_hex) != 3) break;
+    git_index_entry e;
+    memset(&e, 0, sizeof(e));
+    if (oid_from_hex(&e.id, oid_hex) == 0) {
+      e.path = path;
+      e.mode = (unsigned int)strtol(mode, NULL, 8);
+      git_index_add(idx, &e);
+    }
     while (*p && *p != '\n') p++;
     if (*p == '\n') p++;
   }
 
   git_oid tree_oid;
-  if (mktree_recursive(repo, entries, count, &tree_oid) < 0) {
+  int rc = git_index_write_tree_to(&tree_oid, idx, repo);
+  git_index_free(idx);
+  if (rc < 0) {
     sqlite3_result_error(ctx, "failed to build tree", -1);
     return;
   }
 
-  char hex[GIT_OID_SHA1_HEXSIZE + 1];
+  char hex[GIT_OID_MAX_HEXSIZE + 1];
   git_oid_tostr(hex, sizeof(hex), &tree_oid);
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
 }
@@ -207,31 +248,71 @@ static void fn_git0_mktree(sqlite3_context *ctx, int argc, sqlite3_value **argv)
 /* ---- git0_mkcommit(tree_oid, parent_oid, message, author?) ---- */
 
 static void fn_git0_mkcommit(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  git_repository *repo = git0_storage_repo();
+  if (!repo) {
+    sqlite3_result_error(ctx, "storage not initialized (call git0_init first)", -1);
+    return;
+  }
   const char *tree_hex = (const char *)sqlite3_value_text(argv[0]);
+  if (!tree_hex) { sqlite3_result_null(ctx); return; }
   const char *parent_hex = (argc > 1 && sqlite3_value_type(argv[1]) != SQLITE_NULL)
     ? (const char *)sqlite3_value_text(argv[1]) : NULL;
-  const char *message = (argc > 2) ? (const char *)sqlite3_value_text(argv[2]) : "commit";
+  const char *message = (argc > 2 && sqlite3_value_type(argv[2]) != SQLITE_NULL)
+    ? (const char *)sqlite3_value_text(argv[2]) : "commit";
   const char *author_name = (argc > 3 && sqlite3_value_type(argv[3]) != SQLITE_NULL)
     ? (const char *)sqlite3_value_text(argv[3]) : "git0 <git0@sqlite>";
 
-  if (!tree_hex) { sqlite3_result_null(ctx); return; }
+  /* Resolve the tree and optional parent as real objects, then let libgit2
+   * build and write the commit (it owns the serialization + hash). */
+  git_oid tree_oid;
+  git_tree *tree = NULL;
+  if (oid_from_hex(&tree_oid, tree_hex) != 0 ||
+      git_tree_lookup(&tree, repo, &tree_oid) != 0) {
+    sqlite3_result_error(ctx, "mkcommit: tree not found", -1);
+    return;
+  }
 
+  git_commit *parent = NULL;
+  const git_commit *parents[1] = { NULL };
+  size_t nparents = 0;
+  if (parent_hex) {
+    git_oid parent_oid;
+    if (oid_from_hex(&parent_oid, parent_hex) != 0 ||
+        git_commit_lookup(&parent, repo, &parent_oid) != 0) {
+      git_tree_free(tree);
+      sqlite3_result_error(ctx, "mkcommit: parent not found", -1);
+      return;
+    }
+    parents[0] = parent;
+    nparents = 1;
+  }
+
+  /* The author arg is a free-form "Name <email>" identity; format it with the
+   * current time and let git_signature_from_buffer parse it (no hand-split). */
   time_t now = time(NULL);
-  char author_line[512];
-  snprintf(author_line, sizeof(author_line), "%s %lld +0000", author_name, (long long)now);
+  char sigbuf[600];
+  snprintf(sigbuf, sizeof(sigbuf), "%s %lld +0000", author_name, (long long)now);
+  git_signature *sig = NULL;
+  if (git_signature_from_buffer(&sig, sigbuf) != 0) {
+    git_tree_free(tree);
+    git_commit_free(parent);
+    sqlite3_result_error(ctx, "mkcommit: invalid author identity", -1);
+    return;
+  }
 
-  char commit_buf[65536];
-  int len = snprintf(commit_buf, sizeof(commit_buf), "tree %s\n", tree_hex);
-  if (parent_hex)
-    len += snprintf(commit_buf + len, sizeof(commit_buf) - len, "parent %s\n", parent_hex);
-  len += snprintf(commit_buf + len, sizeof(commit_buf) - len,
-    "author %s\ncommitter %s\n\n%s\n", author_line, author_line, message);
-
+  char *msg = sqlite3_mprintf("%s\n", message);
   git_oid oid;
-  git_odb_hash(&oid, commit_buf, len, GIT_OBJECT_COMMIT);
-  storage_write_object(&oid, GIT_OBJECT_COMMIT, commit_buf, len);
-
-  char hex[GIT_OID_SHA1_HEXSIZE + 1];
+  int rc = git_commit_create(&oid, repo, NULL, sig, sig, NULL,
+                             msg ? msg : message, tree, nparents, parents);
+  sqlite3_free(msg);
+  git_signature_free(sig);
+  git_tree_free(tree);
+  git_commit_free(parent);
+  if (rc != 0) {
+    sqlite3_result_error(ctx, "mkcommit: commit create failed", -1);
+    return;
+  }
+  char hex[GIT_OID_MAX_HEXSIZE + 1];
   git_oid_tostr(hex, sizeof(hex), &oid);
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
 }
@@ -240,6 +321,8 @@ static void fn_git0_mkcommit(sqlite3_context *ctx, int argc, sqlite3_value **arg
 
 int git0_register_repo(sqlite3 *db) {
   sqlite3_create_function(db, "git0_init", 0, SQLITE_UTF8, 0, fn_git0_init, 0, 0);
+  sqlite3_create_function(db, "git0_init", 1, SQLITE_UTF8, 0, fn_git0_init, 0, 0);
+  sqlite3_create_function(db, "git0_init", 2, SQLITE_UTF8, 0, fn_git0_init, 0, 0);
   sqlite3_create_function(db, "git0_add", 2, SQLITE_UTF8, 0, fn_git0_add, 0, 0);
   sqlite3_create_function(db, "git0_add", 3, SQLITE_UTF8, 0, fn_git0_add, 0, 0);
   sqlite3_create_function(db, "git0_mktree", 1, SQLITE_UTF8, 0, fn_git0_mktree, 0, 0);

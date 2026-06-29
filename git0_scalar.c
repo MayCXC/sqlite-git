@@ -1,5 +1,5 @@
 /*
-** git0_storage: convenience SQL functions for storage-backed repos.
+** git0_scalar: convenience SQL functions for storage-backed repos.
 **
 ** These are wrappers around the git_* functions in git0.c that
 ** implicitly use git0_repo() (the storage-backed libgit2 repo)
@@ -16,13 +16,13 @@
 
 #include "git0.h"
 #include "git0_internal.h"
-#include "storage.h"
+#include "storage_git.h"
 
 #ifndef SQLITE_CORE
   SQLITE_EXTENSION_INIT3
 #endif
 
-#include <git2.h>
+#include "oidhex.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -38,7 +38,7 @@ static git_repository *get_repo(sqlite3_context *ctx) {
 /* Parse hex OID from argument */
 static int get_oid(sqlite3_context *ctx, sqlite3_value *arg, git_oid *oid) {
   const char *hex = (const char *)sqlite3_value_text(arg);
-  if (!hex || git_oid_fromstr(oid, hex) < 0) {
+  if (!hex || oid_from_hex(oid, hex) < 0) {
     sqlite3_result_null(ctx);
     return -1;
   }
@@ -76,24 +76,32 @@ static git_commit *resolve_commit(git_repository *repo, sqlite3_context *ctx,
 
 static void fn_s_exists(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
-  if (!get_repo(ctx)) return;
+  git_repository *repo = get_repo(ctx); if (!repo) return;
   git_oid oid;
   if (get_oid(ctx, argv[0], &oid)) return;
-  sqlite3_result_int(ctx, storage_object_exists(&oid));
+  git_odb *odb = NULL;
+  if (git_repository_odb(&odb, repo) != 0) { sqlite3_result_int(ctx, 0); return; }
+  sqlite3_result_int(ctx, git_odb_exists(odb, &oid) ? 1 : 0);
+  git_odb_free(odb);
 }
 
 /* ---- git0_cat(oid) - raw object content ---- */
 
 static void fn_s_cat(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
-  if (!get_repo(ctx)) return;
+  git_repository *repo = get_repo(ctx); if (!repo) return;
   git_oid oid;
   if (get_oid(ctx, argv[0], &oid)) return;
-  git_object_t type; size_t size; unsigned char *data;
-  if (storage_read_object(&oid, &type, &size, &data) < 0) {
-    sqlite3_result_null(ctx); return;
+  git_odb *odb = NULL;
+  if (git_repository_odb(&odb, repo) != 0) { sqlite3_result_null(ctx); return; }
+  git_odb_object *obj = NULL;
+  if (git_odb_read(&obj, odb, &oid) != 0) {
+    git_odb_free(odb); sqlite3_result_null(ctx); return;
   }
-  sqlite3_result_blob64(ctx, data, size, free);
+  sqlite3_result_blob64(ctx, git_odb_object_data(obj),
+                        git_odb_object_size(obj), SQLITE_TRANSIENT);
+  git_odb_object_free(obj);
+  git_odb_free(odb);
 }
 
 /* ---- Wrappers using libgit2 via storage-backed repo ---- */
@@ -175,29 +183,44 @@ static void fn_s_ref(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   if (git_reference_name_to_id(&oid, repo, name) != 0) {
     sqlite3_result_null(ctx); return;
   }
-  char hex[GIT_OID_SHA1_HEXSIZE + 1];
+  char hex[GIT_OID_MAX_HEXSIZE + 1];
   git_oid_tostr(hex, sizeof(hex), &oid);
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
 }
 
 static void fn_s_ref_create(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
+  git_repository *repo = get_repo(ctx); if (!repo) return;
   const char *name = (const char *)sqlite3_value_text(argv[0]);
   const char *hex = (const char *)sqlite3_value_text(argv[1]);
   if (!name || !hex) { sqlite3_result_null(ctx); return; }
   git_oid oid;
-  if (git_oid_fromstr(&oid, hex) < 0) {
+  if (oid_from_hex(&oid, hex) < 0) {
     sqlite3_result_error(ctx, "invalid oid", -1); return;
   }
-  storage_ref_write(name, &oid, NULL);
+  /* force=1: the storage-native helper keeps its prior upsert semantics; the
+   * refdb backend logs the reflog entry and enforces CAS as the files backend
+   * would (a NULL log message takes libgit2's default identity). */
+  git_reference *ref = NULL;
+  if (git_reference_create(&ref, repo, name, &oid, 1, NULL) != 0) {
+    const git_error *e = git_error_last();
+    sqlite3_result_error(ctx, e ? e->message : "ref create failed", -1);
+    return;
+  }
+  git_reference_free(ref);
   sqlite3_result_text(ctx, "ok", -1, SQLITE_STATIC);
 }
 
 static void fn_s_ref_delete(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
+  git_repository *repo = get_repo(ctx); if (!repo) return;
   const char *name = (const char *)sqlite3_value_text(argv[0]);
-  if (!name) return;
-  storage_ref_delete(name);
+  if (!name) { sqlite3_result_null(ctx); return; }
+  if (git_reference_remove(repo, name) != 0) {
+    const git_error *e = git_error_last();
+    sqlite3_result_error(ctx, e ? e->message : "ref delete failed", -1);
+    return;
+  }
   sqlite3_result_text(ctx, "ok", -1, SQLITE_STATIC);
 }
 
@@ -205,7 +228,7 @@ static void fn_s_commit_tree(sqlite3_context *ctx, int argc, sqlite3_value **arg
   (void)argc;
   git_repository *repo = get_repo(ctx); if (!repo) return;
   git_commit *c = resolve_commit(repo, ctx, argv[0]); if (!c) return;
-  char hex[GIT_OID_SHA1_HEXSIZE + 1];
+  char hex[GIT_OID_MAX_HEXSIZE + 1];
   git_oid_tostr(hex, sizeof(hex), git_commit_tree_id(c));
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
   git_commit_free(c);
@@ -248,7 +271,7 @@ static void fn_s_commit_parent(sqlite3_context *ctx, int argc, sqlite3_value **a
   if (n >= git_commit_parentcount(c)) {
     git_commit_free(c); sqlite3_result_null(ctx); return;
   }
-  char hex[GIT_OID_SHA1_HEXSIZE + 1];
+  char hex[GIT_OID_MAX_HEXSIZE + 1];
   git_oid_tostr(hex, sizeof(hex), git_commit_parent_id(c, n));
   sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
   git_commit_free(c);
@@ -260,22 +283,6 @@ static void fn_s_commit_parents(sqlite3_context *ctx, int argc, sqlite3_value **
   git_commit *c = resolve_commit(repo, ctx, argv[0]); if (!c) return;
   sqlite3_result_int(ctx, (int)git_commit_parentcount(c));
   git_commit_free(c);
-}
-
-/* ---- Path utilities ---- */
-
-/*
- * git0_name_hash(path): sortable hash from the path, weighted so trailing
- * characters count most. Identical to git-core's pack_name_hash() from
- * pack-objects.h. Files ending in ".c" sort together, same-name files
- * across directories sort together.
- */
-#include "vendor/name-hash.h"
-
-static void fn_s_name_hash(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-  (void)argc;
-  const char *name = (const char *)sqlite3_value_text(argv[0]);
-  sqlite3_result_int64(ctx, (sqlite3_int64)pack_name_hash(name));
 }
 
 /* ---- Registration ---- */
@@ -296,6 +303,5 @@ int git0_register_storage(sqlite3 *db) {
   sqlite3_create_function(db, "git0_commit_author", 1, SQLITE_UTF8, 0, fn_s_commit_author, 0, 0);
   sqlite3_create_function(db, "git0_commit_parent", 2, SQLITE_UTF8, 0, fn_s_commit_parent, 0, 0);
   sqlite3_create_function(db, "git0_commit_parents", 1, SQLITE_UTF8, 0, fn_s_commit_parents, 0, 0);
-  sqlite3_create_function(db, "git0_name_hash", 1, SQLITE_UTF8|SQLITE_DETERMINISTIC, 0, fn_s_name_hash, 0, 0);
   return SQLITE_OK;
 }

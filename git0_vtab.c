@@ -4,11 +4,9 @@
 ** git_log(repo, from?, path?)        -> oid, message, author_name, author_email, author_when, committer_name, committer_email, committer_when, parents
 ** git_tree(repo, rev, path?)         -> name, mode, type, oid, size
 ** git_diff(repo, old_rev, new_rev)   -> status, path, old_oid, new_oid, old_mode, new_mode
-** git_diff_stat(repo, old_rev, new_rev) -> path, additions, deletions
 ** git_refs(repo, pattern?)           -> name, type, oid
 ** git_status(repo)                   -> path, status, head_to_index, index_to_workdir
 ** git_blame(repo, path, rev?)        -> line_start, line_count, oid, orig_path, author_name, author_email, author_when
-** git_index(repo)                    -> path, mode, oid, stage, flags
 ** git_config_list(repo)              -> key, value
 ** git_ancestors(repo, oid)           -> oid
 **
@@ -18,13 +16,17 @@
 #include <sqlite3ext.h>
 SQLITE_EXTENSION_INIT3
 
-#include <git2.h>
+#include "oidhex.h"
+#include "storage_git.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
-/* Shared functions (defined in git0.c) */
-extern git_repository *git0_repo_open(const char *path, char **err);
+/* Shared functions (defined in git0.c). The returned handle is caller-owned
+ * (free with git_repository_free) unless *borrowed is set (the shared
+ * storage-backed repo, which must not be freed). Each cursor owns its own
+ * handle and releases it in xClose / on re-filter. */
+extern git_repository *git0_repo_open(const char *path, int *borrowed, char **err);
 
 /*
 ** ========================================================
@@ -39,6 +41,7 @@ typedef struct {
 typedef struct {
   sqlite3_vtab_cursor base;
   git_repository *repo;
+  int repo_borrowed;
   git_revwalk *walk;
   git_pathspec *pathspec;
   git_commit *current;
@@ -78,6 +81,7 @@ static int git_log_close(sqlite3_vtab_cursor *pCursor) {
   if (cur->current) git_commit_free(cur->current);
   if (cur->walk) git_revwalk_free(cur->walk);
   if (cur->pathspec) git_pathspec_free(cur->pathspec);
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
   sqlite3_free(cur);
   return SQLITE_OK;
 }
@@ -133,8 +137,13 @@ static int git_log_advance(git_log_cursor *cur) {
 static int git_log_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
                           int argc, sqlite3_value **argv) {
   git_log_cursor *cur = (git_log_cursor *)pCursor;
-  if (cur->walk) git_revwalk_free(cur->walk);
+  /* Release the previous scan's objects before the repo they reference, so a
+   * re-filter (e.g. a join's inner cursor) neither leaks nor dangles. */
+  if (cur->current) { git_commit_free(cur->current); cur->current = NULL; }
+  if (cur->walk) { git_revwalk_free(cur->walk); cur->walk = NULL; }
   if (cur->pathspec) { git_pathspec_free(cur->pathspec); cur->pathspec = NULL; }
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
+  cur->repo = NULL;
   cur->eof = 0;
   cur->rowid = 0;
 
@@ -145,7 +154,7 @@ static int git_log_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *
     ? (const char *)sqlite3_value_text(argv[2]) : NULL;
 
   char *err = NULL;
-  cur->repo = git0_repo_open(repo_path, &err);
+  cur->repo = git0_repo_open(repo_path, &cur->repo_borrowed, &err);
   if (!cur->repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_revwalk_new(&cur->walk, cur->repo);
@@ -276,6 +285,7 @@ typedef struct { sqlite3_vtab base; } git_tree_vtab;
 typedef struct {
   sqlite3_vtab_cursor base;
   git_repository *repo;
+  int repo_borrowed;
   git_tree *tree;
   size_t count;
   size_t idx;
@@ -310,6 +320,7 @@ static int git_tree_close(sqlite3_vtab_cursor *pCursor) {
   if (cur->tree) git_tree_free(cur->tree);
   for (int i = 0; i < cur->depth; i++)
     git_tree_free(cur->stack[i].tree);
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
   sqlite3_free(cur);
   return SQLITE_OK;
 }
@@ -352,18 +363,26 @@ static void tree_advance(git_tree_cursor *cur) {
 static int git_tree_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
                            int argc, sqlite3_value **argv) {
   git_tree_cursor *cur = (git_tree_cursor *)pCursor;
+  /* Release the previous scan's trees (including any left on the descent stack
+   * by a partial scan) before the repo they reference, so a re-filter neither
+   * leaks nor dangles. */
   if (cur->tree) { git_tree_free(cur->tree); cur->tree = NULL; }
+  for (int i = 0; i < cur->depth; i++)
+    git_tree_free(cur->stack[i].tree);
+  cur->depth = 0;
   cur->idx = 0;
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
+  cur->repo = NULL;
 
   const char *repo_path = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : ".";
-  const char *rev = argc > 1 ? (const char *)sqlite3_value_text(argv[1]) : "HEAD";
+  const char *rev = argc > 1 && sqlite3_value_type(argv[1]) != SQLITE_NULL
+    ? (const char *)sqlite3_value_text(argv[1]) : "HEAD";
   const char *path = argc > 2 && sqlite3_value_type(argv[2]) != SQLITE_NULL
     ? (const char *)sqlite3_value_text(argv[2]) : NULL;
   cur->recursive = argc > 3 && sqlite3_value_int(argv[3]);
-  cur->depth = 0;
 
   char *err = NULL;
-  cur->repo = git0_repo_open(repo_path, &err);
+  cur->repo = git0_repo_open(repo_path, &cur->repo_borrowed, &err);
   if (!cur->repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_object *obj = NULL;
@@ -511,6 +530,7 @@ typedef struct { sqlite3_vtab base; } git_refs_vtab;
 typedef struct {
   sqlite3_vtab_cursor base;
   git_repository *repo;
+  int repo_borrowed;
   git_reference_iterator *iter;
   git_reference *current;
   int eof;
@@ -542,6 +562,7 @@ static int git_refs_close(sqlite3_vtab_cursor *pCursor) {
   git_refs_cursor *cur = (git_refs_cursor *)pCursor;
   if (cur->current) git_reference_free(cur->current);
   if (cur->iter) git_reference_iterator_free(cur->iter);
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
   sqlite3_free(cur);
   return SQLITE_OK;
 }
@@ -559,7 +580,12 @@ static int git_refs_advance(git_refs_cursor *cur) {
 static int git_refs_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
                            int argc, sqlite3_value **argv) {
   git_refs_cursor *cur = (git_refs_cursor *)pCursor;
+  /* Release the previous scan's ref + iterator before the repo they
+   * reference, so a re-filter neither leaks nor dangles. */
+  if (cur->current) { git_reference_free(cur->current); cur->current = NULL; }
   if (cur->iter) { git_reference_iterator_free(cur->iter); cur->iter = NULL; }
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
+  cur->repo = NULL;
   cur->eof = 0; cur->rowid = 0;
 
   const char *repo_path = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : ".";
@@ -567,7 +593,7 @@ static int git_refs_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char 
     ? (const char *)sqlite3_value_text(argv[1]) : NULL;
 
   char *err = NULL;
-  cur->repo = git0_repo_open(repo_path, &err);
+  cur->repo = git0_repo_open(repo_path, &cur->repo_borrowed, &err);
   if (!cur->repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   if (pattern) {
@@ -666,6 +692,8 @@ typedef struct { sqlite3_vtab base; } git_diff_vtab;
 
 typedef struct {
   sqlite3_vtab_cursor base;
+  git_repository *repo;
+  int repo_borrowed;
   git_diff *diff;
   size_t count;
   size_t idx;
@@ -696,6 +724,7 @@ static int git_diff_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
 static int git_diff_close(sqlite3_vtab_cursor *pCursor) {
   git_diff_cursor *cur = (git_diff_cursor *)pCursor;
   if (cur->diff) git_diff_free(cur->diff);
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
   sqlite3_free(cur);
   return SQLITE_OK;
 }
@@ -703,20 +732,26 @@ static int git_diff_close(sqlite3_vtab_cursor *pCursor) {
 static int git_diff_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
                            int argc, sqlite3_value **argv) {
   git_diff_cursor *cur = (git_diff_cursor *)pCursor;
+  /* Release the previous scan's diff before the repo it references, so a
+   * re-filter neither leaks nor dangles. */
   if (cur->diff) { git_diff_free(cur->diff); cur->diff = NULL; }
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
+  cur->repo = NULL;
   cur->idx = 0; cur->count = 0;
 
   const char *repo_path = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : ".";
-  const char *old_rev = argc > 1 ? (const char *)sqlite3_value_text(argv[1]) : "HEAD~1";
-  const char *new_rev = argc > 2 ? (const char *)sqlite3_value_text(argv[2]) : "HEAD";
+  const char *old_rev = argc > 1 && sqlite3_value_type(argv[1]) != SQLITE_NULL
+    ? (const char *)sqlite3_value_text(argv[1]) : "HEAD~1";
+  const char *new_rev = argc > 2 && sqlite3_value_type(argv[2]) != SQLITE_NULL
+    ? (const char *)sqlite3_value_text(argv[2]) : "HEAD";
 
   char *err = NULL;
-  git_repository *repo = git0_repo_open(repo_path, &err);
-  if (!repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
+  cur->repo = git0_repo_open(repo_path, &cur->repo_borrowed, &err);
+  if (!cur->repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_object *old_obj = NULL, *new_obj = NULL;
-  git_revparse_single(&old_obj, repo, old_rev);
-  git_revparse_single(&new_obj, repo, new_rev);
+  git_revparse_single(&old_obj, cur->repo, old_rev);
+  git_revparse_single(&new_obj, cur->repo, new_rev);
   if (!old_obj || !new_obj) {
     if (old_obj) git_object_free(old_obj);
     if (new_obj) git_object_free(new_obj);
@@ -735,7 +770,7 @@ static int git_diff_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char 
   if (c2) git_commit_free(c2);
 
   if (old_tree && new_tree) {
-    git_diff_tree_to_tree(&cur->diff, repo, old_tree, new_tree, NULL);
+    git_diff_tree_to_tree(&cur->diff, cur->repo, old_tree, new_tree, NULL);
     if (cur->diff) {
       git_diff_find_similar(cur->diff, NULL);
       cur->count = git_diff_num_deltas(cur->diff);
@@ -829,6 +864,8 @@ typedef struct { sqlite3_vtab base; } git_anc_vtab;
 
 typedef struct {
   sqlite3_vtab_cursor base;
+  git_repository *repo;
+  int repo_borrowed;
   git_revwalk *walk;
   git_oid current;
   int eof;
@@ -857,6 +894,7 @@ static int git_anc_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
 static int git_anc_close(sqlite3_vtab_cursor *pCursor) {
   git_anc_cursor *cur = (git_anc_cursor *)pCursor;
   if (cur->walk) git_revwalk_free(cur->walk);
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
   sqlite3_free(cur);
   return SQLITE_OK;
 }
@@ -873,7 +911,12 @@ static int git_anc_advance(git_anc_cursor *cur) {
 static int git_anc_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
                           int argc, sqlite3_value **argv) {
   git_anc_cursor *cur = (git_anc_cursor *)pCursor;
+  /* Release the previous scan's walk before the repo it references (the walk
+   * holds the repo for its whole lifetime), so a re-filter neither leaks nor
+   * dangles. */
   if (cur->walk) { git_revwalk_free(cur->walk); cur->walk = NULL; }
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
+  cur->repo = NULL;
   cur->eof = 0; cur->rowid = 0;
 
   const char *repo_path = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : ".";
@@ -881,14 +924,14 @@ static int git_anc_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *
     ? (const char *)sqlite3_value_text(argv[1]) : "HEAD";
 
   char *err = NULL;
-  git_repository *repo = git0_repo_open(repo_path, &err);
-  if (!repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
+  cur->repo = git0_repo_open(repo_path, &cur->repo_borrowed, &err);
+  if (!cur->repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
-  git_revwalk_new(&cur->walk, repo);
+  git_revwalk_new(&cur->walk, cur->repo);
   git_revwalk_sorting(cur->walk, GIT_SORT_TIME);
 
   git_object *obj = NULL;
-  if (git_revparse_single(&obj, repo, rev) == 0) {
+  if (git_revparse_single(&obj, cur->repo, rev) == 0) {
     git_revwalk_push(cur->walk, git_object_id(obj));
     git_object_free(obj);
   }
@@ -959,6 +1002,8 @@ typedef struct { sqlite3_vtab base; } git_cfgl_vtab;
 
 typedef struct {
   sqlite3_vtab_cursor base;
+  git_repository *repo;
+  int repo_borrowed;
   git_config_iterator *iter;
   git_config_entry *current;
   int eof;
@@ -987,6 +1032,7 @@ static int git_cfgl_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
 static int git_cfgl_close(sqlite3_vtab_cursor *pCursor) {
   git_cfgl_cursor *cur = (git_cfgl_cursor *)pCursor;
   if (cur->iter) git_config_iterator_free(cur->iter);
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
   sqlite3_free(cur);
   return SQLITE_OK;
 }
@@ -1003,16 +1049,20 @@ static int git_cfgl_advance(git_cfgl_cursor *cur) {
 static int git_cfgl_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
                            int argc, sqlite3_value **argv) {
   git_cfgl_cursor *cur = (git_cfgl_cursor *)pCursor;
+  /* Release the previous scan's iterator and repo before reopening, so a
+   * re-filter neither leaks nor dangles. */
   if (cur->iter) { git_config_iterator_free(cur->iter); cur->iter = NULL; }
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
+  cur->repo = NULL;
   cur->eof = 0; cur->rowid = 0;
 
   const char *repo_path = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : ".";
   char *err = NULL;
-  git_repository *repo = git0_repo_open(repo_path, &err);
-  if (!repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
+  cur->repo = git0_repo_open(repo_path, &cur->repo_borrowed, &err);
+  if (!cur->repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_config *cfg = NULL;
-  git_repository_config(&cfg, repo);
+  git_repository_config(&cfg, cur->repo);
   git_config_iterator_new(&cur->iter, cfg);
   git_config_free(cfg);
 
@@ -1079,6 +1129,8 @@ typedef struct { sqlite3_vtab base; } git_stat_vtab;
 
 typedef struct {
   sqlite3_vtab_cursor base;
+  git_repository *repo;
+  int repo_borrowed;
   git_status_list *list;
   size_t count;
   size_t idx;
@@ -1107,6 +1159,7 @@ static int git_stat_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
 static int git_stat_close(sqlite3_vtab_cursor *pCursor) {
   git_stat_cursor *cur = (git_stat_cursor *)pCursor;
   if (cur->list) git_status_list_free(cur->list);
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
   sqlite3_free(cur);
   return SQLITE_OK;
 }
@@ -1114,18 +1167,22 @@ static int git_stat_close(sqlite3_vtab_cursor *pCursor) {
 static int git_stat_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
                            int argc, sqlite3_value **argv) {
   git_stat_cursor *cur = (git_stat_cursor *)pCursor;
+  /* Release the previous scan's status list and repo before reopening, so a
+   * re-filter neither leaks nor dangles. */
   if (cur->list) { git_status_list_free(cur->list); cur->list = NULL; }
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
+  cur->repo = NULL;
   cur->idx = 0; cur->count = 0;
 
   const char *repo_path = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : ".";
   char *err = NULL;
-  git_repository *repo = git0_repo_open(repo_path, &err);
-  if (!repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
+  cur->repo = git0_repo_open(repo_path, &cur->repo_borrowed, &err);
+  if (!cur->repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_status_options opts = GIT_STATUS_OPTIONS_INIT;
   opts.show = GIT_STATUS_SHOW_INDEX_AND_WORKDIR;
   opts.flags = GIT_STATUS_OPT_INCLUDE_UNTRACKED | GIT_STATUS_OPT_RENAMES_HEAD_TO_INDEX;
-  git_status_list_new(&cur->list, repo, &opts);
+  git_status_list_new(&cur->list, cur->repo, &opts);
   if (cur->list) cur->count = git_status_list_entrycount(cur->list);
 
   return SQLITE_OK;
@@ -1212,6 +1269,8 @@ typedef struct { sqlite3_vtab base; } git_bl_vtab;
 
 typedef struct {
   sqlite3_vtab_cursor base;
+  git_repository *repo;
+  int repo_borrowed;
   git_blame *blame;
   uint32_t count;
   uint32_t idx;
@@ -1242,6 +1301,7 @@ static int git_bl_open(sqlite3_vtab *pVtab, sqlite3_vtab_cursor **ppCursor) {
 static int git_bl_close(sqlite3_vtab_cursor *pCursor) {
   git_bl_cursor *cur = (git_bl_cursor *)pCursor;
   if (cur->blame) git_blame_free(cur->blame);
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
   sqlite3_free(cur);
   return SQLITE_OK;
 }
@@ -1249,7 +1309,11 @@ static int git_bl_close(sqlite3_vtab_cursor *pCursor) {
 static int git_bl_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
                          int argc, sqlite3_value **argv) {
   git_bl_cursor *cur = (git_bl_cursor *)pCursor;
+  /* Release the previous scan's blame and repo before reopening, so a
+   * re-filter neither leaks nor dangles. */
   if (cur->blame) { git_blame_free(cur->blame); cur->blame = NULL; }
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
+  cur->repo = NULL;
   cur->idx = 0; cur->count = 0;
 
   const char *repo_path = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : ".";
@@ -1260,19 +1324,19 @@ static int git_bl_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *i
   if (!path) return SQLITE_OK;
 
   char *err = NULL;
-  git_repository *repo = git0_repo_open(repo_path, &err);
-  if (!repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
+  cur->repo = git0_repo_open(repo_path, &cur->repo_borrowed, &err);
+  if (!cur->repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
   git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
   if (rev) {
     git_object *obj = NULL;
-    if (git_revparse_single(&obj, repo, rev) == 0) {
+    if (git_revparse_single(&obj, cur->repo, rev) == 0) {
       git_oid_cpy(&opts.newest_commit, git_object_id(obj));
       git_object_free(obj);
     }
   }
 
-  if (git_blame_file(&cur->blame, repo, path, &opts) == 0) {
+  if (git_blame_file(&cur->blame, cur->repo, path, &opts) == 0) {
     cur->count = git_blame_get_hunk_count(cur->blame);
   }
 
@@ -1364,6 +1428,7 @@ typedef struct {
 typedef struct {
   sqlite3_vtab_cursor base;
   git_repository *repo;
+  int repo_borrowed;
   int n;
   int idx;
   char **names;
@@ -1401,6 +1466,7 @@ static int git_attr_close(sqlite3_vtab_cursor *pCursor) {
   }
   free(cur->names);
   free(cur->values);
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
   sqlite3_free(cur);
   return SQLITE_OK;
 }
@@ -1416,9 +1482,14 @@ static int attr_foreach_cb(const char *name, const char *value, void *payload) {
   git_attr_value_t vtype = git_attr_value(value);
   if (vtype == GIT_ATTR_VALUE_UNSPECIFIED) return 0;
   if (ac->n >= ac->cap) {
-    ac->cap = ac->cap ? ac->cap * 2 : 16;
-    ac->names = realloc(ac->names, ac->cap * sizeof(char *));
-    ac->values = realloc(ac->values, ac->cap * sizeof(char *));
+    int ncap = ac->cap ? ac->cap * 2 : 16;
+    char **nn = realloc(ac->names, ncap * sizeof(char *));
+    if (!nn) return -1;
+    ac->names = nn;
+    char **nv = realloc(ac->values, ncap * sizeof(char *));
+    if (!nv) return -1;
+    ac->values = nv;
+    ac->cap = ncap;
   }
   ac->names[ac->n] = strdup(name);
   if (vtype == GIT_ATTR_VALUE_TRUE)
@@ -1447,6 +1518,8 @@ static int git_attr_filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   cur->n = 0;
   cur->idx = 0;
   cur->eof = 1;
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
+  cur->repo = NULL;
 
   if (argc < 2) return SQLITE_OK;
   const char *repo_path = (const char *)sqlite3_value_text(argv[0]);
@@ -1454,7 +1527,7 @@ static int git_attr_filter(sqlite3_vtab_cursor *pCursor, int idxNum,
   if (!repo_path || !path) return SQLITE_OK;
 
   char *err = NULL;
-  cur->repo = git0_repo_open(repo_path, &err);
+  cur->repo = git0_repo_open(repo_path, &cur->repo_borrowed, &err);
   if (!cur->repo) {
     if (err) pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err);
     return SQLITE_ERROR;
@@ -1543,7 +1616,7 @@ typedef struct {
   int idx;
   struct stash_entry {
     int stash_idx;
-    char oid_hex[GIT_OID_SHA1_HEXSIZE + 1];
+    char oid_hex[GIT_OID_MAX_HEXSIZE + 1];
     char *message;
   } *entries;
 } git_stash_cursor;
@@ -1584,17 +1657,20 @@ struct stash_collect {
   int n, cap;
 };
 
-static int stash_reflog_cb(const git_oid *old_oid, const git_oid *new_oid,
+static int stash_reflog_cb(const char *old_oid, const char *new_oid,
                            const char *committer, long long ts, int tz,
                            const char *msg, void *data) {
   (void)old_oid; (void)committer; (void)ts; (void)tz;
   struct stash_collect *sc = data;
   if (sc->n >= sc->cap) {
-    sc->cap = sc->cap ? sc->cap * 2 : 16;
-    sc->entries = realloc(sc->entries, sc->cap * sizeof(struct stash_entry));
+    int ncap = sc->cap ? sc->cap * 2 : 16;
+    struct stash_entry *ne = realloc(sc->entries, ncap * sizeof(struct stash_entry));
+    if (!ne) return -1;
+    sc->entries = ne;
+    sc->cap = ncap;
   }
   sc->entries[sc->n].stash_idx = sc->n;
-  git_oid_tostr(sc->entries[sc->n].oid_hex, GIT_OID_SHA1_HEXSIZE + 1, new_oid);
+  snprintf(sc->entries[sc->n].oid_hex, GIT_OID_MAX_HEXSIZE + 1, "%s", new_oid);
   sc->entries[sc->n].message = strdup(msg ? msg : "");
   sc->n++;
   return 0;
@@ -1612,14 +1688,19 @@ static int git_stash_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char
   cur->n = 0;
   cur->idx = 0;
 
-  /* Read reflog for refs/stash via storage layer */
   struct stash_collect sc = {NULL, 0, 0};
 
-  /* Use storage_reflog_read if we have it (for :storage: repos),
-   * otherwise try libgit2 reflog API. We import storage_reflog_read
-   * since it is declared in storage.h. */
-  extern int storage_reflog_read(const char *, int (*)(const git_oid *, const git_oid *,
-    const char *, long long, int, const char *, void *), void *);
+  /*
+   * The one read in the extension that bypasses libgit2, by necessity: libgit2's
+   * git_stash_foreach walks the refs/stash reflog through the refdb's reflog_read
+   * callback, which the storage refdb backend stubs (GIT_ENOTFOUND) because
+   * libgit2 exposes no public git_reflog constructor (the documented #131 /
+   * upstream PR libgit2#7041 gap, the same one that stubs storage_refdb_reflog_read).
+   * So git_stash_foreach would return nothing on a :storage: repo. Reading the
+   * stash reflog directly via storage_reflog_read is the read-side of that same
+   * exception; once #7041 lands and reflog_read is wired, this can move to
+   * git_stash_foreach.
+   */
   storage_reflog_read("refs/stash", stash_reflog_cb, &sc);
 
   cur->entries = sc.entries;
@@ -1693,8 +1774,8 @@ typedef struct { sqlite3_vtab base; } git_tag_vtab;
 
 struct tag_entry {
   char *name;
-  char oid_hex[GIT_OID_SHA1_HEXSIZE + 1];
-  char target_oid_hex[GIT_OID_SHA1_HEXSIZE + 1];
+  char oid_hex[GIT_OID_MAX_HEXSIZE + 1];
+  char target_oid_hex[GIT_OID_MAX_HEXSIZE + 1];
   char *target_type;
   char *tagger;
   char *message;
@@ -1703,8 +1784,11 @@ struct tag_entry {
 typedef struct {
   sqlite3_vtab_cursor base;
   int n;
+  int cap;
   int idx;
   struct tag_entry *entries;
+  git_repository *repo;
+  int repo_borrowed;
 } git_tag_cursor;
 
 static int git_tag_connect(sqlite3 *db, void *pAux, int argc, const char *const*argv,
@@ -1743,84 +1827,59 @@ static void free_tag_entries(struct tag_entry *entries, int n) {
 static int git_tag_close(sqlite3_vtab_cursor *pCursor) {
   git_tag_cursor *cur = (git_tag_cursor *)pCursor;
   free_tag_entries(cur->entries, cur->n);
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
   sqlite3_free(cur);
   return SQLITE_OK;
 }
 
-/* Parse a tag object's raw data to extract fields */
-static void parse_tag_object(const unsigned char *data, size_t size,
-                             struct tag_entry *e) {
-  const char *p = (const char *)data;
-  const char *end = p + size;
-  const char *body = NULL;
+/* Collect one tag ref into the cursor's entry array, resolved through libgit2.
+ * The iterator hands the git_reference directly, so its oid comes from
+ * git_reference_target (no extra name->oid lookup). An annotated tag (a stored
+ * tag object) carries its target oid + type, tagger and message via the
+ * git_tag_* accessors; a lightweight tag is a ref pointing straight at a
+ * commit/tree/blob, so its target is that object. libgit2 owns the tag-object
+ * parsing (no hand parser). */
+static int git_tag_collect(git_tag_cursor *cur, const git_reference *ref) {
+  const git_oid *oid = git_reference_target(ref);
+  if (!oid) return 0;	/* symbolic ref (not a normal tag): skip */
 
-  while (p < end) {
-    const char *nl = memchr(p, '\n', end - p);
-    if (!nl) break;
-    if (nl == p) { body = p + 1; break; } /* empty line = start of message */
-
-    size_t linelen = nl - p;
-    if (linelen > 7 && !strncmp(p, "object ", 7)) {
-      char hex[GIT_OID_SHA1_HEXSIZE + 1];
-      snprintf(hex, sizeof(hex), "%.*s", (int)(linelen - 7 < 40 ? linelen - 7 : 40), p + 7);
-      snprintf(e->target_oid_hex, sizeof(e->target_oid_hex), "%s", hex);
-    } else if (linelen > 5 && !strncmp(p, "type ", 5)) {
-      e->target_type = strndup(p + 5, linelen - 5);
-    } else if (linelen > 7 && !strncmp(p, "tagger ", 7)) {
-      e->tagger = strndup(p + 7, linelen - 7);
-    }
-    p = nl + 1;
+  if (cur->n >= cur->cap) {
+    int ncap = cur->cap ? cur->cap * 2 : 16;
+    struct tag_entry *ne = realloc(cur->entries, (size_t)ncap * sizeof(*ne));
+    if (!ne) return -1;
+    cur->entries = ne;
+    cur->cap = ncap;
   }
 
-  if (body && body < end) {
-    e->message = strndup(body, end - body);
-  }
-}
-
-struct tag_collect {
-  struct tag_entry *entries;
-  int n, cap;
-};
-
-static int tag_ref_cb(const char *refname, const git_oid *oid,
-                      const char *symref, void *data) {
-  (void)symref;
-  struct tag_collect *tc = data;
-  if (!oid) return 0;
-
-  if (tc->n >= tc->cap) {
-    tc->cap = tc->cap ? tc->cap * 2 : 16;
-    tc->entries = realloc(tc->entries, tc->cap * sizeof(struct tag_entry));
-  }
-
-  struct tag_entry *e = &tc->entries[tc->n];
+  struct tag_entry *e = &cur->entries[cur->n];
   memset(e, 0, sizeof(*e));
-
-  /* Strip refs/tags/ prefix for name */
-  if (!strncmp(refname, "refs/tags/", 10))
-    e->name = strdup(refname + 10);
-  else
-    e->name = strdup(refname);
-
+  e->name = strdup(git_reference_shorthand(ref));	/* strips refs/tags/ */
   git_oid_tostr(e->oid_hex, sizeof(e->oid_hex), oid);
 
-  /* Try to read the object to see if it's an annotated tag */
-  extern int storage_read_object(const git_oid *oid, git_object_t *out_type,
-    size_t *out_size, unsigned char **out_data);
-  git_object_t type; size_t size; unsigned char *obj_data;
-  if (storage_read_object(oid, &type, &size, &obj_data) == 0) {
-    if (type == GIT_OBJECT_TAG) {
-      /* Annotated tag: parse the tag object */
-      parse_tag_object(obj_data, size, e);
+  git_object *obj = NULL;
+  if (git_object_lookup(&obj, cur->repo, oid, GIT_OBJECT_ANY) == 0) {
+    if (git_object_type(obj) == GIT_OBJECT_TAG) {
+      git_tag *tag = (git_tag *)obj;
+      git_oid_tostr(e->target_oid_hex, sizeof(e->target_oid_hex), git_tag_target_id(tag));
+      e->target_type = strdup(git_object_type2string(git_tag_target_type(tag)));
+      const git_signature *tagger = git_tag_tagger(tag);
+      if (tagger) {
+        char buf[1024];
+        snprintf(buf, sizeof(buf), "%s <%s> %lld %+03d%02d",
+                 tagger->name, tagger->email, (long long)tagger->when.time,
+                 tagger->when.offset / 60, abs(tagger->when.offset) % 60);
+        e->tagger = strdup(buf);
+      }
+      const char *msg = git_tag_message(tag);
+      if (msg) e->message = strdup(msg);
     } else {
-      /* Lightweight tag: points directly to a commit/tree/blob */
+      /* Lightweight tag: the ref points straight at its target object. */
       snprintf(e->target_oid_hex, sizeof(e->target_oid_hex), "%s", e->oid_hex);
-      e->target_type = strdup(git_object_type2string(type));
+      e->target_type = strdup(git_object_type2string(git_object_type(obj)));
     }
-    free(obj_data);
+    git_object_free(obj);
   }
-
-  tc->n++;
+  cur->n++;
   return 0;
 }
 
@@ -1831,16 +1890,37 @@ static int git_tag_filter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *
   free_tag_entries(cur->entries, cur->n);
   cur->entries = NULL;
   cur->n = 0;
+  cur->cap = 0;
   cur->idx = 0;
+  if (cur->repo && !cur->repo_borrowed) git_repository_free(cur->repo);
+  cur->repo = NULL;
 
-  extern int storage_ref_list(const char *prefix, int (*)(const char *, const git_oid *,
-    const char *, void *), void *);
+  /* Honor the repo argument like the other TVFs (git_log/git_refs); the prior
+   * implementation ignored it and always read the storage repo. */
+  const char *repo_path = argc > 0 ? (const char *)sqlite3_value_text(argv[0]) : ".";
+  const char *pattern = argc > 1 && sqlite3_value_type(argv[1]) != SQLITE_NULL
+    ? (const char *)sqlite3_value_text(argv[1]) : NULL;
 
-  struct tag_collect tc = {NULL, 0, 0};
-  storage_ref_list("refs/tags/", tag_ref_cb, &tc);
+  char *err = NULL;
+  cur->repo = git0_repo_open(repo_path, &cur->repo_borrowed, &err);
+  if (!cur->repo) { pCursor->pVtab->zErrMsg = sqlite3_mprintf("%s", err); return SQLITE_ERROR; }
 
-  cur->entries = tc.entries;
-  cur->n = tc.n;
+  /* Glob the tag refs through libgit2's refdb iterator; a pattern scopes under
+   * refs/tags/ (previously a declared-but-ignored column). */
+  char *glob = pattern ? sqlite3_mprintf("refs/tags/%s", pattern)
+                       : sqlite3_mprintf("refs/tags/*");
+  if (!glob) return SQLITE_NOMEM;
+  git_reference_iterator *it = NULL;
+  if (git_reference_iterator_glob_new(&it, cur->repo, glob) == 0) {
+    git_reference *ref;
+    while (git_reference_next(&ref, it) == 0) {
+      int rc = git_tag_collect(cur, ref);
+      git_reference_free(ref);
+      if (rc < 0) break;
+    }
+    git_reference_iterator_free(it);
+  }
+  sqlite3_free(glob);
   return SQLITE_OK;
 }
 
@@ -1925,28 +2005,6 @@ static sqlite3_module git_tag_module = {
 
 /*
 ** ========================================================
-** git0_generation(oid) scalar function
-** Queries commit_graph for generation number.
-** ========================================================
-*/
-
-static void fn_git0_generation(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-  (void)argc;
-  const char *hex = (const char *)sqlite3_value_text(argv[0]);
-  if (!hex) { sqlite3_result_null(ctx); return; }
-  git_oid oid;
-  if (git_oid_fromstr(&oid, hex) < 0) { sqlite3_result_null(ctx); return; }
-
-  extern int storage_commit_generation(const git_oid *oid);
-  int gen = storage_commit_generation(&oid);
-  if (gen < 0)
-    sqlite3_result_null(ctx);
-  else
-    sqlite3_result_int(ctx, gen);
-}
-
-/*
-** ========================================================
 ** Register all TVFs
 ** ========================================================
 */
@@ -1963,7 +2021,5 @@ int git0_register_vtabs(sqlite3 *db) {
   sqlite3_create_module(db, "git_attr", &git_attr_module, 0);
   sqlite3_create_module(db, "git_stash", &git_stash_module, 0);
   sqlite3_create_module(db, "git_tag", &git_tag_module, 0);
-  sqlite3_create_function(db, "git0_generation", 1, SQLITE_UTF8, 0,
-                          fn_git0_generation, 0, 0);
   return SQLITE_OK;
 }

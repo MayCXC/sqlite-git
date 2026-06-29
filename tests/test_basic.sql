@@ -48,25 +48,9 @@ SELECT 'blame: ' || count(*) || ' hunks' FROM git_blame('.', 'Makefile');
 -- git_status
 SELECT 'status: ' || count(*) || ' entries' FROM git_status('.');
 
--- Phase 1/2: git0_objects and git0_refs virtual tables
-CREATE VIRTUAL TABLE IF NOT EXISTS test_obj USING git0_objects;
-CREATE VIRTUAL TABLE IF NOT EXISTS test_refs USING git0_refs;
-
-INSERT INTO test_obj(type, data) VALUES('blob', 'hello world');
-INSERT INTO test_obj(type, data) VALUES('blob', 'second blob');
-INSERT INTO test_obj(type, data) VALUES('blob', 'hello world');  -- duplicate
-
-SELECT 'obj_count: ' || count(*) FROM test_obj;
-SELECT 'obj_lookup: ' || oid FROM test_obj WHERE oid = '95d09f2b10159347eece71399a7e2e907ea3df4f';
-
-INSERT INTO test_refs(name, target) VALUES('refs/heads/main', '95d09f2b10159347eece71399a7e2e907ea3df4f');
-INSERT INTO test_refs(name, target) VALUES('HEAD', '95d09f2b10159347eece71399a7e2e907ea3df4f');
-SELECT 'ref_count: ' || count(*) FROM test_refs;
-SELECT 'ref_type: ' || type FROM test_refs WHERE name = 'refs/heads/main';
-SELECT 'head_type: ' || type FROM test_refs WHERE name = 'HEAD';
-
-DROP TABLE test_obj;
-DROP TABLE test_refs;
+-- Object and ref storage round-trips are exercised below through the public
+-- storage-native interface (git0_add/git0_cat, git0_ref_create/git0_ref), which
+-- writes and reads the same objects/refs tables.
 
 -- Phase 3: self-contained repo (requires storage_open, skipped in :memory:)
 -- These functions work when loaded into a file-backed database:
@@ -75,8 +59,8 @@ DROP TABLE test_refs;
 --   SELECT git0_mktree('100644 test.txt ' || git0_add('test.txt', 'data'));
 --   SELECT git0_mkcommit(tree_oid, parent_oid, 'message');
 
--- Phase 5: LFS pointer generation (no storage needed)
-SELECT 'lfs_pointer: ' || length(git0_lfs_pointer('large content here')) || ' bytes';
+-- LFS lives in its own extension now (gitlfs.so / tests/test_lfs.sql); git0.so
+-- registers no git0_lfs_* functions.
 
 -- Storage-native functions (use the same db connection)
 SELECT 'storage_type: ' || git0_type(git0_add('test.txt', 'storage test'));
@@ -85,9 +69,13 @@ SELECT 'storage_exists: ' || git0_exists(git0_add('test.txt', 'storage test'));
 SELECT 'storage_cat: ' || length(git0_cat(git0_add('test.txt', 'storage test')));
 SELECT 'storage_blob: ' || CAST(git0_blob(git0_add('test.txt', 'storage test')) AS TEXT);
 
+-- Abbreviated-oid lookup resolves through the storage odb's read_prefix/exists_prefix
+-- (git_revparse_single on a 12-hex prefix -> git_object_lookup_prefix -> backend).
+SELECT 'storage_abbrev: ' || git_rev_parse(git0_repo(), substr(git0_add('abbrev.txt', 'abbrev probe'), 1, 12));
+
 -- Ref operations
 SELECT 'storage_ref: ' || git0_ref('HEAD');
-SELECT 'storage_ref_main: ' || git0_ref('refs/heads/main');
+SELECT 'storage_ref_master: ' || git0_ref('refs/heads/master');
 
 -- Commit accessors
 SELECT 'storage_tree: ' || git0_commit_tree(git0_ref('HEAD'));
@@ -96,27 +84,36 @@ SELECT 'storage_author: ' || git0_commit_author(git0_ref('HEAD'));
 SELECT 'storage_parents: ' || git0_commit_parents(git0_ref('HEAD'));
 
 -- Commit with content, then read blob by path
-SELECT git0_ref_create('refs/heads/main',
+SELECT git0_ref_create('refs/heads/master',
   git0_mkcommit(
     git0_mktree('100644 file.txt ' || git0_add('file.txt', 'path test')),
     git0_ref('HEAD'),
     'test commit'
   )
 );
-SELECT 'storage_blob_path: ' || CAST(git0_blob(git0_ref('refs/heads/main'), 'file.txt') AS TEXT);
+SELECT 'storage_blob_path: ' || CAST(git0_blob(git0_ref('refs/heads/master'), 'file.txt') AS TEXT);
+
+-- Nested path: git0_mktree builds the intermediate dir/sub subtrees from the
+-- slashed path, and git0_blob resolves the blob through them (covers subtree
+-- creation, which the flat entries above do not).
+SELECT git0_ref_create('refs/heads/nested',
+  git0_mkcommit(
+    git0_mktree('100644 dir/sub/file.txt ' || git0_add('dir/sub/file.txt', 'nested test')),
+    git0_ref('HEAD'),
+    'nested commit'
+  )
+);
+SELECT 'storage_blob_nested: ' || CAST(git0_blob(git0_ref('refs/heads/nested'), 'dir/sub/file.txt') AS TEXT);
 
 -- Commit parent
-SELECT 'storage_parent0: ' || git0_commit_parent(git0_ref('refs/heads/main'), 0);
+SELECT 'storage_parent0: ' || git0_commit_parent(git0_ref('refs/heads/master'), 0);
 
 -- Refs list TVF
 -- Refs are verified via git0_ref() above. The git0_refs vtable
 -- (test_refs) was dropped after Phase 1/2 tests.
 
--- LFS round-trip (storage-backed)
-SELECT 'storage_lfs: ' || (CAST(git0_lfs_fetch(git0_lfs_store('lfs round trip')) AS TEXT) = 'lfs round trip');
-
 -- Ref delete
-SELECT git0_ref_delete('refs/heads/main');
-SELECT 'storage_ref_deleted: ' || COALESCE(git0_ref('refs/heads/main'), 'null');
+SELECT git0_ref_delete('refs/heads/master');
+SELECT 'storage_ref_deleted: ' || COALESCE(git0_ref('refs/heads/master'), 'null');
 
 SELECT 'All tests passed.';

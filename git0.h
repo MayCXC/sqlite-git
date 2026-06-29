@@ -15,9 +15,6 @@
 #endif
 
 #define GIT0_VERSION "0.1.0"
-#define GIT0_VERSION_MAJOR 0
-#define GIT0_VERSION_MINOR 1
-#define GIT0_VERSION_PATCH 0
 
 #ifdef GIT0_STATIC
   #define GIT0_API
