@@ -1,14 +1,14 @@
 #!/bin/sh
 #
-# Test suite for git-local-sqlite.
+# Test suite for git-local-sqlite and git-lfs-sqlite-transfer.
 #
 # Exercises the local helper protocol (the landed command set: objects, refs,
-# transactions with CAS old-value preconditions, reflog, promisor, refresh).
-# Each test creates a fresh database in a temp directory and cleans up after
-# itself.
+# transactions with CAS old-value preconditions, reflog, promisor, refresh) and
+# the LFS transfer adapter. Each test creates a fresh database in a temp
+# directory and cleans up after itself.
 #
 # Usage: ./tests/test_helper.sh
-#   Requires: git-local-sqlite built in the repo root.
+#   Requires: git-local-sqlite, git-lfs-sqlite-transfer built in the repo root.
 
 set -e
 
@@ -16,6 +16,7 @@ PASS=0
 FAIL=0
 BINDIR="$(cd "$(dirname "$0")/.." && pwd)"
 HELPER="$BINDIR/git-local-sqlite"
+LFS_TRANSFER="$BINDIR/git-lfs-sqlite-transfer"
 TMPDIR=$(mktemp -d)
 
 cleanup() { rm -rf "$TMPDIR"; }
@@ -39,8 +40,9 @@ check() {
 	fi
 }
 
-# Ensure the helper exists
+# Ensure binaries exist
 test -x "$BINDIR/git-local-sqlite" || { echo "git-local-sqlite not built"; exit 1; }
+test -x "$LFS_TRANSFER" || { echo "git-lfs-sqlite-transfer not built"; exit 1; }
 
 # ---- Capabilities ----
 
@@ -569,6 +571,56 @@ VFY=$(printf 'capabilities\nverify\n' \
 
 check "verify: command acks ok (integrity_check)" \
 	'test "$VFY" = "ok"'
+
+# ---- LFS transfer adapter ----
+
+DB="$TMPDIR/lfs-test"
+
+# Upload via LFS protocol
+UPLOAD_RESP=$(printf '{"event":"init","operation":"upload","concurrent":true}\n{"event":"upload","oid":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","size":0,"path":"/dev/null"}\n{"event":"terminate"}\n' \
+	| "$LFS_TRANSFER" "$DB" 2>/dev/null)
+
+check "lfs upload: completes without error" \
+	'echo "$UPLOAD_RESP" | grep -q "\"event\":\"complete\""'
+
+check "lfs upload: no error field" \
+	'! echo "$UPLOAD_RESP" | grep -q "\"error\""'
+
+# Download via LFS protocol
+DOWNLOAD_RESP=$(printf '{"event":"init","operation":"download","concurrent":true}\n{"event":"download","oid":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","size":0}\n{"event":"terminate"}\n' \
+	| "$LFS_TRANSFER" "$DB" 2>/dev/null)
+
+check "lfs download: completes with path" \
+	'echo "$DOWNLOAD_RESP" | grep -q "\"path\""'
+
+# Download missing oid
+DOWNLOAD_MISSING=$(printf '{"event":"init","operation":"download","concurrent":true}\n{"event":"download","oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":0}\n{"event":"terminate"}\n' \
+	| "$LFS_TRANSFER" "$DB" 2>/dev/null)
+
+check "lfs download: 404 for missing oid" \
+	'echo "$DOWNLOAD_MISSING" | grep -q "\"code\":404"'
+
+# Bad oid validation
+BAD_OID=$(printf '{"event":"init","operation":"download","concurrent":true}\n{"event":"download","oid":"notahex","size":0}\n{"event":"terminate"}\n' \
+	| "$LFS_TRANSFER" "$DB" 2>/dev/null)
+
+check "lfs download: 400 for bad oid" \
+	'echo "$BAD_OID" | grep -q "\"code\":400"'
+
+# Multi-frame round-trip: an object larger than one 4 MiB frame must split into
+# several lfs_chunk rows on upload and reassemble byte-for-byte on download.
+LFS_BIG="$TMPDIR/lfs-big.bin"
+dd if=/dev/urandom of="$LFS_BIG" bs=1048576 count=5 2>/dev/null  # 5 MiB: spans two frames
+LFS_BIG_OID=$(sha256sum "$LFS_BIG" | cut -d' ' -f1)
+LFS_BIG_DB="$TMPDIR/lfs-big-db"
+printf '{"event":"init","operation":"upload","concurrent":true}\n{"event":"upload","oid":"%s","size":5242880,"path":"%s"}\n{"event":"terminate"}\n' "$LFS_BIG_OID" "$LFS_BIG" \
+	| "$LFS_TRANSFER" "$LFS_BIG_DB" >/dev/null 2>&1
+LFS_BIG_DL=$(printf '{"event":"init","operation":"download","concurrent":true}\n{"event":"download","oid":"%s","size":5242880}\n{"event":"terminate"}\n' "$LFS_BIG_OID" \
+	| "$LFS_TRANSFER" "$LFS_BIG_DB" 2>/dev/null)
+LFS_BIG_PATH=$(echo "$LFS_BIG_DL" | grep -o '"path":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+check "lfs multi-frame: a >4 MiB object round-trips across chunks intact" \
+	'test -n "$LFS_BIG_PATH" && test "$(sha256sum "$LFS_BIG_PATH" | cut -d" " -f1)" = "$LFS_BIG_OID"'
 
 # ---- Summary ----
 

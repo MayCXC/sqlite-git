@@ -21,7 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "storage.h"
+#include "storage_git_lfs.h"
 
 /* Minimal JSON helpers (no dependency on a JSON library) */
 
@@ -34,9 +34,7 @@ static const char *json_string(const char *json, const char *key, char *out, siz
 	const char *end = strchr(p, '"');
 	if (!end) return NULL;
 	size_t len = end - p;
-	if (len >= outlen) len = outlen - 1;
-	memcpy(out, p, len);
-	out[len] = '\0';
+	snprintf(out, outlen, "%.*s", (int)len, p);
 	return out;
 }
 
@@ -59,6 +57,7 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "error: cannot open database\n");
 		return 1;
 	}
+	storage_lfs_init();	/* create the lfs schema on the opened connection */
 
 	char line[65536];
 	while (fgets(line, sizeof(line), stdin)) {
@@ -86,28 +85,36 @@ int main(int argc, char **argv) {
 				continue;
 			}
 
-			size_t out_size;
-			unsigned char *data;
-			if (storage_lfs_read(oid, &out_size, &data) == 0) {
-				char tmppath[] = "/tmp/lfs-XXXXXX";
-				int fd = mkstemp(tmppath);
-				if (fd >= 0) {
-					FILE *f = fdopen(fd, "wb");
-					if (f) {
-						fwrite(data, 1, out_size, f);
-						fclose(f);
-					} else {
-						close(fd);
-						unlink(tmppath);
-					}
-				}
-				free(data);
-				printf("{\"event\":\"complete\",\"oid\":\"%s\",\"path\":\"%s\"}\n",
-				       oid_hex, tmppath);
-			} else {
+			char tmppath[] = "/tmp/lfs-XXXXXX";
+			int fd = mkstemp(tmppath);
+			if (fd < 0) {
 				printf("{\"event\":\"complete\",\"oid\":\"%s\","
-				       "\"error\":{\"code\":404,\"message\":\"not found\"}}\n",
+				       "\"error\":{\"code\":500,\"message\":\"cannot create temp file\"}}\n",
 				       oid_hex);
+			} else {
+				FILE *f = fdopen(fd, "wb");
+				/* Stream the object out a frame at a time into the temp file
+				 * git-lfs reads, never holding the whole object in memory.
+				 * read_stream: 0 ok, -1 not stored (404), -2 sink error (500). */
+				int rc = f ? storage_lfs_read_stream(oid, f) : -2;
+				if (f && fclose(f) != 0 && rc == 0)
+					rc = -2;
+				if (!f)
+					close(fd);
+				if (rc == 0) {
+					printf("{\"event\":\"complete\",\"oid\":\"%s\",\"path\":\"%s\"}\n",
+					       oid_hex, tmppath);
+				} else {
+					unlink(tmppath);
+					if (rc == -1)
+						printf("{\"event\":\"complete\",\"oid\":\"%s\","
+						       "\"error\":{\"code\":404,\"message\":\"not found\"}}\n",
+						       oid_hex);
+					else
+						printf("{\"event\":\"complete\",\"oid\":\"%s\","
+						       "\"error\":{\"code\":500,\"message\":\"cannot stage download\"}}\n",
+						       oid_hex);
+				}
 			}
 			fflush(stdout);
 
@@ -125,18 +132,19 @@ int main(int argc, char **argv) {
 				continue;
 			}
 
-			/* Read content from the file git-lfs provides */
+			/* Stream the file git-lfs staged into the store a frame at a time,
+			 * never materializing the whole object in memory. write_stream
+			 * fails on a short read or a failed store, so the ack is gated on it. */
 			FILE *f = fopen(path, "rb");
 			if (f) {
-				unsigned char *data = malloc(size ? (size_t)size : 1);
-				if (!data) { fclose(f); printf("{\"event\":\"complete\",\"oid\":\"%s\","
-					"\"error\":{\"code\":500,\"message\":\"out of memory\"}}\n", oid_hex);
-					fflush(stdout); continue; }
-				size_t got = fread(data, 1, (size_t)size, f);
+				int rc = storage_lfs_write_stream(oid, f, (size_t)size);
 				fclose(f);
-				storage_lfs_write(oid, data, got);
-				free(data);
-				printf("{\"event\":\"complete\",\"oid\":\"%s\"}\n", oid_hex);
+				if (rc == 0)
+					printf("{\"event\":\"complete\",\"oid\":\"%s\"}\n", oid_hex);
+				else
+					printf("{\"event\":\"complete\",\"oid\":\"%s\","
+					       "\"error\":{\"code\":500,\"message\":\"cannot store object\"}}\n",
+					       oid_hex);
 			} else {
 				printf("{\"event\":\"complete\",\"oid\":\"%s\","
 				       "\"error\":{\"code\":500,\"message\":\"cannot read file\"}}\n",

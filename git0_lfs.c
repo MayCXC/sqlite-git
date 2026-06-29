@@ -1,7 +1,13 @@
 /*
-** git0_lfs: large file storage in SQLite.
+** git0_lfs: git-lfs large file storage in SQLite, as a standalone extension.
 **
-** Stores large file content via the shared storage layer.
+** This is its own loadable extension (gitlfs.so -> sqlite3_gitlfs_init),
+** separate from git0.so: it links NO libgit2 and NO git object store, only the
+** dependency-free core + the git-lfs storage layer (storage_git_lfs.c) + sha256.
+** It can be used alone as an LFS backend, or loaded alongside git0.so / the
+** local helper over the same sqlite.db, where the lfs tables coexist with the
+** git object/ref tables.
+**
 ** LFS pointer format (fully compatible with git-lfs):
 **   version https://git-lfs.github.com/spec/v1
 **   oid sha256:<64-char-hex>
@@ -16,17 +22,18 @@
 ** Uses SHA-256 for content OIDs per the git-lfs specification.
 */
 
-#include "git0.h"
-#include "storage.h"
-
 #ifndef SQLITE_CORE
-  SQLITE_EXTENSION_INIT3
+  #include "sqlite3ext.h"
+  SQLITE_EXTENSION_INIT1
+#else
+  #include <sqlite3.h>
 #endif
 
+#include "storage_git_lfs.h"
+
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-
-
 
 /* ---- git0_lfs_pointer(data) ---- */
 
@@ -60,7 +67,10 @@ static void fn_lfs_store(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 
   unsigned char oid[LFS_OID_RAWSZ];
   storage_lfs_sha256(data, len, oid);
-  storage_lfs_write(oid, data, len);
+  if (storage_lfs_write(oid, data, len) != 0) {
+    sqlite3_result_error(ctx, "lfs store failed", -1);
+    return;
+  }
 
   char hex[LFS_OID_HEXSZ + 1];
   storage_lfs_oid_to_hex(oid, hex);
@@ -116,12 +126,33 @@ static void fn_lfs_smudge(sqlite3_context *ctx, int argc, sqlite3_value **argv) 
   }
 }
 
-/* ---- Registration ---- */
+/* ---- Extension entry point ---- */
 
-int git0_register_lfs(sqlite3 *db) {
+/*
+ * .load <dir>/gitlfs derives sqlite3_gitlfs_init (sqlite copies the alpha chars
+ * of the basename: "gitlfs" -> sqlite3_gitlfs_init). Borrow the loader's
+ * connection and ensure the lfs schema exists, so the git0_lfs_* functions work
+ * on whatever database the extension is loaded into; storage_open_db is a no-op
+ * if git0.so already adopted the same connection, and storage_lfs_init is
+ * idempotent, so the two extensions compose over one store.
+ */
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+int sqlite3_gitlfs_init(sqlite3 *db, char **pzErrMsg,
+                        const sqlite3_api_routines *pApi) {
+  (void)pzErrMsg;
+#ifndef SQLITE_CORE
+  SQLITE_EXTENSION_INIT2(pApi);
+#endif
+
+  storage_open_db(db);
+  storage_lfs_init();
+
   sqlite3_create_function(db, "git0_lfs_pointer", 1, SQLITE_UTF8, 0, fn_lfs_pointer, 0, 0);
   sqlite3_create_function(db, "git0_lfs_store", 1, SQLITE_UTF8, 0, fn_lfs_store, 0, 0);
   sqlite3_create_function(db, "git0_lfs_fetch", 1, SQLITE_UTF8, 0, fn_lfs_fetch, 0, 0);
   sqlite3_create_function(db, "git0_lfs_smudge", 1, SQLITE_UTF8, 0, fn_lfs_smudge, 0, 0);
+
   return SQLITE_OK;
 }
