@@ -93,6 +93,11 @@ SELECT git0_ref_create('refs/heads/master',
 );
 SELECT 'storage_blob_path: ' || CAST(git0_blob(git0_ref('refs/heads/master'), 'file.txt') AS TEXT);
 
+-- The oid sibling of the path lookup: the entry's identity must be the oid the
+-- content was stored under (git0_add of identical content returns the same oid).
+SELECT 'storage_blob_oid: ' || (git0_blob_oid(git0_ref('refs/heads/master'), 'file.txt') = git0_add('file.txt', 'path test'));
+SELECT 'storage_blob_oid_absent: ' || COALESCE(git0_blob_oid(git0_ref('refs/heads/master'), 'no-such-path'), '(null)');
+
 -- Nested path: git0_mktree builds the intermediate dir/sub subtrees from the
 -- slashed path, and git0_blob resolves the blob through them (covers subtree
 -- creation, which the flat entries above do not).

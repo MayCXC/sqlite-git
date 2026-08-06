@@ -174,6 +174,33 @@ static void fn_s_blob(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   git_tree_free(tree);
 }
 
+/* git0_blob_oid(rev, path): the oid of the entry at <path> in <rev>'s tree, as hex
+ * (NULL if the path is absent). The sibling of git0_blob that resolves the same
+ * tree entry but yields its identity instead of its content, so a caller can enumerate
+ * a path's blob versions across history without reading each blob. */
+static void fn_s_blob_oid(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc;
+  git_repository *repo = get_repo(ctx); if (!repo) return;
+  const char *path = (const char *)sqlite3_value_text(argv[1]);
+  if (!path) { sqlite3_result_null(ctx); return; }
+  git_commit *commit = resolve_commit(repo, ctx, argv[0]);
+  if (!commit) return;
+  git_tree *tree = NULL;
+  if (git_commit_tree(&tree, commit) != 0) {
+    git_commit_free(commit); sqlite3_result_null(ctx); return;
+  }
+  git_commit_free(commit);
+  git_tree_entry *entry = NULL;
+  if (git_tree_entry_bypath(&entry, tree, path) != 0) {
+    git_tree_free(tree); sqlite3_result_null(ctx); return;
+  }
+  char hex[GIT_OID_MAX_HEXSIZE + 1];
+  git_oid_tostr(hex, sizeof(hex), git_tree_entry_id(entry));
+  sqlite3_result_text(ctx, hex, -1, SQLITE_TRANSIENT);
+  git_tree_entry_free(entry);
+  git_tree_free(tree);
+}
+
 static void fn_s_ref(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
   git_repository *repo = get_repo(ctx); if (!repo) return;
@@ -294,6 +321,7 @@ int git0_register_storage(sqlite3 *db) {
   sqlite3_create_function(db, "git0_cat", 1, SQLITE_UTF8, 0, fn_s_cat, 0, 0);
   sqlite3_create_function(db, "git0_blob", 1, SQLITE_UTF8, 0, fn_s_blob, 0, 0);
   sqlite3_create_function(db, "git0_blob", 2, SQLITE_UTF8, 0, fn_s_blob, 0, 0);
+  sqlite3_create_function(db, "git0_blob_oid", 2, SQLITE_UTF8, 0, fn_s_blob_oid, 0, 0);
   sqlite3_create_function(db, "git0_ref", 1, SQLITE_UTF8, 0, fn_s_ref, 0, 0);
   sqlite3_create_function(db, "git0_ref_create", 2, SQLITE_UTF8, 0, fn_s_ref_create, 0, 0);
   sqlite3_create_function(db, "git0_ref_delete", 1, SQLITE_UTF8, 0, fn_s_ref_delete, 0, 0);
