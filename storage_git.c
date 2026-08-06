@@ -369,10 +369,14 @@ static const char *const stmt_sql[STMT_COUNT] = {
 	 * one-off raw prepare. */
 	[STMT_INTEGRITY_CHECK] =
 		"PRAGMA integrity_check",
-	/* VACUUM (the optimize command): a no-result maintenance statement, cached in
-	 * the array like every other statement an operation drives, not exec'd. */
+	/* incremental_vacuum (the optimize command): reclaims the pages object and ref
+	 * churn freed to the freelist, in place, skipping the whole-store rebuild (and
+	 * ~2x scratch) a full VACUUM does. Relies on auto_vacuum = INCREMENTAL, set in
+	 * apply_pragmas when the store is created. A no-result maintenance statement,
+	 * cached in the array like every other statement an operation drives, not
+	 * exec'd. */
 	[STMT_VACUUM] =
-		"VACUUM",
+		"PRAGMA incremental_vacuum",
 };
 
 /* The prepared handles, parallel to stmt_sql[] and indexed by the same stmt_id.
@@ -1113,7 +1117,7 @@ int storage_optimize_done(void) {
 	return storage_release("optimize_done");
 }
 
-/* ---- Maintenance: VACUUM (optimize) and the integrity check (verify) ---- */
+/* ---- Maintenance: incremental_vacuum (optimize) and integrity check (verify) ---- */
 
 int storage_vacuum(void) {
 	sqlite3_stmt *st = stmt_acquire(STMT_VACUUM);
@@ -1122,6 +1126,9 @@ int storage_vacuum(void) {
 	if (!st)
 		return -1;
 	rc = sqlite3_step(st);
+	if (rc != SQLITE_DONE)
+		fprintf(stderr, "sqlite-git: incremental_vacuum failed (%d): %s\n",
+			rc, sqlite3_errmsg(storage_db()));
 	stmt_release(STMT_VACUUM, st);
 	return rc == SQLITE_DONE ? 0 : -1;
 }

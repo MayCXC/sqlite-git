@@ -49,7 +49,7 @@ static void cmd_capabilities(void) {
 	 * Advertise the landed protocol (the commands the git core helper
 	 * backend sends). "optimize" (A3) repacks: it re-deltifies the store by
 	 * driving git's pack-objects and storing the result through "put"/"put-raw"
-	 * with their replace argument set, then VACUUMs. "replace" advertises that
+	 * with their replace argument set, then reclaims (incremental_vacuum). "replace" advertises that
 	 * those verbs honor that trailing argument (overwrite an object's stored
 	 * representation in place rather than keep-existing); only repack sets it.
 	 * "verify" (A3) runs a database integrity check for "git fsck". "keep-pack"
@@ -348,7 +348,7 @@ static void cmd_promisor(void) {
 }
 
 /*
- * A3 maintenance: "optimize" compacts the backing database (VACUUM), reclaiming
+ * A3 maintenance: "optimize" reclaims, in place (incremental_vacuum), the
  * pages freed by object/ref churn. Reached from "git gc"/"git repack" AFTER git
  * has re-deltified the store (pack-objects | index-pack --re-deltify), so this
  * reclaims the space the re-representation frees. It then stamps the optimize

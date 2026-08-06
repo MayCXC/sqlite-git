@@ -236,9 +236,10 @@ int storage_prune_object(const char *oid, long long expire);
 long long storage_optimize_churn(void);
 int storage_optimize_done(void);
 
-/* Maintenance, driven by the optimize/verify operations: VACUUM reclaims free
- * pages left by object/ref churn; integrity_check (PRAGMA) reports whether the
- * store is sound. Both return 0 on success, -1 on failure. */
+/* Maintenance, driven by the optimize/verify operations: incremental_vacuum
+ * reclaims the free pages left by object/ref churn to the OS in place (needs
+ * auto_vacuum = INCREMENTAL); integrity_check (PRAGMA) reports whether the store
+ * is sound. Both return 0 on success, -1 on failure. */
 int storage_vacuum(void);
 int storage_integrity_check(void);
 

@@ -95,13 +95,19 @@ void storage_at_close(void (*fn)(void)) {
 /* ---- Database ---- */
 
 /*
- * Connection pragmas, shared by both faces. page_size MUST precede journal_mode
- * (and any CREATE): a page_size change is silently ignored once the WAL is set
- * up or any table exists, so issuing it first is the only way the intended 8 KiB
- * page (shallower btrees over the blob payloads) takes effect on a fresh store.
+ * Connection pragmas, shared by both faces. page_size and auto_vacuum MUST
+ * precede journal_mode (and any CREATE): both are fixed when the store is created,
+ * and a later change is silently ignored once the WAL is set up or any table
+ * exists, so issuing them first is the only way they take effect on a fresh store.
+ * The 8 KiB page gives shallower btrees over the blob payloads; auto_vacuum =
+ * INCREMENTAL lets the optimize command reclaim churn-freed pages in place with
+ * PRAGMA incremental_vacuum instead of a full VACUUM, which rebuilds the whole
+ * store into a ~2x-size scratch copy and fails when the disk is tight, exactly
+ * when reclaiming is needed.
  */
 static void apply_pragmas(sqlite3 *db) {
 	sqlite3_exec(db, "PRAGMA page_size = 8192;", 0, 0, 0);
+	sqlite3_exec(db, "PRAGMA auto_vacuum = INCREMENTAL;", 0, 0, 0);
 	sqlite3_exec(db, "PRAGMA busy_timeout = 5000;", 0, 0, 0);
 	sqlite3_exec(db, "PRAGMA synchronous = NORMAL;", 0, 0, 0);
 	sqlite3_exec(db, "PRAGMA journal_mode = WAL;", 0, 0, 0);
