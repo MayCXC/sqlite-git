@@ -214,6 +214,22 @@ test_case "gc deltifies stored objects on the helper" '
 	has_delta_blob deltifystore
 '
 
+# --- a second gc re-deltifies a store that already holds deltas: the first gc
+#     stores deltas, the next ones store again objects held as deltas against
+#     bases they store again too; three in a row prove the store stays
+#     repackable and readable.
+test_case "gc re-deltifies a store that already holds deltas" '
+	create_helper_repo redeltastore &&
+	i=1; while [ "$i" -le 40 ]; do seq 1 $((200 + i)) >redeltastore/f$((i % 5)).txt && git -C redeltastore add -A && git -C redeltastore commit -q -m "c$i" || exit 1; i=$((i + 1)); done &&
+	git -C redeltastore gc &&
+	has_delta_blob redeltastore &&
+	git -C redeltastore gc &&
+	git -C redeltastore gc &&
+	git -C redeltastore fsck &&
+	git -C redeltastore cat-file -p HEAD:f1.txt >readback &&
+	test "$(wc -l <readback)" -eq 236
+'
+
 # --- gc re-represents a survivor and prunes a now-unreachable delta base, rather
 #     than pinning the base forever via the delta edge.
 test_case "gc unpins and prunes a delta base made unreachable" '
