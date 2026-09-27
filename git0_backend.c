@@ -45,7 +45,7 @@ static int storage_backend_read(void **data_p, size_t *len_p,
   char hex[GIT_OID_MAX_HEXSIZE + 1];
   git_oid_tostr(hex, sizeof(hex), oid);
 
-  if (storage_read_object(hex, type_name, sizeof(type_name), &size, &data) < 0)
+  if (storage_read_object(hex, type_name, sizeof(type_name), &size, &data, NULL) < 0)
     return GIT_ENOTFOUND;
 
   /* libgit2 requires data allocated with git_odb_backend_data_alloc */
@@ -71,7 +71,7 @@ static int storage_backend_read_header(size_t *len_p, git_object_t *type_p,
 
   /* Header-only: no inflate or delta resolve (the point of a read_header
    * path), unlike a full read whose bytes we'd discard. */
-  if (storage_read_header(hex, type_name, sizeof(type_name), &size) < 0)
+  if (storage_read_header(hex, type_name, sizeof(type_name), &size, NULL) < 0)
     return GIT_ENOTFOUND;
 
   *len_p = size;

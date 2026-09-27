@@ -14,7 +14,7 @@ The storage layer is split into three dependency tiers, each its own translation
 | File | Tier | Links | Holds |
 |------|------|-------|-------|
 | `storage.c` | core | sqlite only | connection, transactions, db maintenance, the prepared-statement mechanism |
-| `storage_git.c` | git | + zlib + clean-room delta | objects, refs, reflogs, the reachability bitmap, the commit-graph generation cache, pack membership, prune, object format |
+| `storage_git.c` | git | + zlib + clean-room delta | objects, refs, reflogs, the reachability bitmap, the commit-graph generation cache, prune, object format |
 | `storage_git_lfs.c` | lfs | + sha256 | git-lfs content (independent of the git object layer) |
 
 The link graph, not naming, enforces the layering: only `git0.so` links libgit2; the helper, the lfs extension, and the transfer agent are libgit2-free; the lfs units carry no git object store.
@@ -57,12 +57,12 @@ git init --ref-format=sqlite --object-storage=sqlite myrepo
 cd myrepo
 ```
 
-This sets two extensions in `.git/config`, one per subsystem: each storage backend names the helper that serves it outright, the way a transport is named. The object and ref helpers run as separate processes over one shared database, so reconfiguring one never touches the other:
+This sets two extensions in `.git/config`, one per subsystem, each naming the helper that serves it (`sqlite` alone is short for `helper://sqlite`). The object and ref helpers run as separate processes over one shared database, so reconfiguring one never touches the other:
 
 ```ini
 [extensions]
-    refstorage = sqlite
-    objectstorage = sqlite
+    refstorage = helper://sqlite
+    objectstorage = helper://sqlite
 ```
 
 All git operations then go through SQLite (`<gitdir>/sqlite.db`):
@@ -72,8 +72,10 @@ echo hello | git hash-object -w --stdin   # writes to .git/sqlite.db
 git update-ref refs/heads/main <oid>       # ref stored in SQLite
 git cat-file blob <oid>                    # reads from SQLite
 git for-each-ref                           # lists refs from SQLite
-git gc                                     # repacks + bitmaps + commit-graph in SQLite
+git gc                                     # deltas and the reachability bitmap in SQLite
 ```
+
+Packfiles and loose objects git receives, from a fetch or a push, land in the objects directory until `git gc` moves them into SQLite; a packfile kept by a `.keep` file stays there. `git gc` also writes git's commit-graph file, `objects/info/commit-graph`.
 
 For LFS, also configure the transfer adapter:
 
@@ -95,10 +97,8 @@ reflog(refname TEXT, idx INT, old_oid BLOB, new_oid BLOB, committer TEXT,
        timestamp INT, tz INT, msg TEXT, PRIMARY KEY(refname, idx))       WITHOUT ROWID
 commit_graph(oid BLOB PRIMARY KEY, generation INT)                       WITHOUT ROWID
 meta(key TEXT PRIMARY KEY, value INT)                                    WITHOUT ROWID
-pack_objects(oid BLOB, pack_id BLOB, PRIMARY KEY(oid, pack_id))          WITHOUT ROWID
-git_bitmap(id INT PRIMARY KEY CHECK(id = 0), bitmap BLOB)
+pack_bitmap(id INT PRIMARY KEY CHECK(id = 0), pack_size INT, idx BLOB, rev BLOB, bitmap BLOB)
 pack_content(pack_pos INT PRIMARY KEY, type TEXT, size INT, base BLOB, content BLOB)
-commit_bitmap(commit_oid BLOB PRIMARY KEY, xor_base BLOB, flags INT, ewah BLOB)
 ```
 
 The git-lfs content store (`storage_git_lfs.c`):
@@ -111,16 +111,18 @@ lfs_chunk(oid BLOB, seq INT, data BLOB, PRIMARY KEY(oid, seq))
 Design notes:
 
 - **Binary oids**: keys are raw oid blobs (20 bytes sha1 / 32 sha256), half the hex width, converted in SQL via `unhex()`/`hex()`.
-- **rowid vs WITHOUT ROWID** is chosen per table by measurement: a table carrying a large inline BLOB (`objects.data`, `commit_bitmap.ewah`) is a rowid table (a fat WITHOUT-ROWID primary-key btree pages through content it does not need); small key/value and all-key tables (`refs`, `reflog`, `commit_graph`, `meta`, `pack_objects`) stay WITHOUT ROWID.
+- **rowid vs WITHOUT ROWID** is chosen per table by measurement: a table carrying a large inline BLOB (`objects.data`, the blobs of `pack_bitmap`) is a rowid table (a fat WITHOUT-ROWID primary-key btree pages through content it does not need); small key/value tables (`refs`, `reflog`, `commit_graph`, `meta`) stay WITHOUT ROWID.
 - **Compression**: full objects are zlib-compressed; LFS frames are stored raw (LFS media is already entropy-coded).
-- **Deltas**: git owns delta creation. On a `put-raw` the helper stores git's already-compressed delta bytes verbatim (base in the `base` column) and resolves them on read with a clean-room git-format delta applier (`git_delta_apply`, modelled on `Documentation/technical/pack-format.txt`, validated against but not copied from git's `patch-delta.c` and libgit2's `delta.c`). There is no fossil delta.
-- **Pack shape**: at `gc`, reachable objects are clustered into `pack_content` keyed by `pack_pos` (the bit position from git's reachability bitmap), so a contiguous bit-run is served verbatim, the relational analog of copying a `.pack` region. `git_bitmap` holds git's EWAH type-bitmap; `commit_bitmap` holds the per-commit (xor-chained) bitmaps; `commit_graph` holds only the generation numbers (everything else is re-derived from the commit objects). No `.bitmap`/`.rev`/`.midx`/commit-graph file is written.
-- **Prune**: `prune` deletes git-identified unreachable objects past their grace window, sparing kept-pack members and any object still serving as a delta base.
+- **Deltas**: git owns delta creation. At `gc`, git searches the objects for deltas as a repack does and stores each object again with `put-raw`, as the pack it wrote holds it: whole, or as git's compressed delta bytes, verbatim, with the base in the `base` column. The helper resolves a delta on read with a clean-room git-format delta applier (`git_delta_apply`, modelled on `Documentation/technical/pack-format.txt`, validated against but not copied from git's `patch-delta.c` and libgit2's `delta.c`), reads the size of a delta's object off the start of the delta alone, as git does in a packfile, and hands the stored bytes back verbatim with `get-raw`, which `pack-objects` writes into the packs it sends as they are. There is no fossil delta.
+- **Reachability bitmap**: git writes a reachability bitmap for the objects at `gc` when `repack.writeBitmaps` asks for one (by default in a bare repository), for the pack it deltified them in, and sends it with the `.idx` and `.rev` of that pack, which relate its bits to the objects. `pack_bitmap` keeps the three verbatim, and git opens them as it opens the bitmap of a pack. No `.bitmap`/`.rev`/`.midx` file is written.
+- **Clustered objects**: `pack_content` keeps the bytes of objects clustered by pack position (`objects.pack_pos`), with `objects.data` empty for them. Reads coalesce it over `objects.data`, re-storing an object moves its bytes back to `objects.data`, and `optimize` drops the rows no object points at.
+- **Commit-graph generations**: `commit_graph` holds the generation numbers `store-commit-graph` gives it, which `git0_generation()` reads (everything else is derived from the commit objects).
+- **Prune**: `prune` deletes git-identified unreachable objects last written before the expiry git gives, sparing any object still serving as a delta base.
 - **Transactions**: in owned mode (the helper) every durable write is bracketed by a savepoint over `BEGIN IMMEDIATE`/`COMMIT`; in borrowed mode (an extension on a loaded connection) the enclosing SQLite statement is the transaction, so storage adds none.
 
 ### Protocol
 
-The helper speaks the git local-helper protocol: a flat command namespace on stdin/stdout. The authoritative reference is `helper.h` in the git fork; the families are: object ops (`info`/`get`/`put`/`put-raw`/`get-delta`/`have`/`list-objects`/`put-stream`/`odb-transaction-*`), maintenance (`optimize`/`verify`/`prune`/`refresh`), reachability + pack-reuse + commit-graph (`store-bitmap`/`get-bitmap`/`clear-bitmap`/`pos-of-oid`/`result-oids`/`reuse-pack`/`store-commit-bitmaps`/`get-commit-bitmap`/`store-commit-graph`/`commit-generation`), refs (`read`/`list`/`transaction-*`/`create`/`remove`), and reflogs (`reflog-read`/`-read-reverse`/`-append`/`-exists`/`-delete`/`-list`/`-copy`). Each optional family is gated on a capability the helper advertises via `capabilities`.
+The helper speaks the git local-helper protocol: a flat command namespace on stdin/stdout. The authoritative reference is `gitlocal-helpers(7)` (`Documentation/gitlocal-helpers.adoc` in the git fork); the families are: object ops (`info`/`get`/`get-raw`/`put`/`put-raw`/`put-stream`/`have`/`freshen`/`list-objects`/`promisor`/`odb-transaction-*`), maintenance (`optimize`/`optimize-required`/`verify`/`prune`/`refresh`), the reachability bitmap (`put-bitmap`/`get-bitmap`/`remove-bitmap`), refs (`read`/`list`/`transaction-*`/`create`/`remove`), and reflogs (`reflog-read`/`-read-reverse`/`-append`/`-create`/`-exists`/`-delete`/`-list`/`-copy`). Each optional family is gated on a capability the helper advertises via `capabilities`. The helper also answers `store-commit-graph` and `commit-generation`, under the capability `graph`, which git does not define: they feed `commit_graph`.
 
 ## SQLite extension (git0)
 
@@ -187,19 +189,14 @@ make test       # all suites, against both git0 builds
 make test-asan  # the same, under AddressSanitizer + UndefinedBehaviorSanitizer
 ```
 
-- `tests/test_helper.sh` (helper, 80 tests): protocol commands, put-raw/get-delta, reuse-pack streaming, commit-graph generation, bitmaps, prune/keep, freshen, LFS transfer round-trips.
+- `tests/test_helper.sh` (helper, 95 tests): protocol commands, put-raw/get-raw, clustered objects, prune, the reachability bitmap, commit-graph generation, freshen, LFS transfer round-trips.
 - `tests/test_basic.sql`, `test_concurrent.sh`, `test_object_format.sh`, `test_reflog.sh`, `test_vtab.sh`: the `git0.so` extension (scalars, TVFs, storage-native, object formats, reflog-on-write, the writable vtabs), run against both builds.
 - `tests/test_lfs.sql`: the `gitlfs.so` extension.
-- `tests/test_git_helper.sh` (integration, 14 tests): drives a real `git` (set `GIT_BUILD` in `config.mak`) against `git-local-sqlite` for the helper scenarios (delta-preserving push, gc bitmaps, pack reuse, M:N kept packs, delta-base prune, odb migrate).
+- `tests/test_git_helper.sh` (integration, 15 tests): drives a real `git` (set `GIT_BUILD` in `config.mak`) against `git-local-sqlite` for the helper scenarios (delta-preserving push, gc bitmaps, sending stored deltas, kept packs, delta-base prune, odb migrate).
 
-## Git upstream patches
+## Git patches
 
-The local helper backend requires patches to git. Most of the ODB vtable work landed upstream via `ps/odb-sources` and `ps/object-counting`. What remains:
-
-- **Series 1**: adds `write_packfile`, `for_each_unique_abbrev`, and `convert_object_id` to the ODB source vtable, and routes the `object-name.c` abbreviation/disambiguation paths through `for_each_unique_abbrev` instead of files-backend internals.
-- **Series 2**: extracts shared symref/HEAD transaction splitting into `refs.c`, then adds `git-local-<name>` helper backends for both ODB and refs with worktree support, plus the reachability-bitmap / pack-reuse / commit-graph seams that let a helper serve them from its store with no on-disk file.
-
-Both series live on our [git fork](https://github.com/MayCXC/git).
+The local helper backends are a patch series to git, on top of Patrick Steinhardt's pluggable object database work: the `git-local-<name>` helper process, a ref backend and an object source that run one, gc's delta search and reachability bitmap for the objects of a helper, prune, `git odb migrate`, and local clones and submodules of helper repositories. It lives on our [git fork](https://github.com/MayCXC/git).
 
 ## Dependencies
 

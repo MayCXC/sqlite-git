@@ -72,32 +72,25 @@ check "capabilities: lists verify" \
 check "capabilities: lists prune" \
 	'echo "$CAP" | grep -q "^prune$"'
 
-check "capabilities: lists keep-pack" \
-	'echo "$CAP" | grep -q "^keep-pack$"'
-
 check "capabilities: lists bitmap" \
 	'echo "$CAP" | grep -q "^bitmap$"'
 
 check "capabilities: lists graph" \
 	'echo "$CAP" | grep -q "^graph$"'
 
-check "capabilities: lists commit-bitmap" \
-	'echo "$CAP" | grep -q "^commit-bitmap$"'
-
 check "capabilities: lists put-raw" \
 	'echo "$CAP" | grep -q "^put-raw$"'
 
-check "capabilities: lists get-delta" \
-	'echo "$CAP" | grep -q "^get-delta$"'
+check "capabilities: lists get-raw" \
+	'echo "$CAP" | grep -q "^get-raw$"'
 
-check "capabilities: write-packfile pruned (subsumed by odb-transaction)" \
-	'! echo "$CAP" | grep -q "^write-packfile$"'
-
-check "capabilities: lists reuse-pack" \
-	'echo "$CAP" | grep -q "^reuse-pack$"'
-
-check "capabilities: 29 total (landed protocol + optimize + verify + prune + keep-pack + bitmap + commit-bitmap + graph + reuse-pack + reflog + reflog-read-reverse + put-raw/get-delta)" \
-	'test "$(echo "$CAP" | grep -c .)" -eq 29'
+# The whole set, so that nothing git does not define is advertised.
+CAP_ALL="bitmap create freshen get get-raw graph have info list list-objects
+odb-transaction optimize optimize-required promisor prune put put-raw
+put-stream read reflog reflog-read-reverse refresh remove replace transaction
+verify"
+check "capabilities: exactly the objects and refs protocol, plus graph" \
+	'test "$(echo "$CAP" | grep . | sort | tr "\n" " ")" = "$(echo $CAP_ALL | tr " " "\n" | sort | tr "\n" " ")"'
 
 # ---- Object operations ----
 
@@ -149,7 +142,7 @@ else
 		'test "$(printf "get %s\n" "$OID" | "$HELPER" "$SDB" 2>/dev/null)" = "missing"'
 fi
 
-# ---- put-raw / get-delta ----
+# ---- put-raw / get-raw ----
 # Store a git-format delta against the 11-byte base put above, in git's native
 # pack form: the COMPRESSED delta bytes, stored verbatim (no recompress), base set.
 # The delta is a copy-all: varint(11) varint(11) copy(offset=0,size=11) =
@@ -158,7 +151,8 @@ fi
 # is stable across zlib versions (only compression output varies). usize=4 is the
 # uncompressed delta length, clen=12 the compressed byte count that follows.
 DELTA_OID="1111111111111111111111111111111111111111"
-PD=$(printf 'capabilities\nput-raw %s blob 4 %s 12\n\170\234\343\346\236\300\015\000\001\174\000\262' \
+DELTA_Z='\170\234\343\346\236\300\015\000\001\174\000\262'
+PD=$(printf "capabilities\nput-raw %s blob 4 %s 12\n$DELTA_Z" \
 	"$DELTA_OID" "$OID" \
 	| "$HELPER" "$DB" 2>/dev/null | tail -1)
 
@@ -173,86 +167,153 @@ DELTA_CONTENT=$(printf 'capabilities\nget %s\n' "$DELTA_OID" \
 check "get: stored git-delta resolves to base content" \
 	'test "$DELTA_CONTENT" = "hello world"'
 
-# "info" reports the resolved type and size of a stored delta, its base and
-# the size of the delta. It reads the size off the start of the delta alone,
-# as git reads the size of a delta in a packfile, so it answers for a delta
-# whose base the store lacks.
+# "get" and "info" report the resolved type and size of a stored delta, its
+# base and the size of the delta. info reads the size off the start of the
+# delta alone, as git reads the size of a delta in a packfile, so it answers
+# for a delta whose base the store lacks.
+GET_DELTA_HDR=$(printf 'get %s\n' "$DELTA_OID" | "$HELPER" "$DB" 2>/dev/null | head -1)
 INFO_DELTA=$(printf 'capabilities\ninfo %s\n' "$DELTA_OID" \
 	| "$HELPER" "$DB" 2>/dev/null | tail -1)
 LONE_OID="2222222222222222222222222222222222222222"
 LONE_BASE="3333333333333333333333333333333333333333"
-printf 'put-raw %s blob 4 %s 12\n\170\234\343\346\236\300\015\000\001\174\000\262' \
-	"$LONE_OID" "$LONE_BASE" | "$HELPER" "$DB" >/dev/null 2>&1
+printf "put-raw %s blob 4 %s 12\n$DELTA_Z" "$LONE_OID" "$LONE_BASE" \
+	| "$HELPER" "$DB" >/dev/null 2>&1
 INFO_LONE=$(printf 'info %s\n' "$LONE_OID" | "$HELPER" "$DB" 2>/dev/null)
 
+check "get: a stored git-delta names its base and delta size" \
+	'test "$GET_DELTA_HDR" = "blob 11 $OID 4"'
 check "info: a stored git-delta names its base and delta size" \
 	'test "$INFO_DELTA" = "blob 11 $OID 4"'
 check "info: the size of a delta's object comes from the delta alone" \
 	'test "$INFO_LONE" = "blob 11 $LONE_BASE 4"'
 
-# "get-delta" returns the COMPRESSED delta verbatim with its base oid, the
-# uncompressed length and the compressed length, for git to reuse on a send pack.
-GETDELTA=$(printf 'capabilities\nget-delta %s\n' "$DELTA_OID" \
-	| "$HELPER" "$DB" 2>/dev/null)
+# "get-raw" hands a delta back as stored: its base, the size the bytes inflate
+# to, and the 12 compressed bytes verbatim.
+printf 'get-raw %s\n' "$DELTA_OID" | "$HELPER" "$DB" >"$TMPDIR/raw-delta" 2>/dev/null
+printf "blob 4 %s 12\n$DELTA_Z" "$OID" >"$TMPDIR/raw-delta.expect"
 
-check "get-delta: returns delta header with base oid, raw len and clen" \
-	'echo "$GETDELTA" | grep -q "^delta $OID 4 12$"'
+check "get-raw: a delta comes back as put-raw stored it" \
+	'cmp -s "$TMPDIR/raw-delta" "$TMPDIR/raw-delta.expect"'
 
-# "get-delta" on a resolved (non-delta) object replies plain.
-GETPLAIN=$(printf 'capabilities\nget-delta %s\n' "$OID" \
-	| "$HELPER" "$DB" 2>/dev/null | tail -1)
+# A whole object comes back compressed, with a base of 0; storing those bytes
+# with put-raw elsewhere gives the object back.
+printf 'get-raw %s\n' "$OID" | "$HELPER" "$DB" >"$TMPDIR/raw-whole" 2>/dev/null
+RAW_HDR=$(head -1 "$TMPDIR/raw-whole")
+RAW_LEN=${RAW_HDR##* }
+{ printf 'put-raw %s blob 11 0 %s\n' "$OID" "$RAW_LEN"
+  tail -c "$RAW_LEN" "$TMPDIR/raw-whole"; } | "$HELPER" "$TMPDIR/raw-copy" >/dev/null 2>&1
+RAW_COPY=$(printf 'get %s\n' "$OID" | "$HELPER" "$TMPDIR/raw-copy" 2>/dev/null | tail -1)
 
-check "get-delta: plain for a non-delta object" \
-	'test "$GETPLAIN" = "plain"'
+check "get-raw: a whole object has base 0" \
+	'test "${RAW_HDR% *}" = "blob 11 0"'
+check "get-raw: the compressed bytes of a whole object store elsewhere intact" \
+	'test "$(wc -c <"$TMPDIR/raw-whole")" -eq $((${#RAW_HDR} + 1 + RAW_LEN)) &&
+	 test "$RAW_COPY" = "hello world"'
+check "get-raw: missing for an unknown object" \
+	'test "$(printf "get-raw deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n" | "$HELPER" "$DB" 2>/dev/null)" = "missing"'
 
-# ---- reuse-pack (source-backed pack reuse over the protocol) ----
-# Drive cmd_reuse_pack / storage_reuse_stream directly: stage pack_content/pack_pos
-# through the store-bitmap orderings, then stream the reusable prefix and assert
-# the framed records. The 12 compressed bytes are the same verbatim payload the
-# get-delta test uses; reuse streams them byte-for-byte (no inflate), so the
-# content is portable across zlib versions. A is a whole object (base 0), B a
-# git-delta whose base is A. None of these verbs need a capabilities handshake.
-RDB="$TMPDIR/reuse-test"
-RA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-RB=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-RC='\170\234\343\346\236\300\015\000\001\174\000\262'
-printf "put-raw %s blob 4 0 12\n$RC" "$RA" | "$HELPER" "$RDB" >/dev/null 2>&1
-printf "put-raw %s blob 4 %s 12\n$RC" "$RB" "$RA" | "$HELPER" "$RDB" >/dev/null 2>&1
-# store-bitmap: the single newline after the command line is the 1-byte opaque
-# .bitmap blob (only its non-emptiness matters, it triggers recluster); then the
-# .idx (index->oid: 0=A, 1=B) blank-terminated, then the .rev (bit->index: bit0=0,
-# bit1=1) blank-terminated. Recluster derives objects.pack_pos via the order/rev
-# join (A->0, B->1) and clusters both objects' verbatim bytes into pack_content.
-SB=$(printf 'store-bitmap 1\n\n%s\n%s\n\n0\n1\n\n' "$RA" "$RB" | "$HELPER" "$RDB" 2>/dev/null | tail -1)
-check "reuse setup: store-bitmap reclusters pack_content (ack ok)" \
-	'test "$SB" = "ok"'
-RPA=$(printf 'pos-of-oid %s\n' "$RA" | "$HELPER" "$RDB" 2>/dev/null | tail -1)
-RPB=$(printf 'pos-of-oid %s\n' "$RB" | "$HELPER" "$RDB" 2>/dev/null | tail -1)
-check "reuse setup: A reclustered to pack_pos 0" 'test "$RPA" = "pos 0"'
-check "reuse setup: B reclustered to pack_pos 1" 'test "$RPB" = "pos 1"'
-# Stream the [0,2) prefix: "<type> <size> <base|-> <clen>" + clen verbatim bytes,
-# in pack_pos order, blank-terminated.
-REUSE=$(printf 'reuse-pack 2\n' | "$HELPER" "$RDB" 2>/dev/null)
-check "reuse-pack: whole-object record for A (base -)" \
-	'echo "$REUSE" | grep -q "^blob 4 - 12$"'
-check "reuse-pack: delta record for B carries base A" \
-	'echo "$REUSE" | grep -q "blob 4 $RA 12$"'
-check "reuse-pack: records stream in pack_pos order (A before B)" \
-	'test $(echo "$REUSE" | grep -n "^blob 4 - 12$" | cut -d: -f1) -lt $(echo "$REUSE" | grep -n "blob 4 $RA 12$" | cut -d: -f1)'
-# Exact stream length pins both header shapes + the verbatim payloads:
-#   A "blob 4 - 12\n"(12) + 12 content; B "blob 4 <40hex> 12\n"(51) + 12 content;
-#   + 1 terminating blank line = 88.
-RLEN=$(printf 'reuse-pack 2\n' | "$HELPER" "$RDB" 2>/dev/null | wc -c)
-check "reuse-pack: exact stream length (2 records + verbatim bytes + terminator)" \
-	'test "$RLEN" -eq 88'
-# end_pos bounds the prefix: reuse-pack 1 streams only pack_pos 0 (A), not B.
-REUSE1=$(printf 'reuse-pack 1\n' | "$HELPER" "$RDB" 2>/dev/null)
-check "reuse-pack: end_pos=1 includes A" 'echo "$REUSE1" | grep -q "^blob 4 - 12$"'
-check "reuse-pack: end_pos=1 excludes B (past the prefix)" \
-	'! echo "$REUSE1" | grep -q "blob 4 $RA 12$"'
-# end_pos=0 streams nothing but the 1-byte blank terminator.
-RLEN0=$(printf 'reuse-pack 0\n' | "$HELPER" "$RDB" 2>/dev/null | wc -c)
-check "reuse-pack: end_pos=0 streams only the terminator" 'test "$RLEN0" -eq 1'
+# ---- objects clustered in pack_content ----
+# A store may hold the bytes of objects in pack_content, keyed by their
+# pack_pos, with objects.data empty. Reads find them there; re-storing an
+# object moves it back into objects.data; optimize drops the pack_content rows
+# no object points at.
+if ! command -v sqlite3 >/dev/null 2>&1; then
+	ok "clustered objects (skipped: needs sqlite3)"
+else
+	# The whole "hello world" at pack_pos 0 and the delta on it at 1.
+	cluster_setup() {
+		printf 'put %s blob 11\nhello world' "$OID" | "$HELPER" "$1" >/dev/null 2>&1
+		printf "put-raw %s blob 4 %s 12\n$DELTA_Z" "$DELTA_OID" "$OID" \
+			| "$HELPER" "$1" >/dev/null 2>&1
+		sqlite3 "$1/sqlite.db" "
+			INSERT INTO pack_content(pack_pos, type, size, base, content)
+			  SELECT iif(base IS NULL, 0, 1), type, size, base, data FROM objects;
+			UPDATE objects SET pack_pos = iif(base IS NULL, 0, 1), data = X'';"
+	}
+	# Store "hello world" whole under the oid $2, replacing how it is stored.
+	put_whole() {
+		{ printf 'put-raw %s blob 11 0 %s 1\n' "$2" "$RAW_LEN"
+		  tail -c "$RAW_LEN" "$TMPDIR/raw-whole"; } | "$HELPER" "$1" >/dev/null 2>&1
+	}
+	CDB="$TMPDIR/cluster-test"
+	cluster_setup "$CDB"
+	cluster_get() { printf 'get %s\n' "$1" | "$HELPER" "$CDB" 2>/dev/null | tail -1; }
+
+	check "clustered: a whole object reads from pack_content" \
+		'test "$(cluster_get "$OID")" = "hello world"'
+	check "clustered: a delta reads from pack_content" \
+		'test "$(cluster_get "$DELTA_OID")" = "hello world"'
+	printf 'get-raw %s\n' "$DELTA_OID" | "$HELPER" "$CDB" >"$TMPDIR/raw-cluster" 2>/dev/null
+	check "clustered: get-raw hands back the clustered bytes" \
+		'cmp -s "$TMPDIR/raw-cluster" "$TMPDIR/raw-delta.expect"'
+
+	# Re-store the base; the delta still reads its own clustered bytes.
+	put_whole "$CDB" "$OID"
+	check "clustered: a replaced object leaves pack_content" \
+		'test "$(sqlite3 "$CDB/sqlite.db" "SELECT pack_pos IS NULL AND length(data) > 0 FROM objects WHERE oid = unhex('\''$OID'\'')")" = 1'
+	check "clustered: a delta on a replaced base still resolves" \
+		'test "$(cluster_get "$DELTA_OID")" = "hello world"'
+
+	printf 'optimize\n' | "$HELPER" "$CDB" >/dev/null 2>&1
+	check "clustered: optimize drops only the rows no object points at" \
+		'test "$(sqlite3 "$CDB/sqlite.db" "SELECT group_concat(pack_pos) FROM pack_content")" = 1'
+	printf 'prune\n%s\n\noptimize\n' "$DELTA_OID" | "$HELPER" "$CDB" >/dev/null 2>&1
+	check "clustered: the row of a pruned object goes at the next optimize" \
+		'test "$(sqlite3 "$CDB/sqlite.db" "SELECT count(*) FROM pack_content")" = 0'
+
+	# A delta re-stored whole reads as the whole object, not as its old delta.
+	CDB="$TMPDIR/cluster-switch-test"
+	cluster_setup "$CDB"
+	put_whole "$CDB" "$DELTA_OID"
+	check "clustered: a delta re-stored whole reads whole" \
+		'test "$(printf "info %s\n" "$DELTA_OID" | "$HELPER" "$CDB" 2>/dev/null)" = "blob 11" &&
+		 test "$(cluster_get "$DELTA_OID")" = "hello world"'
+fi
+
+# ---- prune ----
+# Candidates go when last written at or before the expiry, bases once no
+# object stored against them is left; the reply names what went, then "ok".
+PRDB="$TMPDIR/prune-test"
+prune_setup() {
+	printf 'put %s blob 11\nhello world' "$OID" | "$HELPER" "$PRDB" >/dev/null 2>&1
+	printf "put-raw %s blob 4 %s 12\n$DELTA_Z" "$DELTA_OID" "$OID" \
+		| "$HELPER" "$PRDB" >/dev/null 2>&1
+}
+prune_setup
+PR_BASE=$(printf 'prune\n%s\n\n' "$OID" | "$HELPER" "$PRDB" 2>/dev/null)
+check "prune: keeps a base an object is still stored against" \
+	'test "$PR_BASE" = "ok" &&
+	 test "$(printf "have %s\n" "$OID" | "$HELPER" "$PRDB" 2>/dev/null)" = true'
+PR_OLD=$(printf 'prune 0\n%s\n\n' "$DELTA_OID" | "$HELPER" "$PRDB" 2>/dev/null)
+check "prune: keeps an object written after the expiry" \
+	'test "$PR_OLD" = "ok"'
+PR_DRY=$(printf 'prune --dry-run\n%s\n%s\n\n' "$OID" "$DELTA_OID" | "$HELPER" "$PRDB" 2>/dev/null)
+check "prune --dry-run: names the chain it would remove" \
+	'test "$(echo "$PR_DRY" | sort | tr "\n" " ")" = "$(printf "%s\n%s\nok\n" "$OID" "$DELTA_OID" | sort | tr "\n" " ")"'
+check "prune --dry-run: removes nothing" \
+	'test "$(printf "have %s\n" "$DELTA_OID" | "$HELPER" "$PRDB" 2>/dev/null)" = true'
+PR_ALL=$(printf 'prune\n%s\n%s\n\n' "$OID" "$DELTA_OID" | "$HELPER" "$PRDB" 2>/dev/null)
+check "prune: removes a delta and then its base" \
+	'test "$PR_ALL" = "$PR_DRY" &&
+	 test "$(printf "have %s\nhave %s\n" "$OID" "$DELTA_OID" | "$HELPER" "$PRDB" 2>/dev/null | tr "\n" " ")" = "false false "'
+
+# ---- reachability bitmap ----
+# put-bitmap stores the .idx, .rev and .bitmap git sends, verbatim, replacing
+# any stored before; get-bitmap hands them back as they came.
+BDB="$TMPDIR/bitmap-test"
+check "get-bitmap: missing when none is stored" \
+	'test "$(printf "get-bitmap\n" | "$HELPER" "$BDB" 2>/dev/null)" = "missing"'
+PB=$(printf 'put-bitmap 1234 3 0 5\nidxbmbmb' | "$HELPER" "$BDB" 2>/dev/null)
+check "put-bitmap: acks ok" \
+	'test "$PB" = "ok"'
+check "get-bitmap: returns the sizes and the bytes put-bitmap stored" \
+	'test "$(printf "get-bitmap\n" | "$HELPER" "$BDB" 2>/dev/null)" = "$(printf "1234 3 0 5\nidxbmbmb")"'
+# The payload is read to its end, so the next command follows in sync.
+PB2=$(printf 'put-bitmap 99 2 3 1\nIIRRRBget-bitmap\n' | "$HELPER" "$BDB" 2>/dev/null)
+check "put-bitmap: replaces the stored bitmap and keeps the stream in sync" \
+	'test "$PB2" = "$(printf "ok\n99 2 3 1\nIIRRRB")"'
+check "remove-bitmap: acks ok and leaves none" \
+	'test "$(printf "remove-bitmap\nget-bitmap\n" | "$HELPER" "$BDB" 2>/dev/null)" = "$(printf "ok\nmissing")"'
 
 # ---- commit-graph generation (store + serve the generation VALUE) ----
 # git computes generation numbers while writing its commit-graph; the helper
@@ -271,7 +332,7 @@ check "commit-generation: serves each commit independently" \
 	'test "$(printf "commit-generation %s\n" "$CGB" | "$HELPER" "$GDB" 2>/dev/null | tail -1)" = "7"'
 check "commit-generation: none for an unknown commit" \
 	'test "$(printf "commit-generation %s\n" "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" | "$HELPER" "$GDB" 2>/dev/null | tail -1)" = "none"'
-# A re-store clears the prior set first (stale commits drop), mirroring store-bitmap.
+# A re-store clears the prior set first (stale commits drop), as put-bitmap replaces.
 printf 'store-commit-graph\n%s 99\n\n' "$CGA" | "$HELPER" "$GDB" >/dev/null 2>&1
 check "store-commit-graph: re-store drops a commit no longer in the set" \
 	'test "$(printf "commit-generation %s\n" "$CGB" | "$HELPER" "$GDB" 2>/dev/null | tail -1)" = "none"'
@@ -447,6 +508,34 @@ EXISTS3=$(printf 'capabilities\nreflog-exists refs/heads/main\n' \
 
 check "reflog-delete: removes reflog" \
 	'test "$EXISTS3" = "false"'
+
+# reflog-create: a reflog can exist without entries, and entries appended to
+# it later read back alone.
+CREATE=$(printf 'capabilities\nreflog-create refs/heads/empty\n' \
+	| "$HELPER" "$DB" 2>/dev/null | tail -1)
+EXISTS_EMPTY=$(printf 'capabilities\nreflog-exists refs/heads/empty\n' \
+	| "$HELPER" "$DB" 2>/dev/null | tail -1)
+READ_EMPTY=$(printf 'capabilities\nreflog-read refs/heads/empty\n' \
+	| "$HELPER" "$DB" 2>/dev/null | grep -c "^$ZERO \|^$OID1 " || true)
+LISTED_EMPTY=$(printf 'capabilities\nreflog-list\n' \
+	| "$HELPER" "$DB" 2>/dev/null | grep -c "^refs/heads/empty$" || true)
+
+check "reflog-create: replies ok" \
+	'test "$CREATE" = "ok"'
+check "reflog-create: the empty reflog exists" \
+	'test "$EXISTS_EMPTY" = "true"'
+check "reflog-create: the empty reflog reads no entries" \
+	'test "$READ_EMPTY" -eq 0'
+check "reflog-create: the empty reflog is listed" \
+	'test "$LISTED_EMPTY" -eq 1'
+
+printf 'capabilities\nreflog-create refs/heads/empty\nreflog-append refs/heads/empty %s %s Test <test@example.com> 1234567893 +0000\tfirst\n' \
+	"$ZERO" "$OID1" | "$HELPER" "$DB" >/dev/null 2>&1
+READ_ONE=$(printf 'capabilities\nreflog-read refs/heads/empty\n' \
+	| "$HELPER" "$DB" 2>/dev/null | grep -c "^$ZERO $OID1 " || true)
+
+check "reflog-create: entries appended later read back alone" \
+	'test "$READ_ONE" -eq 1'
 
 # ---- ODB transactions ----
 

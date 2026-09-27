@@ -2,11 +2,11 @@
 #
 # Integration tests: a real git build driving git-local-sqlite as its object and
 # ref storage helper (extensions.objectStorage=sqlite names the helper outright).
-# These exercise the real-helper STORAGE behaviors that git's own t0620
-# deliberately leaves out, because its bundled testgit stub stores every object
-# whole and has no pack/bitmap machinery: delta preservation across a push,
-# reachability bitmaps the helper stores and serves, kept-pack M:N membership,
-# atomic pack ingest, gc deltification/prune/freshen, and bitmap pack-reuse.
+# These exercise the storage behaviors of the real helper that git's own tests
+# run against the git-local-testgit stub only: delta preservation across a
+# push, reachability bitmaps the helper stores and serves, kept packs, atomic
+# pack ingest, gc deltification/prune/freshen, and pack-objects sending the
+# deltas the helper stores.
 #
 # This is the sqlite-git side of the helper protocol: it depends on a git build
 # (sqlite-git -> git-core, the correct direction), never the reverse. Point it at
@@ -91,19 +91,25 @@ test_case "push migrates the staged pack and preserves a delta" '
 	has_delta_blob pushdst
 '
 
-# --- gc captures a reachability bitmap the helper stores and serves back, and
-#     --test-bitmap verifies it reproduces a real rev-list walk.
+# --- gc writes a reachability bitmap, as repack.writeBitmaps asks, which the
+#     helper stores and serves back: git opens it from the helper, with no
+#     .bitmap file on disk, and --test-bitmap verifies it reproduces a real
+#     rev-list walk.
 test_case "gc builds a reachability bitmap the helper stores and serves" '
 	create_helper_repo bmstore &&
+	git -C bmstore config repack.writeBitmaps true &&
 	test_commit -C bmstore bm1 && test_commit -C bmstore bm2 && test_commit -C bmstore bm3 &&
 	git -C bmstore gc &&
-	git -C bmstore rev-list --test-bitmap HEAD
+	! ls bmstore/.git/objects/pack/*.bitmap >/dev/null 2>&1 &&
+	GIT_TRACE2_EVENT="$PWD/bm-trace" git -C bmstore rev-list --test-bitmap HEAD &&
+	grep -q "\"key\":\"opened stored bitmap\"" bm-trace
 '
 
 # --- commits added after the bitmap gc are not in the stored bitmap; a bitmapped
 #     walk must fill them in and match an unbitmapped walk.
 test_case "reachability stays correct for commits added after the bitmap gc" '
 	create_helper_repo stalebm &&
+	git -C stalebm config repack.writeBitmaps true &&
 	test_commit -C stalebm s1 && test_commit -C stalebm s2 &&
 	git -C stalebm gc &&
 	test_commit -C stalebm s3 && test_commit -C stalebm s4 &&
@@ -129,20 +135,30 @@ test_case "a failed pack ingest persists no objects in the helper store" '
 	git -C ingrecv fsck
 '
 
-# --- pack-objects reuses the stored bitmap pack verbatim (nonzero pack-reused in
-#     trace2), and the produced pack is byte-valid and complete.
-test_case "pack-objects reuses the stored bitmap pack through the helper" '
-	create_helper_repo reusestore &&
-	i=1; while [ "$i" -le 70 ]; do echo "content $i" >reusestore/f$i.txt && git -C reusestore add f$i.txt && git -C reusestore commit -q -m "c$i" || exit 1; i=$((i + 1)); done &&
-	git -C reusestore gc &&
-	GIT_TRACE2_EVENT="$PWD/reuse-trace" git -C reusestore pack-objects --all --stdout --use-bitmap-index </dev/null >reuse.pack &&
-	grep -q "\"key\":\"pack-reused\",\"value\":\"[1-9]" reuse-trace &&
-	git index-pack reuse.pack &&
-	test "$(git show-index <reuse.idx | wc -l)" -eq "$(git -C reusestore rev-list --all --objects | wc -l)"
+# --- pack-objects, counting with the stored bitmap, sends the deltas the helper
+#     stores: with no delta search (--window=0), every delta in the pack it
+#     writes is one the helper stored, against the same base, and the pack is
+#     byte-valid and complete.
+test_case "pack-objects sends the deltas the helper stores" '
+	create_helper_repo sendstore &&
+	git -C sendstore config repack.writeBitmaps true &&
+	i=1; while [ "$i" -le 40 ]; do seq 1 $((200 + i)) >sendstore/f$((i % 5)).txt && git -C sendstore add -A && git -C sendstore commit -q -m "c$i" || exit 1; i=$((i + 1)); done &&
+	git -C sendstore gc &&
+	has_delta_blob sendstore &&
+	GIT_TRACE2_EVENT="$PWD/send-trace" git -C sendstore pack-objects --all --stdout --use-bitmap-index --window=0 </dev/null >send.pack &&
+	grep -q "\"key\":\"opened stored bitmap\"" send-trace &&
+	git index-pack send.pack &&
+	test "$(git show-index <send.idx | wc -l)" -eq "$(git -C sendstore rev-list --all --objects | wc -l)" &&
+	git verify-pack -v send.idx | awk "NF == 7 { print \$1, \$7 }" | sort >sent &&
+	test -s sent &&
+	git -C sendstore cat-file --batch-all-objects --batch-check="%(objectname) %(deltabase)" |
+		grep -v " $ZERO_OID\$" | sort >stored &&
+	cmp sent stored
 '
 
-# --- an in-flight kept pack (index-pack --keep) spares its members from prune
-#     while its .keep is live, and they are swept once it is released.
+# --- a pack kept by a .keep file stays in the objects directory, where prune
+#     leaves its objects, while its .keep is live; once it is released, gc moves
+#     it into the helper and prunes them.
 test_case "prune spares a live kept pack and sweeps it once released" '
 	create_helper_repo keepstore &&
 	git -C keepstore config core.logAllRefUpdates false &&
@@ -154,15 +170,16 @@ test_case "prune spares a live kept pack and sweeps it once released" '
 	git -C keepstore reset --hard HEAD^ && git -C keepstore tag -d kdoomed &&
 	git -C keepstore cat-file -e "$doomed" &&
 	git -C keepstore gc --prune=now &&
+	test -f "${keep%.keep}.pack" &&
 	git -C keepstore cat-file -e "$doomed" &&
 	rm "$keep" &&
 	git -C keepstore gc --prune=now &&
+	no_packfile keepstore &&
 	! git -C keepstore cat-file -e "$doomed"
 '
 
-# --- a blob in two kept packs survives until BOTH .keep markers are released
-#     (M:N membership, not single ownership).
-test_case "prune keeps an object until all its kept packs are released (M:N)" '
+# --- a blob in two kept packs survives until BOTH .keep markers are released.
+test_case "prune keeps an object until all its kept packs are released" '
 	create_helper_repo mnstore &&
 	git -C mnstore config core.logAllRefUpdates false &&
 	test_commit -C mnstore mbase && test_commit -C mnstore mshared &&
@@ -292,7 +309,7 @@ test_case "odb migrate moves a files repo into the sqlite helper" '
 	head=$(git -C migloose rev-parse HEAD) &&
 	git -C migloose rev-list --all --objects | sort >before.objs &&
 	git -C migloose odb migrate --object-storage=sqlite &&
-	test "$(git -C migloose config extensions.objectStorage)" = sqlite &&
+	test "$(git -C migloose config extensions.objectStorage)" = helper://sqlite &&
 	test -z "$(git -C migloose config extensions.refStorage)" &&
 	assert_no_loose migloose &&
 	no_packfile migloose &&

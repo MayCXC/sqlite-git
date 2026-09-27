@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <limits.h>
 #include "storage_git.h"
 
 /*
@@ -46,67 +47,65 @@ _Static_assert(STORAGE_OID_HEXSZ == 64, "sscanf %64s widths assume sha256 hex");
 
 static void cmd_capabilities(void) {
 	/*
-	 * Advertise the landed protocol (the commands the git core helper
-	 * backend sends). "optimize" (A3) repacks: it re-deltifies the store by
-	 * driving git's pack-objects and storing the result through "put"/"put-raw"
-	 * with their replace argument set, then reclaims (incremental_vacuum). "replace" advertises that
-	 * those verbs honor that trailing argument (overwrite an object's stored
-	 * representation in place rather than keep-existing); only repack sets it.
-	 * "verify" (A3) runs a database integrity check for "git fsck". "keep-pack"
-	 * records which objects arrived in a kept pack so "prune" spares them while
-	 * its .keep is live (the relational form of files keeping a .keep'd pack).
-	 * "graph" (store-commit-graph) carries the git-computed generation number per
-	 * commit so git0_generation() and the commit-graph fill-in read it from the
-	 * table instead of a commit-graph file (tree/parents/date stay in the commit
-	 * objects, so the generation is the only datum stored).
-	 * The connectivity-check remains deferred to the rest of A3; partial-clone
-	 * remotes, worktrees, alternates and hash conversion are handled git-side,
-	 * and write-packfile is subsumed by odb-transaction.
+	 * Advertise the protocol of gitlocal-helpers(7), for objects and refs
+	 * alike. Before "optimize", git re-deltifies the store by running
+	 * pack-objects and storing the result through "put-raw" with its replace
+	 * argument set, which "replace" advertises (overwrite how an object is
+	 * stored rather than keep it); "optimize" then reclaims the pages freed
+	 * (incremental_vacuum). "get-raw" hands an object back as it is stored,
+	 * which pack-objects writes into a pack as it is. "bitmap" stores the
+	 * reachability bitmap git writes at gc ("put-bitmap"). "verify" runs a
+	 * database integrity check for "git fsck". "graph" (store-commit-graph)
+	 * carries the git-computed generation number per commit so
+	 * git0_generation() reads it from the table (tree/parents/date stay in the
+	 * commit objects, so the generation is the only datum stored).
 	 */
-	printf("get\ninfo\nput\nput-raw\nput-stream\nget-delta\nreplace\n"
+	printf("get\ninfo\nput\nput-raw\nput-stream\nget-raw\nreplace\n"
 	       "have\nfreshen\nlist-objects\nodb-transaction\n"
 	       "read\nlist\ntransaction\ncreate\nremove\n"
 	       "reflog\nreflog-read-reverse\n"
 	       "refresh\npromisor\noptimize\noptimize-required\nverify\nprune\n"
-	       "keep-pack\nbitmap\ncommit-bitmap\ngraph\nreuse-pack\n\n");
+	       "bitmap\ngraph\n\n");
 	fflush(stdout);
 }
 
 /* ---- ODB commands ---- */
 
+/*
+ * The first line of a "get" or "info" reply: the resolved type and size, and
+ * for an object stored as a git-format delta its base and the size of the
+ * delta, which git shows as its delta base and uses to send the delta as it is
+ * stored, fetching it with "get-raw" (gitlocal-helpers(7) "get").
+ */
+static void print_object_header(const char *type, size_t size,
+				const struct storage_delta *delta) {
+	if (delta->base[0])
+		printf("%s %zu %s %zu\n", type, size, delta->base, delta->size);
+	else
+		printf("%s %zu\n", type, size);
+}
+
 static void cmd_info(const char *hex) {
-	char type[32]; size_t size;
-	if (storage_read_header(hex, type, sizeof(type), &size) < 0) {
+	char type[32]; size_t size; struct storage_delta delta;
+	if (storage_read_header(hex, type, sizeof(type), &size, &delta) < 0)
 		printf("missing\n");
-	} else {
-		/*
-		 * Report the resolved type and size; if the object is stored as a
-		 * git-format delta, also report its base oid and raw delta length so
-		 * git core can reuse the stored delta on a send pack instead of
-		 * recomputing it (the bytes are fetched at write time via "get-delta").
-		 * A caller that does not care just parses the first two fields.
-		 */
-		char base_hex[STORAGE_OID_HEXSZ + 1]; size_t delta_len;
-		if (storage_delta_info(hex, base_hex, sizeof(base_hex), &delta_len))
-			printf("%s %zu %s %zu\n", type, size, base_hex, delta_len);
-		else
-			printf("%s %zu\n", type, size);
-	}
+	else
+		print_object_header(type, size, &delta);
 	fflush(stdout);
 }
 
 /*
- * "get <oid>": reply "<type> <size>" then the resolved object bytes. The helper
+ * "get <oid>": reply with the header then the resolved object bytes. The helper
  * resolves locally (inflate + delta apply via storage_read_object), exactly as
  * the files backend resolves a pack object in-process and hands back a finished
- * object; "get-delta" serves the unresolved delta for pack-objects reuse.
+ * object; "get-raw" serves the object as stored for pack-objects to reuse.
  */
 static void cmd_get(const char *hex) {
-	char type[32]; size_t size; unsigned char *data;
-	if (storage_read_object(hex, type, sizeof(type), &size, &data) < 0) {
+	char type[32]; size_t size; unsigned char *data; struct storage_delta delta;
+	if (storage_read_object(hex, type, sizeof(type), &size, &data, &delta) < 0) {
 		printf("missing\n"); fflush(stdout); return;
 	}
-	printf("%s %zu\n", type, size);
+	print_object_header(type, size, &delta);
 	fflush(stdout);
 	if (size > 0) fwrite(data, 1, size, stdout);
 	fflush(stdout);
@@ -159,14 +158,14 @@ static void cmd_put(const char *args) {
 
 /*
  * "put-raw <oid> <type> <usize> <base|0> <clen> [<replace>]" + clen bytes: git
- * hands an object in its native pack-entry storage form and we persist it
- * verbatim, exactly as the files backend keeps a received pack's compressed
- * entries. base "0" = a whole object (compressed content); a base oid = a
- * compressed git-format delta against it. usize is the stored uncompressed
- * length (the pack entry-header size), clen the compressed length. The helper
- * never (de)compresses here, git already prepared the bytes (index-pack's
- * entry on receive, pack-objects' on repack), so this is the recompress-free
- * receive path. Optional <replace> for repack overwrite.
+ * hands an object as the entry of a packfile holds it and we persist it
+ * verbatim, as the files backend keeps the compressed entries of a pack.
+ * base "0" = a whole object (compressed content); a base oid = a compressed
+ * git-format delta against it. usize is the size the bytes inflate to (the
+ * pack entry-header size), clen the compressed length. The helper never
+ * (de)compresses here: git sends the entries of the packs it moves into the
+ * helper, those a fetch or push received and those pack-objects writes at gc.
+ * Optional <replace> for gc's re-representation.
  */
 static void cmd_put_raw(const char *args) {
 	char hex[STORAGE_OID_HEXSZ + 1], type_str[32], base[STORAGE_OID_HEXSZ + 1];
@@ -208,51 +207,22 @@ static void cmd_put_raw(const char *args) {
 }
 
 /*
- * "get-delta <oid>": if the object is stored as a git-format delta, reply
- * "delta <base-oid> <raw-len> <clen>" + the clen COMPRESSED delta bytes, so git
- * core reuses the delta verbatim on a send pack (its cached-delta path writes the
- * compressed bytes straight into the wire pack, no inflate, no recompress) and a
- * push migrate copies it straight in. <raw-len> is the uncompressed delta length
- * git matches against its planned delta size; <clen> is how many compressed bytes
- * follow. Otherwise reply "plain" and let git fetch it with "get". Optional
- * capability; absent -> git uses "get".
+ * "get-raw <oid>": reply "<type> <size> <delta-base> <compressed-size>" and the
+ * compressed bytes of the object as it is stored, as "put-raw" takes them: the
+ * contents of a whole object, with a <delta-base> of "0", or a git-format delta
+ * against <delta-base>, <size> being the size of what the bytes inflate to.
+ * pack-objects writes the bytes into a pack as they are, as the files backend
+ * copies the entry of an object out of one pack into another
+ * (gitlocal-helpers(7) "get-raw").
  */
-static void cmd_get_delta(const char *hex) {
-	char base_hex[STORAGE_OID_HEXSZ + 1];
-	unsigned char *delta;
-	size_t delta_len, raw_len;
-
-	if (!storage_get_delta(hex, base_hex, sizeof(base_hex), &delta, &delta_len, &raw_len)) {
-		printf("plain\n");
-		fflush(stdout);
-		return;
+static void cmd_get_raw(const char *hex) {
+	char type[32]; size_t size, len; unsigned char *data; struct storage_delta delta;
+	if (storage_read_raw(hex, type, sizeof(type), &size, &delta, &data, &len) < 0) {
+		printf("missing\n"); fflush(stdout); return;
 	}
-	printf("delta %s %zu %zu\n", base_hex, raw_len, delta_len);
-	if (delta_len > 0) fwrite(delta, 1, delta_len, stdout);
-	free(delta);
-	fflush(stdout);
-}
-
-/*
- * "reuse-pack <end-pack-pos>": stream the reusable pack_pos prefix [0, end) for
- * git's source-backed pack reuse, the bulk analog of the files backend copying a
- * contiguous .pack region. Each object is one record "<type> <size> <base-oid|->
- * <clen>" followed by the clen verbatim COMPRESSED content bytes, in pack_pos
- * order; a blank line terminates. git frames each into the output pack (REF_DELTA
- * + base for a delta, plain header otherwise), reusing the stored compressed
- * bytes with no inflate or recompress, exactly as "get-delta" reuses one delta.
- */
-static int reuse_emit(const char *type, long long size, const char *base,
-		      const void *content, int clen, void *data) {
-	(void)data;
-	printf("%s %lld %s %d\n", type, size, base, clen);
-	if (clen > 0) fwrite(content, 1, clen, stdout);
-	return 0;
-}
-
-static void cmd_reuse_pack(const char *arg) {
-	storage_reuse_stream(strtoll(arg, NULL, 10), reuse_emit, NULL);
-	printf("\n");	/* blank line terminates the stream */
+	printf("%s %zu %s %zu\n", type, size, delta.base[0] ? delta.base : "0", len);
+	if (len > 0) fwrite(data, 1, len, stdout);
+	free(data);
 	fflush(stdout);
 }
 
@@ -278,13 +248,12 @@ static int print_obj(const char *oid, const char *type, size_t size, void *data)
 
 static void cmd_list_objects(const char *args) {
 	/*
-	 * Grammar: list-objects [--promisor-only] [--skip-kept] [<hexprefix>].
-	 * A flag begins with "--"; a bare token is a hex oid prefix that scopes the
-	 * enumeration to matching ids server-side (abbreviation/disambiguation),
-	 * rather than streaming the whole table for git to filter. --skip-kept is
-	 * accepted and ignored: kept is a pack-level notion with no per-object
-	 * meaning here, but git may send it. git owns the input, so a non-hex prefix
-	 * is treated as absent (full enumeration), never trusted into the GLOB.
+	 * Grammar: list-objects [--promisor-only] [<hexprefix>]. A flag begins
+	 * with "--", and one not known is ignored; a bare token is a hex oid prefix
+	 * that scopes the enumeration to matching ids server-side
+	 * (abbreviation/disambiguation), rather than streaming the whole table for
+	 * git to filter. git owns the input, so a non-hex prefix is treated as
+	 * absent (full enumeration), never trusted into the range.
 	 */
 	int promisor_only = 0;
 	char prefix[STORAGE_OID_HEXSZ + 1];
@@ -348,9 +317,10 @@ static void cmd_promisor(void) {
 
 /*
  * A3 maintenance: "optimize" reclaims, in place (incremental_vacuum), the
- * pages freed by object/ref churn. Reached from "git gc"/"git repack" AFTER git
- * has re-deltified the store (pack-objects | index-pack --re-deltify), so this
- * reclaims the space the re-representation frees. It then stamps the optimize
+ * pages freed by object/ref churn. git sends it at gc after storing the
+ * objects again as its delta search found best ("put-raw" with replace), so
+ * this reclaims the space the re-representation frees, once the clustered
+ * content no object points at is dropped. It then stamps the optimize
  * watermark so the gc-auto churn count (see "optimize-required") resets to ~0.
  */
 static void cmd_optimize(void) {
@@ -381,41 +351,13 @@ static void cmd_optimize_required(void) {
 }
 
 /*
- * "keep-pack <pack_id>" records that the objects of a just-ingested received
- * pack belong to it (one oid per line, blank-terminated). git sends it while the
- * ingest's odb-transaction is still open (just before commit), so the membership
- * lands in the same transaction as the objects: a concurrent prune can never see
- * the objects without their keep already in place. <pack_id> is the pack's
- * trailing hash, matching the pack-<hash>.keep file git's transport lifecycle
- * creates and later removes. While that .keep is live, "prune" spares these
- * objects (the relational form of files keeping a .keep'd pack's objects).
- */
-static void cmd_keep_pack(const char *pack_id) {
-	static char *line = NULL;
-	static size_t cap = 0;
-	int failed = 0;
-	/* Drain to the blank terminator even after a failure so the stream stays in
-	 * sync; report error once at the end. The membership lands in the ingest's
-	 * open odb-transaction, so its abort/rollback discards a partial set. */
-	while (read_line(&line, &cap) >= 0) {
-		size_t len = strlen(line);
-		if (!len) break;
-		if (len > STORAGE_OID_HEXSZ) continue;	/* not an oid; ignore */
-		if (storage_record_pack_membership(line, pack_id) != 0) failed = 1;
-	}
-	if (failed) { printf("error cannot record pack membership\n"); fflush(stdout); return; }
-	printf("ok\n");
-	fflush(stdout);
-}
-
-/*
  * "store-commit-graph" + "<commit_hex> <generation>" lines,
  * blank-terminated: git computed these generations while writing its commit-graph;
  * we store them (clearing the prior set first, so stale commits drop out) and do
  * NOT write a commit-graph file. Generation is the only datum not derivable from
  * the commit objects (tree/parents/date are parsed from the commits on access),
  * so it is all we keep; git0_generation(oid) and the lazy commit-graph
- * reconstruction read it. Atomic clear-then-populate, mirroring store-bitmap.
+ * reconstruction read it. Atomic clear-then-populate, as put-bitmap replaces.
  */
 static void cmd_store_commit_graph(void) {
 	static char *line = NULL;
@@ -462,108 +404,105 @@ static void cmd_commit_generation(const char *args) {
 }
 
 /*
- * "prune <dry_run> <expire>" is the helper's half of "git prune": git computes
- * reachability and sends the unreachable object ids to delete. The exchange has
- * two blank-terminated sections: first the pack ids whose .keep marker is still
- * live (each as "keep <pack_id>"; git owns the .keep lifecycle), then the
- * candidate oids (one per line). We delete a candidate stored at or before
- * <expire> unless it is in a kept pack or is still a delta base (the predicate in
- * STMT_PRUNE_OBJECT). We report back the oids we pruned (one per line, terminated
- * by "ok") so git can show exactly what "git prune" removed; with <dry_run> set
- * we report what would be pruned without deleting. git owns reachability (refs +
- * reflogs + index); the helper just executes the deletions, in one savepoint.
+ * "prune [--dry-run] [<expire>]" is the helper's half of "git prune": git
+ * computes reachability and sends the unreachable object ids to delete, one per
+ * line, blank-terminated. We delete a candidate last written at or before
+ * <expire> unless it is still a delta base (the predicate in
+ * STMT_PRUNE_OBJECT). We report back the oids we pruned (one per line,
+ * terminated by "ok") so git can show exactly what "git prune" removed; with
+ * --dry-run we report what would be pruned without deleting. git owns
+ * reachability (refs + reflogs + index); the helper just executes the
+ * deletions, in one savepoint.
  *
- * We drain both lists before writing any reply: git sends them in full before it
+ * We drain the list before writing any reply: git sends it in full before it
  * begins reading our response, so streaming mid-read could deadlock once both
  * pipe buffers fill.
  */
 static void cmd_prune(const char *arg) {
 	int dry_run = 0;
-	long long expire = 0;
+	long long expire = LLONG_MAX;
 	static char *line = NULL;
 	static size_t cap = 0;
 	char (*cand)[STORAGE_OID_HEXSZ + 1] = NULL;
+	char *pruned = NULL;
 	size_t n = 0, alloc = 0, i;
+	int oom = 0, progress;
 
-	if (sscanf(arg, "%d %lld", &dry_run, &expire) != 2) {
-		printf("ok\n");
-		fflush(stdout);
-		return;
+	/* "prune [--dry-run] [<expire>]": without an expiry, whenever written. */
+	if (!strncmp(arg, "--dry-run", 9) && (arg[9] == ' ' || !arg[9])) {
+		dry_run = 1;
+		arg += 9;
+		while (*arg == ' ')
+			arg++;
 	}
+	if (*arg)
+		expire = strtoll(arg, NULL, 10);
 
-	/* First section: the live kept pack ids (blank-terminated). A keep that fails
-	 * to record would let prune over-delete a kept object, so track failure and
-	 * prune nothing in that case (reported below as an empty prune). */
-	int ok = (storage_keep_clear() == 0);
-	while (read_line(&line, &cap) >= 0) {
-		size_t len = strlen(line);
-		if (!len) break;
-		if (!strncmp(line, "keep ", 5) && storage_keep_add(line + 5) != 0) ok = 0;
-	}
-
-	/* Second section: the candidate oids (blank-terminated). */
+	/* The candidate oids (blank-terminated), drained in full even when they
+	 * cannot all be held, so that the protocol stays in sync. */
 	while (read_line(&line, &cap) >= 0) {
 		size_t len = strlen(line);
 		if (!len) break;
 		/* A prune candidate is an oid; ignore any line too long to be one. A
 		 * truncated copy could otherwise unhex to a shorter oid and alias a
 		 * different object; git only ever sends 40/64-char oids here. */
-		if (len > STORAGE_OID_HEXSZ) continue;
+		if (len > STORAGE_OID_HEXSZ || oom) continue;
 		if (n == alloc) {
 			size_t na = alloc ? alloc * 2 : 64;
 			char (*grown)[STORAGE_OID_HEXSZ + 1] = realloc(cand, na * sizeof(*cand));
-			if (grown) { cand = grown; alloc = na; }
+			if (!grown) { oom = 1; continue; }
+			cand = grown; alloc = na;
 		}
-		if (n < alloc)
-			snprintf(cand[n++], STORAGE_OID_HEXSZ + 1, "%.*s", (int)STORAGE_OID_HEXSZ, line);
-		/* else out of memory: keep draining stdin so the protocol stays in
-		 * sync, pruning only the candidates we managed to capture. */
+		snprintf(cand[n++], STORAGE_OID_HEXSZ + 1, "%.*s", (int)STORAGE_OID_HEXSZ, line);
+	}
+	if (!oom && !(pruned = calloc(n ? n : 1, 1)))
+		oom = 1;
+	if (oom) {
+		printf("error out of memory\n");
+		goto out;
 	}
 
 	/*
-	 * Prune to a fixpoint inside one savepoint. Membership of released packs is
-	 * absorbed first (they rejoin the general store, as repack merges a
-	 * no-longer-kept pack). Each pass deletes only candidates that are not in a
-	 * kept pack and not the delta base of any object still in the store (the
-	 * predicate in STMT_PRUNE_OBJECT), so a surviving object is never orphaned by
-	 * losing its base. Deleting a leaf frees its base for the next pass, so an
-	 * unreachable delta chain drains fully; an already-deleted candidate reports
-	 * 0 rows and is not echoed again. A dry run runs the real deletes (and the
-	 * absorb) inside the savepoint and rolls them back, reporting exactly what a
-	 * real prune would remove.
+	 * Prune to a fixpoint inside one savepoint. Each pass deletes only
+	 * candidates that are not the delta base of any object still in the store
+	 * (the predicate in STMT_PRUNE_OBJECT), so a surviving object is never
+	 * orphaned by losing its base. Deleting a leaf frees its base for the next
+	 * pass, so an unreachable delta chain drains fully; an already-deleted
+	 * candidate reports 0 rows. A dry run runs the real deletes inside the
+	 * savepoint and rolls them back, reporting exactly what a real prune would
+	 * remove. The oids are named only once the deletes are committed, as git
+	 * takes each one named as removed.
 	 */
 	if (storage_savepoint("prune")) {
-		/* Cannot open the transaction: prune nothing rather than delete outside
-		 * one. The reply has only an "ok" terminator (no error channel), and an
-		 * empty prune is safe. */
-		printf("ok\n"); fflush(stdout); free(cand); return;
+		printf("error cannot open a transaction to prune in\n");
+		goto out;
 	}
-	if (ok && storage_absorb_released_packs() != 0)
-		ok = 0;
-	if (ok) {
-		int progress;
-		do {
-			progress = 0;
-			for (i = 0; i < n; i++) {
-				if (storage_prune_object(cand[i], expire)) {
-					printf("%s\n", cand[i]);
-					progress = 1;
-				}
+	do {
+		progress = 0;
+		for (i = 0; i < n; i++) {
+			if (storage_prune_object(cand[i], expire)) {
+				pruned[i] = 1;
+				progress = 1;
 			}
-		} while (progress);
-	}
-	/* dry-run, or a keep/absorb failure: roll back and prune nothing (a failure
-	 * streamed no oids, so the reply is just the ok terminator). */
-	if (dry_run || !ok)
+		}
+	} while (progress);
+	if (dry_run)
 		storage_rollback_to("prune");
-	else
-		storage_release("prune");
+	else if (storage_release("prune")) {
+		printf("error cannot commit the prune\n");
+		goto out;
+	}
+	for (i = 0; i < n; i++)
+		if (pruned[i])
+			printf("%s\n", cand[i]);
 	printf("ok\n");
+out:
 	fflush(stdout);
+	free(pruned);
 	free(cand);
 }
 
-/* ---- Reachability bitmap (the open_bitmap source backing) ---- */
+/* ---- Reachability bitmap ---- */
 
 /* Read exactly len bytes from stdin into a fresh buffer, draining the stream to
  * stay in sync even if the allocation fails (then returns NULL). */
@@ -584,207 +523,63 @@ static unsigned char *read_payload(size_t len) {
 }
 
 /*
- * "store-bitmap <bitmap_len>": git computed a reachability bitmap at optimize.
- * The payload is <bitmap_len> bytes of EWAH .bitmap content, then the .idx (one
- * index-order oid hex per line, blank-terminated; line index = index position),
- * then the .rev (one integer per line, blank-terminated; line index = bit
- * position, value = index position). Replace any prior bitmap atomically.
+ * "put-bitmap <pack-size> <index-size> <reverse-index-size> <bitmap-size>": git
+ * wrote a reachability bitmap for a pack of the objects at gc and keeps the
+ * objects here, so it sends the .idx and .rev of that pack along with the
+ * .bitmap, which relate its bits to the objects: the three follow the command,
+ * in that order and of those sizes, the .rev possibly empty. They replace the
+ * bitmap stored before, verbatim; git opens them as it opens the bitmap of a
+ * pack (gitlocal-helpers(7) "put-bitmap").
  */
-static void cmd_store_bitmap(const char *args) {
-	size_t bitmap_len = 0;
-	unsigned char *bitmap;
-	static char *line = NULL;
-	static size_t cap = 0;
-	long long pos = 0, bit = 0;
+static void cmd_put_bitmap(const char *args) {
+	long long pack_size;
+	size_t idx_len, rev_len, bitmap_len;
+	unsigned char *idx, *rev, *bitmap;
+	int ok;
 
-	if (sscanf(args, "%zu", &bitmap_len) != 1) {
-		printf("ok\n"); fflush(stdout); return;
+	/* Without the sizes, how much follows is unknown: nothing can be read in
+	 * sync after this, so end the session as git does on a malformed reply. */
+	if (sscanf(args, "%lld %zu %zu %zu", &pack_size, &idx_len, &rev_len,
+		   &bitmap_len) != 4) {
+		printf("error malformed put-bitmap\n"); fflush(stdout); exit(1);
 	}
+	idx = read_payload(idx_len);
+	rev = read_payload(rev_len);
 	bitmap = read_payload(bitmap_len);
-
-	if (storage_savepoint("store_bitmap")) {
-		free(bitmap); printf("error cannot store bitmap\n"); fflush(stdout); return;
-	}
-	int ok = (storage_clear_bitmap() == 0);
-	if (bitmap && storage_store_bitmap(bitmap, bitmap_len) != 0)
-		ok = 0;
-	while (read_line(&line, &cap) >= 0) {	/* .idx: index-order oids */
-		size_t len = strlen(line);
-		if (!len) break;
-		if (bitmap && len <= STORAGE_OID_HEXSZ &&
-		    storage_add_bitmap_order(pos++, line) != 0)
-			ok = 0;
-	}
-	while (read_line(&line, &cap) >= 0) {	/* .rev: bit -> index */
-		size_t len = strlen(line);
-		char *end;
-		long long idx;
-		if (len && line[len - 1] == '\n') line[--len] = 0;
-		if (!len) break;
-		idx = strtoll(line, &end, 10);
-		if (bitmap && end != line && !*end &&
-		    storage_add_bitmap_rev(bit++, idx) != 0)
-			ok = 0;
-	}
-	/* Recluster only over a fully, correctly stored ordering. */
-	if (bitmap && ok && storage_recluster_pack_content() != 0)
-		ok = 0;
-	free(bitmap);
-	if (!ok) {
-		storage_rollback_to("store_bitmap");
-		printf("error cannot store bitmap\n"); fflush(stdout); return;
-	}
-	if (storage_release("store_bitmap")) {
-		printf("error cannot store bitmap\n"); fflush(stdout); return;
-	}
-	printf("ok\n"); fflush(stdout);
-}
-
-/* "clear-bitmap": drop any stored bitmap (e.g. an optimize that produced none). */
-static void cmd_clear_bitmap(void) {
-	if (storage_savepoint("clear_bitmap")) {
-		printf("error cannot clear bitmap\n"); fflush(stdout); return;
-	}
-	if (storage_clear_bitmap() != 0) {
-		storage_rollback_to("clear_bitmap");
-		printf("error cannot clear bitmap\n"); fflush(stdout); return;
-	}
-	if (storage_release("clear_bitmap")) {
-		printf("error cannot clear bitmap\n"); fflush(stdout); return;
-	}
-	printf("ok\n"); fflush(stdout);
-}
-
-static int print_order_oid(const char *oid, void *data) {
-	(void)data;
-	printf("%s\n", oid);
-	return 0;
+	ok = idx && rev && bitmap &&
+	     !storage_put_pack_bitmap(pack_size, idx, idx_len, rev, rev_len,
+				      bitmap, bitmap_len);
+	free(idx); free(rev); free(bitmap);
+	printf(ok ? "ok\n" : "error cannot store the bitmap\n");
+	fflush(stdout);
 }
 
 /*
- * "get-bitmap": reply "bitmap <type_bitmaps_len> <n_objects>" + the type-bitmap
- * bytes, or "missing" when none is stored. The bit<->oid orderings are NOT sent;
- * git resolves them on demand (pos-of-oid / result-oids) over objects.pack_pos.
- * n_objects sizes git's source bitmap (objects.pack_pos is a dense [0,N) perm).
+ * "get-bitmap": reply "<pack-size> <index-size> <reverse-index-size>
+ * <bitmap-size>" and the .idx, .rev and .bitmap "put-bitmap" stored, or
+ * "missing" when none is stored.
  */
 static void cmd_get_bitmap(void) {
-	void *bitmap;
-	size_t bitmap_len;
+	long long pack_size;
+	void *idx, *rev, *bitmap;
+	size_t idx_len, rev_len, bitmap_len;
+	int ret = storage_get_pack_bitmap(&pack_size, &idx, &idx_len, &rev, &rev_len,
+					  &bitmap, &bitmap_len);
 
-	if (storage_get_bitmap(&bitmap, &bitmap_len) < 0) {
+	if (ret <= 0) {
 		printf("missing\n"); fflush(stdout); return;
 	}
-	printf("bitmap %zu %d\n", bitmap_len, storage_bitmap_count());
-	if (bitmap_len) fwrite(bitmap, 1, bitmap_len, stdout);
-	free(bitmap);
+	printf("%lld %zu %zu %zu\n", pack_size, idx_len, rev_len, bitmap_len);
+	fwrite(idx, 1, idx_len, stdout);
+	fwrite(rev, 1, rev_len, stdout);
+	fwrite(bitmap, 1, bitmap_len, stdout);
+	free(idx); free(rev); free(bitmap);
 	fflush(stdout);
 }
 
-/*
- * Per-commit bitmap rows: the bitmap analog of object deltas (put-delta), stored
- * base-by-oid. At capture git decomposes its .bitmap into one EWAH entry per
- * bitmapped commit (reusing its own reader) and streams them all in one verb:
- *   "store-commit-bitmaps", then a record per commit
- *   "<commit_hex> <xor_base_hex|-> <flags> <ewah_len>\n" + <ewah_len> bytes,
- * blank-line terminated. The helper clears the existing rows and stores the set
- * in a single transaction (atomic, one write), mirroring store-commit-graph. At
- * serve git requests the relevant commits:
- *   "get-commit-bitmap <commit_hex>" -> "commit-bitmap <xor_base|-> <flags> <len>"
- * + bytes, or "missing". A failed store rolls the whole set back and reports
- * error rather than acking, and git rebuilds the bitmap at the next gc (it
- * verifies independently via rev-list --test-bitmap).
- */
-static void cmd_store_commit_bitmaps(void) {
-	static char *line = NULL;
-	static size_t cap = 0;
-
-	if (storage_savepoint("store_commit_bitmaps")) {
-		printf("error cannot store commit bitmaps\n"); fflush(stdout); return;
-	}
-	int ok = (storage_clear_commit_bitmaps() == 0);
-	while (read_line(&line, &cap) >= 0) {
-		char commit[STORAGE_OID_HEXSZ + 1], xb[STORAGE_OID_HEXSZ + 1];
-		int flags = 0;
-		size_t ewah_len = 0;
-		unsigned char *ewah;
-
-		if (!strlen(line)) break;	/* blank terminator */
-		if (sscanf(line, "%64s %64s %d %zu", commit, xb, &flags, &ewah_len) != 4) {
-			ok = 0; break;	/* malformed header: payload length unknown, cannot drain */
-		}
-		ewah = read_payload(ewah_len);	/* always drain the announced bytes to stay in sync */
-		if (!ewah || storage_store_commit_bitmap(commit, strcmp(xb, "-") ? xb : NULL,
-							 flags, ewah, ewah_len) != 0)
-			ok = 0;
-		free(ewah);
-	}
-	if (!ok) {
-		storage_rollback_to("store_commit_bitmaps");
-		printf("error cannot store commit bitmaps\n"); fflush(stdout); return;
-	}
-	if (storage_release("store_commit_bitmaps")) {
-		printf("error cannot store commit bitmaps\n"); fflush(stdout); return;
-	}
-	printf("ok\n"); fflush(stdout);
-}
-
-static void cmd_get_commit_bitmap(const char *args) {
-	char commit[STORAGE_OID_HEXSZ + 1], xb[STORAGE_OID_HEXSZ + 1];
-	int flags = 0;
-	void *ewah;
-	size_t ewah_len;
-
-	if (sscanf(args, "%64s", commit) != 1 ||
-	    storage_get_commit_bitmap(commit, xb, &flags, &ewah, &ewah_len) < 0) {
-		printf("missing\n"); fflush(stdout); return;
-	}
-	printf("commit-bitmap %s %d %zu\n", *xb ? xb : "-", flags, ewah_len);
-	if (ewah_len) fwrite(ewah, 1, ewah_len, stdout);
-	free(ewah);
-	fflush(stdout);
-}
-
-/*
- * On-demand bitmap orderings (2b: files-parity, O(touched) not O(N)). The source
- * bitmap resolves bit<->oid via objects.pack_pos on demand instead of fetching
- * all N orderings at open.
- *   "pos-of-oid <oid_hex>" -> "pos <bit>" or "none": one want/have's bit position.
- *   "result-oids" + an operation's bit positions (one per line, blank-terminated)
- *     -> their oids in bit (pack_pos) order, blank-terminated: the batched bit->oid
- *     for a serve, resolving exactly the bits the operation touches in one join.
- */
-static void cmd_pos_of_oid(const char *args) {
-	char oid[STORAGE_OID_HEXSZ + 1];
-	int pos;
-
-	if (sscanf(args, "%64s", oid) != 1) { printf("none\n"); fflush(stdout); return; }
-	pos = storage_pack_pos_of_oid(oid);
-	if (pos < 0) printf("none\n");
-	else printf("pos %d\n", pos);
-	fflush(stdout);
-}
-
-static void cmd_result_oids(void) {
-	static char *line = NULL;
-	static size_t cap = 0;
-
-	int ok = (storage_result_pos_clear() == 0);
-	while (read_line(&line, &cap) >= 0) {	/* the operation's bit set */
-		size_t len = strlen(line);
-		char *end;
-		long long bit;
-		if (len && line[len - 1] == '\n') line[--len] = 0;
-		if (!len) break;
-		bit = strtoll(line, &end, 10);
-		if (end != line && !*end && storage_result_pos_add(bit) != 0)
-			ok = 0;
-	}
-	/* Resolve only a fully-staged set: a partial result_pos would yield a
-	 * truncated (or stale-padded) oid list, and this reply has no error channel,
-	 * so an incomplete staging emits an empty result rather than a wrong one. */
-	if (ok)
-		storage_oids_at_result(print_order_oid, NULL);	/* oids in bit order */
-	printf("\n");
+/* "remove-bitmap": drop the stored bitmap, if any (a gc that wrote none). */
+static void cmd_remove_bitmap(void) {
+	printf(storage_remove_pack_bitmap() ? "error cannot remove the bitmap\n" : "ok\n");
 	fflush(stdout);
 }
 
@@ -1085,6 +880,15 @@ static void cmd_reflog_exists(const char *refname) {
 	printf(storage_reflog_exists(refname) ? "true\n" : "false\n"); fflush(stdout);
 }
 
+static void cmd_reflog_create(const char *refname) {
+	if (storage_reflog_create(refname) != 0) {
+		if (in_txn) txn_failed = 1;
+		printf("error cannot create reflog for '%s'\n", refname);
+		fflush(stdout); return;
+	}
+	printf("ok\n"); fflush(stdout);
+}
+
 static void cmd_reflog_delete(const char *refname) {
 	if (storage_reflog_delete(refname) != 0) {
 		if (in_txn) txn_failed = 1;
@@ -1191,8 +995,7 @@ int main(int argc, char **argv) {
 		else if (!strncmp(line, "get ", 4)) cmd_get(line + 4);
 		else if (!strncmp(line, "put ", 4)) cmd_put(line + 4);
 		else if (!strncmp(line, "put-raw ", 8)) cmd_put_raw(line + 8);
-		else if (!strncmp(line, "get-delta ", 10)) cmd_get_delta(line + 10);
-		else if (!strncmp(line, "reuse-pack ", 11)) cmd_reuse_pack(line + 11);
+		else if (!strncmp(line, "get-raw ", 8)) cmd_get_raw(line + 8);
 		else if (!strncmp(line, "have ", 5)) cmd_have(line + 5);
 		else if (!strncmp(line, "freshen ", 8)) cmd_freshen(line + 8);
 		else if (!strncmp(line, "list-objects", 12))
@@ -1217,6 +1020,7 @@ int main(int argc, char **argv) {
 		else if (!strncmp(line, "reflog-read ", 12)) cmd_reflog_read(line + 12);
 		else if (!strncmp(line, "reflog-append ", 14)) cmd_reflog_append(line + 14);
 		else if (!strncmp(line, "reflog-exists ", 14)) cmd_reflog_exists(line + 14);
+		else if (!strncmp(line, "reflog-create ", 14)) cmd_reflog_create(line + 14);
 		else if (!strncmp(line, "reflog-delete ", 14)) cmd_reflog_delete(line + 14);
 		else if (!strncmp(line, "reflog-copy ", 12)) cmd_reflog_copy(line + 12);
 		else if (!strcmp(line, "reflog-list")) cmd_reflog_list();
@@ -1228,17 +1032,13 @@ int main(int argc, char **argv) {
 		else if (!strcmp(line, "promisor")) cmd_promisor();
 		else if (!strcmp(line, "optimize")) cmd_optimize();
 		else if (!strcmp(line, "optimize-required")) cmd_optimize_required();
+		else if (!strcmp(line, "prune")) cmd_prune("");
 		else if (!strncmp(line, "prune ", 6)) cmd_prune(line + 6);
-		else if (!strncmp(line, "keep-pack ", 10)) cmd_keep_pack(line + 10);
 		else if (!strcmp(line, "store-commit-graph")) cmd_store_commit_graph();
 		else if (!strncmp(line, "commit-generation ", 18)) cmd_commit_generation(line + 18);
-		else if (!strncmp(line, "store-bitmap ", 13)) cmd_store_bitmap(line + 13);
+		else if (!strncmp(line, "put-bitmap ", 11)) cmd_put_bitmap(line + 11);
 		else if (!strcmp(line, "get-bitmap")) cmd_get_bitmap();
-		else if (!strcmp(line, "clear-bitmap")) cmd_clear_bitmap();
-		else if (!strcmp(line, "store-commit-bitmaps")) cmd_store_commit_bitmaps();
-		else if (!strncmp(line, "get-commit-bitmap ", 18)) cmd_get_commit_bitmap(line + 18);
-		else if (!strncmp(line, "pos-of-oid ", 11)) cmd_pos_of_oid(line + 11);
-		else if (!strcmp(line, "result-oids")) cmd_result_oids();
+		else if (!strcmp(line, "remove-bitmap")) cmd_remove_bitmap();
 		else if (!strcmp(line, "verify")) cmd_verify();
 		else if (!strcmp(line, "close")) break;
 	}
