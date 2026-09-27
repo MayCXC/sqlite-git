@@ -75,8 +75,8 @@ static void cmd_capabilities(void) {
 /* ---- ODB commands ---- */
 
 static void cmd_info(const char *hex) {
-	char type[32]; size_t size; unsigned char *data;
-	if (storage_read_object(hex, type, sizeof(type), &size, &data) < 0) {
+	char type[32]; size_t size;
+	if (storage_read_header(hex, type, sizeof(type), &size) < 0) {
 		printf("missing\n");
 	} else {
 		/*
@@ -91,7 +91,6 @@ static void cmd_info(const char *hex) {
 			printf("%s %zu %s %zu\n", type, size, base_hex, delta_len);
 		else
 			printf("%s %zu\n", type, size);
-		free(data);
 	}
 	fflush(stdout);
 }

@@ -173,6 +173,23 @@ DELTA_CONTENT=$(printf 'capabilities\nget %s\n' "$DELTA_OID" \
 check "get: stored git-delta resolves to base content" \
 	'test "$DELTA_CONTENT" = "hello world"'
 
+# "info" reports the resolved type and size of a stored delta, its base and
+# the size of the delta. It reads the size off the start of the delta alone,
+# as git reads the size of a delta in a packfile, so it answers for a delta
+# whose base the store lacks.
+INFO_DELTA=$(printf 'capabilities\ninfo %s\n' "$DELTA_OID" \
+	| "$HELPER" "$DB" 2>/dev/null | tail -1)
+LONE_OID="2222222222222222222222222222222222222222"
+LONE_BASE="3333333333333333333333333333333333333333"
+printf 'put-raw %s blob 4 %s 12\n\170\234\343\346\236\300\015\000\001\174\000\262' \
+	"$LONE_OID" "$LONE_BASE" | "$HELPER" "$DB" >/dev/null 2>&1
+INFO_LONE=$(printf 'info %s\n' "$LONE_OID" | "$HELPER" "$DB" 2>/dev/null)
+
+check "info: a stored git-delta names its base and delta size" \
+	'test "$INFO_DELTA" = "blob 11 $OID 4"'
+check "info: the size of a delta's object comes from the delta alone" \
+	'test "$INFO_LONE" = "blob 11 $LONE_BASE 4"'
+
 # "get-delta" returns the COMPRESSED delta verbatim with its base oid, the
 # uncompressed length and the compressed length, for git to reuse on a send pack.
 GETDELTA=$(printf 'capabilities\nget-delta %s\n' "$DELTA_OID" \

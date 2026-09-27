@@ -11,6 +11,7 @@
  * passes git's wire strings straight through; the extension converts to/from
  * git_oid / git_object_t at its libgit2 boundary.
  */
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -106,11 +107,14 @@ static const char *const stmt_sql[STMT_COUNT] = {
 		" FROM objects o LEFT JOIN pack_content p ON p.pack_pos = o.pack_pos"
 		" WHERE o.oid = unhex(?)",
 	[STMT_OBJ_HEADER] =
-		/* Header only: type, the stored size, and whether the row is a delta.
-		 * Reads no content (no pack_content JOIN, no objects.data), so a whole
-		 * object answers without inflating; a delta needs a full resolve for its
-		 * logical size (see storage_read_header). */
-		"SELECT type, size, base IS NOT NULL FROM objects WHERE oid = unhex(?)",
+		/* The header of an object: its type, the stored size and the base of a
+		 * delta, and the stored bytes of a delta alone, whose start holds the
+		 * size of the object it makes (see storage_read_header). The bytes of a
+		 * whole object are not read. */
+		"SELECT o.type, o.size, iif(o.base IS NULL, NULL, lower(hex(o.base))),"
+		" iif(o.base IS NULL, NULL, coalesce(p.content, o.data))"
+		" FROM objects o LEFT JOIN pack_content p ON p.pack_pos = o.pack_pos"
+		" WHERE o.oid = unhex(?)",
 	[STMT_OBJ_WRITE] =
 		"INSERT OR IGNORE INTO objects(oid, type, size, data, base, promisor) VALUES(unhex(?),?,?,?,unhex(?),?)",
 	[STMT_OBJ_EXISTS] =
@@ -453,40 +457,76 @@ static unsigned char *zdecompress(const void *src, unsigned long srclen,
  * (src/libgit2/delta.c). Neither is linkable here: this helper/extension does
  * not link git, and libgit2's applier is -fvisibility=hidden and absent from
  * the public API, so we implement the frozen pack-delta format directly.
- *
- * Returns 0 on success, -1 on error. Caller must free *out.
  */
+
+/*
+ * Read one of the two sizes a delta starts with, a little-endian base-128
+ * varint, as git's get_delta_hdr_size() (delta.h) does. The shift is capped: an
+ * over-long varint in a corrupt delta would otherwise shift by the width of a
+ * size_t or more, which is undefined; a valid one is at most 10 bytes (shift
+ * 63). Returns -1 for a varint running past `end` or past that width.
+ */
+static int delta_hdr_size(const unsigned char **datap, const unsigned char *end,
+			  size_t *size)
+{
+	const unsigned char *dp = *datap;
+	unsigned shift = 0;
+	size_t v = 0;
+	unsigned char c;
+
+	do {
+		if (dp >= end || shift >= sizeof(size_t) * 8) return -1;
+		c = *dp++;
+		v |= (size_t)(c & 0x7f) << shift;
+		shift += 7;
+	} while (c & 0x80);
+	*datap = dp;
+	*size = v;
+	return 0;
+}
+
+/*
+ * The size of the object a compressed delta makes, from the start of the delta
+ * alone, as git's get_size_from_delta() (packfile.c) finds it: inflate only as
+ * much as the two sizes the delta starts with can take, and read the second.
+ */
+static int delta_target_size(const void *comp, size_t comp_len, size_t *size)
+{
+	unsigned char head[20];
+	const unsigned char *dp = head;
+	size_t base_size, got;
+	z_stream zs;
+	int st;
+
+	memset(&zs, 0, sizeof(zs));
+	if (inflateInit(&zs) != Z_OK) return -1;
+	zs.next_in = (Bytef *)comp;
+	zs.avail_in = comp_len > UINT_MAX ? UINT_MAX : (uInt)comp_len;
+	zs.next_out = head;
+	zs.avail_out = sizeof(head);
+	st = inflate(&zs, Z_FINISH);
+	got = sizeof(head) - zs.avail_out;
+	inflateEnd(&zs);
+	if (st != Z_STREAM_END && got != sizeof(head)) return -1;
+	if (delta_hdr_size(&dp, head + got, &base_size) ||
+	    delta_hdr_size(&dp, head + got, size))
+		return -1;
+	return 0;
+}
+
+/* Apply `delta` to `base` into *out, which the caller frees. Returns 0, or -1
+ * for a delta that does not apply to the base. */
 static int git_delta_apply(const unsigned char *base, size_t base_len,
 			   const unsigned char *delta, size_t delta_len,
 			   unsigned char **out, size_t *out_len)
 {
 	const unsigned char *dp = delta;
 	const unsigned char *dend = delta + delta_len;
+	size_t src_size, tgt_size;
 
-	/* Read source size varint. Cap the shift: a corrupt/hostile delta with an
-	 * over-long varint would otherwise shift by >= the width of size_t, which is
-	 * undefined behavior. A valid size_t varint is at most 10 bytes (shift 63). */
-	size_t src_size = 0;
-	unsigned shift = 0;
-	while (dp < dend) {
-		unsigned char c = *dp++;
-		if (shift >= sizeof(size_t) * 8) return -1;
-		src_size |= (size_t)(c & 0x7f) << shift;
-		shift += 7;
-		if (!(c & 0x80)) break;
-	}
-	if (src_size != base_len) return -1;
-
-	/* Read target size varint (same shift cap). */
-	size_t tgt_size = 0;
-	shift = 0;
-	while (dp < dend) {
-		unsigned char c = *dp++;
-		if (shift >= sizeof(size_t) * 8) return -1;
-		tgt_size |= (size_t)(c & 0x7f) << shift;
-		shift += 7;
-		if (!(c & 0x80)) break;
-	}
+	if (delta_hdr_size(&dp, dend, &src_size) || src_size != base_len ||
+	    delta_hdr_size(&dp, dend, &tgt_size))
+		return -1;
 
 	unsigned char *buf = malloc(tgt_size);
 	if (!buf) return -1;
@@ -1298,39 +1338,32 @@ int storage_read_object(const char *oid, char *out_type, size_t out_type_sz,
 }
 
 /*
- * Cheap size+type without materializing (or inflating, or delta-resolving) the
- * content: read_header's reason for existing. The stored `size` is the object's
- * logical size for a whole object but the DELTA stream's length for a delta (see
- * read_object_depth), so a delta still needs a full resolve to report its logical
- * size; the common whole-object case answers from the header row alone. type is
- * correct for both (a delta row records the resolved object's type). Returns 0,
- * -1 if absent. out_type is a buffer of out_type_sz.
+ * Type and size without the contents. The stored `size` is the object's size
+ * for a whole object but the length of the delta for a delta (see
+ * read_object_depth), and the start of the delta holds the size of the object
+ * it makes, which is all of the delta read, as git reads the size of a delta
+ * in a packfile. type is correct for both (a delta row records the resolved
+ * object's type). Returns 0, -1 if absent. out_type is a buffer of out_type_sz.
  */
 int storage_read_header(const char *oid, char *out_type, size_t out_type_sz,
 			size_t *out_size) {
 	sqlite3_stmt *st = stmt_acquire(STMT_OBJ_HEADER);
+	int ret = 0;
+
 	sqlite3_bind_text(st, 1, oid, -1, SQLITE_STATIC);
 	if (sqlite3_step(st) != SQLITE_ROW) { stmt_release(STMT_OBJ_HEADER, st); return -1; }
 	const char *type = (const char *)sqlite3_column_text(st, 0);
 	size_t size = (size_t)sqlite3_column_int64(st, 1);
-	int is_delta = sqlite3_column_int(st, 2);
+	const char *base = (const char *)sqlite3_column_text(st, 2);
 	if (out_type && type) snprintf(out_type, out_type_sz, "%s", type);
-	stmt_release(STMT_OBJ_HEADER, st);
-
-	if (!is_delta) {
+	if (!base) {
 		if (out_size) *out_size = size;
-		return 0;
+	} else if (out_size) {
+		ret = delta_target_size(sqlite3_column_blob(st, 3),
+					(size_t)sqlite3_column_bytes(st, 3), out_size);
 	}
-	/* Delta: the logical size only falls out of applying it. Resolve and discard
-	 * the bytes (type is already set from the header row). */
-	{
-		char t[32];
-		unsigned char *data;
-		if (storage_read_object(oid, t, sizeof(t), out_size, &data) < 0)
-			return -1;
-		free(data);
-		return 0;
-	}
+	stmt_release(STMT_OBJ_HEADER, st);
+	return ret;
 }
 
 /* ---- Object write (zlib + delta) ---- */

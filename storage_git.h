@@ -50,8 +50,8 @@ int storage_read_object(const char *oid,
 			char *out_type, size_t out_type_sz,
 			size_t *out_size, unsigned char **out_data);
 
-/* Header (type + logical size) without materializing the content; see the
- * definition for the whole-object fast path vs delta fallback. */
+/* Header (type + size) without materializing the content; see the definition
+ * for how a delta gives the size of its object. */
 int storage_read_header(const char *oid, char *out_type, size_t out_type_sz,
 			size_t *out_size);
 
