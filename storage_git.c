@@ -418,12 +418,15 @@ static unsigned char *zcompress(const void *src, unsigned long srclen,
 	return dst;
 }
 
+/* Inflate src into a buffer of exactly orig bytes, or NULL when it inflates to
+ * any other length, so that a short stream never passes off the rest of the
+ * buffer as content. */
 static unsigned char *zdecompress(const void *src, unsigned long srclen,
 				  unsigned long orig) {
-	unsigned char *dst = malloc(orig);
+	unsigned char *dst = malloc(orig ? orig : 1);
 	unsigned long dstlen = orig;
 	if (!dst) return NULL;
-	if (uncompress(dst, &dstlen, src, srclen) != Z_OK) {
+	if (uncompress(dst, &dstlen, src, srclen) != Z_OK || dstlen != orig) {
 		free(dst);
 		return NULL;
 	}

@@ -137,6 +137,18 @@ HAVE_NO=$(printf 'capabilities\nhave deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n'
 check "have: false for missing object" \
 	'test "$HAVE_NO" = "false"'
 
+# A stored stream that inflates to less than its recorded size fails to read,
+# rather than passing off the rest of a buffer as content.
+if ! command -v sqlite3 >/dev/null 2>&1; then
+	ok "short stored stream (skipped: needs sqlite3)"
+else
+	SDB="$TMPDIR/short-test"
+	printf 'put %s blob 11\nhello world' "$OID" | "$HELPER" "$SDB" >/dev/null 2>&1
+	sqlite3 "$SDB/sqlite.db" "UPDATE objects SET size = 12"
+	check "get: a stream shorter than its recorded size is missing" \
+		'test "$(printf "get %s\n" "$OID" | "$HELPER" "$SDB" 2>/dev/null)" = "missing"'
+fi
+
 # ---- put-raw / get-delta ----
 # Store a git-format delta against the 11-byte base put above, in git's native
 # pack form: the COMPRESSED delta bytes, stored verbatim (no recompress), base set.
