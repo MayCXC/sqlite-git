@@ -68,6 +68,8 @@ create_helper_repo() {
 }
 
 assert_no_loose() { test -z "$(find "$1/.git/objects" -type d -name '??')"; }
+# git's test_cmp, minimal: the two files are byte-identical.
+test_cmp() { cmp "$1" "$2"; }
 no_packfile() { ! ls "$1"/.git/objects/pack/*.pack >/dev/null 2>&1; }
 # A blob is stored as a delta when its delta base is a real (nonzero) oid.
 has_delta_blob() {
@@ -116,7 +118,7 @@ test_case "reachability stays correct for commits added after the bitmap gc" '
 	git -C stalebm -c core.useBitmapIndex=false rev-list --all >expect.raw &&
 	git -C stalebm rev-list --all --use-bitmap-index >actual.raw &&
 	sort expect.raw >expect && sort actual.raw >actual &&
-	test_cmp() { cmp "$1" "$2"; }; test_cmp expect actual
+	test_cmp expect actual
 '
 
 # --- a truncated pack: unpack-objects ingests then fails the tail; the ingest
