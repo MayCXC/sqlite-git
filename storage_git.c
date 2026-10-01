@@ -246,9 +246,9 @@ static const char *const stmt_sql[STMT_COUNT] = {
 	/* incremental_vacuum (the optimize command): reclaims the pages object and ref
 	 * churn freed to the freelist, in place, skipping the whole-store rebuild (and
 	 * ~2x scratch) a full VACUUM does. Relies on auto_vacuum = INCREMENTAL, set in
-	 * apply_pragmas when the store is created. A no-result maintenance statement,
-	 * cached in the array like every other statement an operation drives, not
-	 * exec'd. */
+	 * apply_pragmas when the store is created. Yields a columnless row per page
+	 * freed, so its driver steps it to done; cached in the array like every other
+	 * statement an operation drives, not exec'd. */
 	[STMT_VACUUM] =
 		"PRAGMA incremental_vacuum",
 };
@@ -794,7 +794,14 @@ int storage_vacuum(void) {
 	st = stmt_acquire(STMT_VACUUM);
 	if (!st)
 		return -1;
-	rc = sqlite3_step(st);
+	/*
+	 * The pragma yields a columnless row for each page it returns to the file,
+	 * so a store with anything on its freelist answers the first step with a
+	 * row, not done; it is stepped until it reports done, and only another
+	 * answer is a failure.
+	 */
+	while ((rc = sqlite3_step(st)) == SQLITE_ROW)
+		;
 	if (rc != SQLITE_DONE)
 		fprintf(stderr, "sqlite-git: incremental_vacuum failed (%d): %s\n",
 			rc, sqlite3_errmsg(storage_db()));

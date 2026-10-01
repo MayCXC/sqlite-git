@@ -682,6 +682,31 @@ OPT=$(printf 'capabilities\noptimize\n' \
 check "optimize: command acks ok (VACUUM)" \
 	'test "$OPT" = "ok"'
 
+# A store whose freelist holds pages: the pragma answers a row for each page it
+# returns to the file, and the helper steps through all of them, to the ack and
+# an empty freelist. Incompressible blobs, so pruning them frees whole pages.
+if ! command -v sqlite3 >/dev/null 2>&1; then
+	ok "optimize: populated freelist (skipped: needs sqlite3)"
+else
+	VDB="$TMPDIR/vacuum-test"
+	VOIDS=""
+	for i in 1 2 3 4 5 6 7 8; do
+		head -c 65536 /dev/urandom >"$TMPDIR/vacuum-blob-$i"
+		VOID=$(git hash-object -t blob "$TMPDIR/vacuum-blob-$i")
+		{ printf 'put %s blob 65536\n' "$VOID"; cat "$TMPDIR/vacuum-blob-$i"; } \
+			| "$HELPER" "$VDB" >/dev/null 2>&1
+		VOIDS="$VOIDS $VOID"
+	done
+	{ printf 'prune\n'; for o in $VOIDS; do printf '%s\n' "$o"; done; printf '\n'; } \
+		| "$HELPER" "$VDB" >/dev/null 2>&1
+	VFREE=$(sqlite3 "$VDB/sqlite.db" "PRAGMA freelist_count")
+	check "optimize: pruned pages wait on the freelist" \
+		'test "${VFREE:-0}" -gt 1'
+	VOPT=$(printf 'capabilities\noptimize\n' | "$HELPER" "$VDB" 2>"$TMPDIR/vacuum-err" | tail -1)
+	check "optimize: a populated freelist is vacuumed through to the ack" \
+		'test "$VOPT" = "ok" && test "$(sqlite3 "$VDB/sqlite.db" "PRAGMA freelist_count")" = 0 && ! grep -q "incremental_vacuum failed" "$TMPDIR/vacuum-err"'
+fi
+
 # ---- verify (A3: PRAGMA integrity_check) ----
 
 VFY=$(printf 'capabilities\nverify\n' \
