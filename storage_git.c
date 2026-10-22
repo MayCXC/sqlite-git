@@ -246,7 +246,7 @@ static const char *const stmt_sql[STMT_COUNT] = {
 	/* incremental_vacuum (the optimize command): reclaims the pages object and ref
 	 * churn freed to the freelist, in place, skipping the whole-store rebuild (and
 	 * ~2x scratch) a full VACUUM does. Relies on auto_vacuum = INCREMENTAL, set in
-	 * apply_pragmas when the store is created. Yields a columnless row per page
+	 * apply_store_pragmas when the store is created. Yields a columnless row per page
 	 * freed, so its driver steps it to done; cached in the array like every other
 	 * statement an operation drives, not exec'd. */
 	[STMT_VACUUM] =

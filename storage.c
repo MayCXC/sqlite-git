@@ -95,22 +95,33 @@ void storage_at_close(void (*fn)(void)) {
 /* ---- Database ---- */
 
 /*
- * Connection pragmas, shared by both faces. page_size and auto_vacuum MUST
- * precede journal_mode (and any CREATE): both are fixed when the store is created,
- * and a later change is silently ignored once the WAL is set up or any table
- * exists, so issuing them first is the only way they take effect on a fresh store.
- * The 8 KiB page gives shallower btrees over the blob payloads; auto_vacuum =
- * INCREMENTAL lets the optimize command reclaim churn-freed pages in place with
- * PRAGMA incremental_vacuum instead of a full VACUUM, which rebuilds the whole
- * store into a ~2x-size scratch copy and fails when the disk is tight, exactly
- * when reclaiming is needed.
+ * The store's pragmas, the settings that live in the database file and so are
+ * shared by both faces. page_size and auto_vacuum MUST precede journal_mode (and
+ * any CREATE): both are fixed when the store is created, and a later change is
+ * silently ignored once the WAL is set up or any table exists, so issuing them
+ * first is the only way they take effect on a fresh store. The 8 KiB page gives
+ * shallower btrees over the blob payloads; auto_vacuum = INCREMENTAL lets the
+ * optimize command reclaim churn-freed pages in place with PRAGMA
+ * incremental_vacuum instead of a full VACUUM, which rebuilds the whole store into
+ * a ~2x-size scratch copy and fails when the disk is tight, exactly when
+ * reclaiming is needed. WAL mode persists in the file once set
+ * (https://www.sqlite.org/wal.html#persistence_of_wal_mode).
  */
-static void apply_pragmas(sqlite3 *db) {
+static void apply_store_pragmas(sqlite3 *db) {
 	sqlite3_exec(db, "PRAGMA page_size = 8192;", 0, 0, 0);
 	sqlite3_exec(db, "PRAGMA auto_vacuum = INCREMENTAL;", 0, 0, 0);
+	sqlite3_exec(db, "PRAGMA journal_mode = WAL;", 0, 0, 0);
+}
+
+/*
+ * The connection's own pragmas, which belong to whoever opens the connection: how
+ * long it waits on another connection's lock (one busy handler per connection,
+ * https://www.sqlite.org/c3ref/busy_timeout.html) and how often it syncs. Set
+ * before the store's, so the switch to WAL waits on a lock rather than failing.
+ */
+static void apply_connection_pragmas(sqlite3 *db) {
 	sqlite3_exec(db, "PRAGMA busy_timeout = 5000;", 0, 0, 0);
 	sqlite3_exec(db, "PRAGMA synchronous = NORMAL;", 0, 0, 0);
-	sqlite3_exec(db, "PRAGMA journal_mode = WAL;", 0, 0, 0);
 }
 
 int storage_open(const char *path_arg) {
@@ -140,7 +151,8 @@ int storage_open(const char *path_arg) {
 	 * A store made by an older build is migrated by pushing from it and pulling
 	 * into a fresh store on the new build, never by ALTER-ing in place.
 	 */
-	apply_pragmas(sdb);
+	apply_connection_pragmas(sdb);
+	apply_store_pragmas(sdb);
 	return 0;
 }
 
@@ -150,12 +162,12 @@ int storage_open_db(sqlite3 *db) {
 	/*
 	 * The extension borrows an already-open connection (owned by the loader, so
 	 * sdb_owned stays 0) and prepares statements per call, so it does NOT cache.
-	 * Pragmas are otherwise identical to the helper's: both faces share one store
-	 * and create it the same way, so the extension connection gets the same
-	 * busy_timeout and WAL mode. (page_size only takes effect on a fresh DB; on an
-	 * existing helper store it is a harmless no-op.)
+	 * Both faces share one store and create it the same way, so the extension
+	 * applies the store's pragmas; the connection's own are its owner's, set by
+	 * whoever opened it. (page_size only takes effect on a fresh DB; on an existing
+	 * helper store it is a harmless no-op.)
 	 */
-	apply_pragmas(db);
+	apply_store_pragmas(db);
 	return 0;
 }
 
